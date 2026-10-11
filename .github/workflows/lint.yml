@@ -39,6 +39,8 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
+      # Nightlies since rust-lang/rust#160619 default to `-Znext-solver=globally`, which takes
+      # ~10x the time and memory on the node-launch crates; the RUSTFLAGS below keep the old solver.
       - uses: tempoxyz/gh-actions/vendor/dtolnay/rust-toolchain@e813067e922303348ee5aad965f745803cc24f1f # 2026-10-02T09-56-31Z-e813067e
         with:
           toolchain: nightly-2026-10-02
@@ -50,15 +52,15 @@ jobs:
       - name: Run clippy on runtime targets
         run: cargo clippy --workspace --lib --bins --all-features --locked
         env:
-          RUSTFLAGS: -D warnings
+          RUSTFLAGS: -D warnings -Znext-solver=coherence
       - name: Run clippy on test targets
         run: cargo clippy --workspace --tests --all-features --locked
         env:
-          RUSTFLAGS: -D warnings
+          RUSTFLAGS: -D warnings -Znext-solver=coherence
       - name: Run clippy on bench and example targets
         run: cargo clippy --workspace --benches --examples --all-features --locked
         env:
-          RUSTFLAGS: -D warnings
+          RUSTFLAGS: -D warnings -Znext-solver=coherence
 
   fmt:
     name: fmt
