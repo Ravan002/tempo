@@ -20,8 +20,7 @@ use alloy_provider::{ProviderBuilder, bindings::IMulticall3};
 use alloy_signer::SignerSync;
 use alloy_sol_types::{SolCall, SolError};
 use futures::{SinkExt, StreamExt};
-use p256::ecdsa::SigningKey as P256SigningKey;
-use rand::thread_rng;
+use p256::{ecdsa::SigningKey as P256SigningKey, elliptic_curve::rand_core::OsRng};
 use serde_json::{Value, json};
 use std::{collections::HashSet, time::Duration};
 use tempo_chainspec::spec::{TEMPO_T0_BASE_FEE, TEMPO_T1_BASE_FEE};
@@ -318,8 +317,8 @@ async fn test_non_secp_auth_tokens() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
     let ctx = start_zone_with_redacted_rpc().await?;
-    let p256_signer = P256SigningKey::random(&mut thread_rng());
-    let webauthn_signer = P256SigningKey::random(&mut thread_rng());
+    let p256_signer = P256SigningKey::random(&mut OsRng);
+    let webauthn_signer = P256SigningKey::random(&mut OsRng);
 
     for token in [
         ctx.p256_token(&p256_signer),
@@ -347,8 +346,8 @@ async fn test_invalid_non_secp_auth_tokens_are_rejected() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
     let ctx = start_zone_with_redacted_rpc().await?;
-    let p256_signer = P256SigningKey::random(&mut thread_rng());
-    let webauthn_signer = P256SigningKey::random(&mut thread_rng());
+    let p256_signer = P256SigningKey::random(&mut OsRng);
+    let webauthn_signer = P256SigningKey::random(&mut OsRng);
 
     let bad_p256 = corrupt_token_hex(&ctx.p256_token(&p256_signer));
     let (status, _) = ctx
@@ -376,7 +375,7 @@ async fn test_keychain_auth_tokens_v1_and_v2() -> eyre::Result<()> {
 
     let mut ctx = start_zone_with_redacted_rpc().await?;
     let root_signer = PrivateKeySigner::random();
-    let access_signer = P256SigningKey::random(&mut thread_rng());
+    let access_signer = P256SigningKey::random(&mut OsRng);
 
     ctx.inject_deposit(
         PATH_USD_ADDRESS,
@@ -429,7 +428,7 @@ async fn test_keychain_auth_rejection_cases() -> eyre::Result<()> {
     let mut ctx = start_zone_with_redacted_rpc().await?;
 
     let missing_root = PrivateKeySigner::random();
-    let missing_access = P256SigningKey::random(&mut thread_rng());
+    let missing_access = P256SigningKey::random(&mut OsRng);
     let (missing_token, _) = ctx.keychain_p256_token(missing_root.address(), &missing_access, 0x04);
     let (status, _) = ctx
         .call_raw("eth_blockNumber", serde_json::json!([]), &missing_token)
@@ -441,7 +440,7 @@ async fn test_keychain_auth_rejection_cases() -> eyre::Result<()> {
     );
 
     let revoked_root = PrivateKeySigner::random();
-    let revoked_access = P256SigningKey::random(&mut thread_rng());
+    let revoked_access = P256SigningKey::random(&mut OsRng);
     ctx.inject_deposit(
         PATH_USD_ADDRESS,
         address!("0x0000000000000000000000000000000000002222"),
@@ -466,7 +465,7 @@ async fn test_keychain_auth_rejection_cases() -> eyre::Result<()> {
     assert_eq!(status.as_u16(), 403, "revoked key should return 403");
 
     let mismatch_root = PrivateKeySigner::random();
-    let mismatch_access = P256SigningKey::random(&mut thread_rng());
+    let mismatch_access = P256SigningKey::random(&mut OsRng);
     ctx.inject_deposit(
         PATH_USD_ADDRESS,
         address!("0x0000000000000000000000000000000000004444"),

@@ -24,7 +24,7 @@ tempo-chainspec.workspace = true
 tempo-evm = { workspace = true, features = ["engine", "rpc"] }
 tempo-payload-types.workspace = true
 tempo-precompiles.workspace = true
-tempo-primitives = { workspace = true, features = ["reth", "reth-codec", "serde", "serde-bincode-compat"] }
+tempo-primitives.workspace = true
 tempo-revm.workspace = true
 
 # reth

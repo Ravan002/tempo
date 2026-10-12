@@ -21,7 +21,7 @@ tempo-chainspec = { workspace = true, default-features = false }
 tempo-contracts = { workspace = true, default-features = false }
 tempo-precompiles = { workspace = true, default-features = false }
 tempo-precompiles-macros.workspace = true
-tempo-primitives = { workspace = true, default-features = false, features = ["reth", "reth-codec", "serde", "serde-bincode-compat"] }
+tempo-primitives = { workspace = true, default-features = false }
 
 # alloy
 alloy-consensus = { workspace = true, default-features = false }
@@ -38,7 +38,7 @@ revm = { workspace = true, default-features = false }
 aes-gcm = { version = "0.10.3", default-features = false, features = ["aes", "alloc"] }
 k256 = { version = "0.13.4", default-features = false, features = ["arithmetic", "ecdh"] }
 sha2 = { version = "0.10.9", default-features = false }
-rand = { version = "0.8.5", default-features = false }
+rand = { workspace = true, optional = true }
 
 # misc
 derive_more = { workspace = true, default-features = true }
@@ -54,6 +54,7 @@ tempo-precompiles = { workspace = true, features = ["test-utils"] }
 dst = ["tempo-precompiles/dst"]
 default = ["std"]
 test-utils = [
+    "std",
     "tempo-precompiles/test-utils",
     "tempo-primitives/test-utils",
 ]
@@ -70,7 +71,7 @@ std = [
     "aes-gcm/std",
     "k256/std",
     "sha2/std",
-    "rand/std",
+    "dep:rand",
     "alloy/std",
     "serde/std",
     "tempo-chainspec/std",

@@ -19,7 +19,7 @@ zone-primitives = { workspace = true }
 # tempo
 tempo-alloy.workspace = true
 tempo-contracts.workspace = true
-tempo-primitives = { workspace = true, features = ["reth", "reth-codec", "serde", "serde-bincode-compat"] }
+tempo-primitives.workspace = true
 
 # reth
 reth-metrics.workspace = true

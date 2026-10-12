@@ -16,7 +16,7 @@ tempo-chainspec.workspace = true
 tempo-evm = { workspace = true, features = ["engine", "rpc"] }
 tempo-node.workspace = true
 tempo-precompiles.workspace = true
-tempo-primitives = { workspace = true, features = ["reth", "reth-codec", "serde", "serde-bincode-compat"] }
+tempo-primitives.workspace = true
 tempo-transaction-pool.workspace = true
 tempo-alloy.workspace = true
 tempo-contracts.workspace = true
@@ -108,7 +108,6 @@ const-hex.workspace = true
 commonware-codec.workspace = true
 commonware-cryptography = { workspace = true, default-features = true }
 p256 = { workspace = true, features = ["ecdsa"] }
-rand = { version = "0.8.5" }
 reth-ethereum = { workspace = true, features = ["node", "test-utils"] }
 reth-tracing.workspace = true
 reth-trie-common = { workspace = true, features = ["std"] }

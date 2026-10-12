@@ -39,7 +39,7 @@ tempo-alloy.workspace = true
 tempo-chainspec = { workspace = true, features = ["reth"] }
 tempo-contracts.workspace = true
 tempo-precompiles.workspace = true
-tempo-primitives = { workspace = true, features = ["reth", "reth-codec", "serde", "serde-bincode-compat"] }
+tempo-primitives = { workspace = true, features = ["reth-codec"] }
 tempo-revm = { workspace = true, features = ["reth"] }
 
 # zones

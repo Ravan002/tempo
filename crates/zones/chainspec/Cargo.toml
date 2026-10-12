@@ -15,7 +15,7 @@ workspace = true
 
 # tempo
 tempo-chainspec = { workspace = true, features = ["reth"] }
-tempo-primitives = { workspace = true, features = ["reth", "reth-codec", "serde", "serde-bincode-compat"] }
+tempo-primitives.workspace = true
 zone-primitives.workspace = true
 
 # reth
@@ -36,7 +36,7 @@ thiserror = { version = "2", default-features = false }
 
 [features]
 default = []
-cli = ["dep:eyre", "dep:reth-cli"]
+cli = ["dep:eyre", "dep:reth-cli", "tempo-primitives/reth-codec"]
 test-utils = [
     "reth-chainspec/test-utils",
     "tempo-primitives/test-utils",
