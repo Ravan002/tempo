@@ -632,7 +632,7 @@ impl StablecoinDEX {
 
     /// Places a limit order on the orderbook for `token` against its quote token.
     /// Escrows the appropriate amount via [`TIP20Token`] transfer or DEX balance and enforces
-    /// compliance via the [`TIP403Registry`]. Auto-creates the trading pair if needed.
+    /// compliance via the [`TIP403Registry`](crate::tip403_registry::TIP403Registry). Auto-creates the trading pair if needed.
     ///
     /// # Errors
     /// - `InvalidBaseToken` — token address does not have a valid TIP-20 prefix
@@ -791,7 +791,7 @@ impl StablecoinDEX {
 
     /// Places a flip order that auto-reverses to the opposite side when
     /// fully filled, acting as perpetual liquidity. Escrows tokens via
-    /// [`TIP20Token`] and enforces compliance via [`TIP403Registry`].
+    /// [`TIP20Token`] and enforces compliance via [`TIP403Registry`](crate::tip403_registry::TIP403Registry).
     /// Pre-T5: for bids `flip_tick` must be > `tick`; for asks, < `tick`.
     /// T5+ (TIP-1030): for bids `flip_tick >= tick`; for asks `flip_tick <= tick`.
     ///
@@ -1421,7 +1421,7 @@ impl StablecoinDEX {
         self.emit_event(StablecoinDEXEvents::order_cancelled(order.order_id()))
     }
 
-    /// Cancels an order whose maker is blocked by [`TIP403Registry`] policy, allowing anyone to
+    /// Cancels an order whose maker is blocked by [`TIP403Registry`](crate::tip403_registry::TIP403Registry) policy, allowing anyone to
     /// clean up stale liquidity.
     ///
     /// [TIP-1015]: T4+ checks sender authorization on the escrow token and recipient
