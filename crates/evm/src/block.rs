@@ -548,26 +548,17 @@ where
         if self.inner.spec.is_t10_active_at_timestamp(timestamp) {
             self.deploy_zone_factory_at_boundary()?;
         }
-        // Chains starting at T13 supply their runtime code in genesis. Preserve those
-        // allocations (including locally compiled contracts on test chains). Chains
-        // that activate T13 later still follow the normal runtime upgrade path.
-        if self.inner.spec.is_t13_active_at_timestamp(timestamp)
-            && !self.inner.spec.is_t14_active_at_timestamp(timestamp)
-            && !self
-                .inner
-                .spec
-                .is_t13_active_at_timestamp(self.inner.spec.genesis().timestamp)
+        // Preserve genesis-supplied runtimes and apply only the latest active upgrade.
+        let spec = &self.inner.spec;
+        let genesis_timestamp = spec.genesis().timestamp;
+        if spec.is_t14_active_at_timestamp(timestamp) {
+            if !spec.is_t14_active_at_timestamp(genesis_timestamp) {
+                self.upgrade_zone_refunds_at_boundary()?;
+            }
+        } else if spec.is_t13_active_at_timestamp(timestamp)
+            && !spec.is_t13_active_at_timestamp(genesis_timestamp)
         {
             self.upgrade_zone_runtimes_at_boundary()?;
-        }
-        // Preserve genesis-supplied runtimes on chains starting at T14, just as at T13.
-        if self.inner.spec.is_t14_active_at_timestamp(timestamp)
-            && !self
-                .inner
-                .spec
-                .is_t14_active_at_timestamp(self.inner.spec.genesis().timestamp)
-        {
-            self.upgrade_zone_refunds_at_boundary()?;
         }
 
         Ok(())
