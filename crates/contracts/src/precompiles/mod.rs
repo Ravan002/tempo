@@ -14,7 +14,8 @@ pub mod tip403_registry;
 pub mod tip_fee_manager;
 pub mod validator_config;
 pub mod validator_config_v2;
-pub mod zones;
+pub mod zone_factory;
+pub mod zone_verifier;
 
 pub use account_keychain::*;
 pub use address_registry::*;
@@ -32,7 +33,8 @@ pub use tip20_factory::*;
 pub use tip403_registry::*;
 pub use validator_config::*;
 pub use validator_config_v2::*;
-pub use zones::*;
+pub use zone_factory::*;
+pub use zone_verifier::*;
 
 use alloy_primitives::{Address, address};
 use tempo_hardfork::TempoHardfork;

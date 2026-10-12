@@ -18,10 +18,12 @@ use tempo_alloy::{
     provider::TempoProviderExt,
     rpc::{ForkSchedule, TempoHeaderResponse, TempoTransactionRequest},
 };
-use tempo_contracts::precompiles::{IZoneFactory, IZonePortal, ZONE_FACTORY_ADDRESS};
+use tempo_contracts::{
+    precompiles::{IZoneFactory, ZONE_FACTORY_ADDRESS},
+    zones::{BatchSubmitted, submitBatchCall},
+};
 use tempo_nitro_attestation::{SHA384_SIZE, parse_attestation, to_measurements};
 use tempo_primitives::TempoTxEnvelope;
-
 use tracing::info;
 
 const LOG_QUERY_BLOCKS: u64 = 1_000;
@@ -207,7 +209,7 @@ async fn sample_interval(
 ) -> eyre::Result<Option<Pcrs>> {
     let mut filter = Filter::new()
         .address(portals.iter().copied().collect::<Vec<_>>())
-        .event_signature(IZonePortal::BatchSubmitted::SIGNATURE_HASH);
+        .event_signature(BatchSubmitted::SIGNATURE_HASH);
     let mut end_block = interval.to_block;
     loop {
         let start = end_block
@@ -222,7 +224,7 @@ async fn sample_interval(
         // throughout the hardfork interval, across all accepted direct Nitro submissions.
         let mut transactions = BTreeSet::new();
         for log in provider.get_logs(&filter).await? {
-            log.log_decode::<IZonePortal::BatchSubmitted>()?;
+            log.log_decode::<BatchSubmitted>()?;
             let number = log
                 .block_number
                 .ok_or_eyre("BatchSubmitted event is missing its block number")?;
@@ -293,11 +295,11 @@ fn nitro_submission(
 ) -> eyre::Result<Option<Pcrs>> {
     for (index, (to, input)) in envelope.calls().enumerate() {
         if !matches!(to, TxKind::Call(portal) if portals.contains(&portal))
-            || !input.starts_with(&IZonePortal::submitBatchCall::SELECTOR)
+            || !input.starts_with(&submitBatchCall::SELECTOR)
         {
             continue;
         }
-        let call = IZonePortal::submitBatchCall::abi_decode_validate(input)?;
+        let call = submitBatchCall::abi_decode_validate(input)?;
         if call.verifierConfig.as_ref() != [1] {
             continue;
         }
@@ -355,7 +357,7 @@ mod tests {
         Call {
             to: TxKind::Call(PORTAL),
             value: U256::ZERO,
-            input: IZonePortal::submitBatchCall {
+            input: submitBatchCall {
                 tempoBlockNumber: 1,
                 verifierConfig: config.to_vec().into(),
                 proof,
@@ -390,7 +392,7 @@ mod tests {
     }
 
     fn batch_log(number: u64, tx_hash: B256) -> Log {
-        let event = IZonePortal::BatchSubmitted::default();
+        let event = BatchSubmitted::default();
         Log {
             inner: alloy_primitives::Log {
                 address: PORTAL,

@@ -7,7 +7,10 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use p256::{ecdsa::SigningKey, elliptic_curve::rand_core::OsRng};
 use std::hint::black_box;
 use tempo_chainspec::hardfork::TempoHardfork;
-use tempo_contracts::precompiles::IZoneVerifier;
+use tempo_contracts::{
+    precompiles::IZoneVerifier,
+    zones::{BlockTransition, DepositQueueTransition, TokenEnablementTransition},
+};
 use tempo_nitro_attestation::parse_attestation;
 use tempo_precompiles::{
     Precompile,
@@ -69,17 +72,17 @@ fn signature_verification(c: &mut Criterion) {
         anchorBlockHash: B256::ZERO,
         expectedWithdrawalBatchIndex: 0,
         nextZoneHeight: U256::ZERO,
-        blockTransition: IZoneVerifier::BlockTransition {
+        blockTransition: BlockTransition {
             prevBlockHash: B256::ZERO,
             nextBlockHash: B256::ZERO,
         },
-        depositQueueTransition: IZoneVerifier::DepositQueueTransition {
+        depositQueueTransition: DepositQueueTransition {
             prevProcessedHash: B256::ZERO,
             nextProcessedHash: B256::ZERO,
             prevDepositNumber: 0,
             nextDepositNumber: 0,
         },
-        tokenEnablementTransition: IZoneVerifier::TokenEnablementTransition {
+        tokenEnablementTransition: TokenEnablementTransition {
             prevProcessedTokenCount: 0,
             nextProcessedTokenCount: 0,
         },
@@ -112,7 +115,7 @@ fn signature_verification(c: &mut Criterion) {
 
 fn tip20_metadata(c: &mut Criterion) {
     c.bench_function("tip20_name", |b| {
-        let admin = Address::from([0u8; 20]);
+        let admin = Address::ZERO;
         let mut storage = HashMapStorageProvider::new(1);
         StorageCtx::enter(&mut storage, || {
             let mut token = TIP20Setup::create("TestToken", "TEST", admin)
@@ -128,7 +131,7 @@ fn tip20_metadata(c: &mut Criterion) {
     });
 
     c.bench_function("tip20_symbol", |b| {
-        let admin = Address::from([0u8; 20]);
+        let admin = Address::ZERO;
         let mut storage = HashMapStorageProvider::new(1);
         StorageCtx::enter(&mut storage, || {
             let mut token = TIP20Setup::create("TestToken", "TEST", admin)
@@ -144,7 +147,7 @@ fn tip20_metadata(c: &mut Criterion) {
     });
 
     c.bench_function("tip20_decimals", |b| {
-        let admin = Address::from([0u8; 20]);
+        let admin = Address::ZERO;
         let mut storage = HashMapStorageProvider::new(1);
         StorageCtx::enter(&mut storage, || {
             let mut token = TIP20Setup::create("TestToken", "TEST", admin)
@@ -160,7 +163,7 @@ fn tip20_metadata(c: &mut Criterion) {
     });
 
     c.bench_function("tip20_currency", |b| {
-        let admin = Address::from([0u8; 20]);
+        let admin = Address::ZERO;
         let mut storage = HashMapStorageProvider::new(1);
         StorageCtx::enter(&mut storage, || {
             let mut token = TIP20Setup::create("TestToken", "TEST", admin)
@@ -176,8 +179,8 @@ fn tip20_metadata(c: &mut Criterion) {
     });
 
     c.bench_function("tip20_total_supply", |b| {
-        let admin = Address::from([0u8; 20]);
-        let user = Address::from([1u8; 20]);
+        let admin = Address::ZERO;
+        let user = Address::repeat_byte(1u8);
         let mut storage = HashMapStorageProvider::new(1);
         StorageCtx::enter(&mut storage, || {
             let mut token = TIP20Setup::create("TestToken", "TEST", admin)
@@ -205,8 +208,8 @@ fn tip20_metadata(c: &mut Criterion) {
 
 fn tip20_view(c: &mut Criterion) {
     c.bench_function("tip20_balance_of", |b| {
-        let admin = Address::from([0u8; 20]);
-        let user = Address::from([1u8; 20]);
+        let admin = Address::ZERO;
+        let user = Address::repeat_byte(1u8);
         let mut storage = HashMapStorageProvider::new(1);
         StorageCtx::enter(&mut storage, || {
             let mut token = TIP20Setup::create("TestToken", "TEST", admin)
@@ -233,9 +236,9 @@ fn tip20_view(c: &mut Criterion) {
     });
 
     c.bench_function("tip20_allowance", |b| {
-        let admin = Address::from([0u8; 20]);
-        let owner = Address::from([1u8; 20]);
-        let spender = Address::from([2u8; 20]);
+        let admin = Address::ZERO;
+        let owner = Address::repeat_byte(1u8);
+        let spender = Address::repeat_byte(2u8);
         let mut storage = HashMapStorageProvider::new(1);
         StorageCtx::enter(&mut storage, || {
             let mut token = TIP20Setup::create("TestToken", "TEST", admin)
@@ -261,7 +264,7 @@ fn tip20_view(c: &mut Criterion) {
     });
 
     c.bench_function("tip20_supply_cap", |b| {
-        let admin = Address::from([0u8; 20]);
+        let admin = Address::ZERO;
         let mut storage = HashMapStorageProvider::new(1);
         StorageCtx::enter(&mut storage, || {
             let mut token = TIP20Setup::create("TestToken", "TEST", admin)
@@ -277,7 +280,7 @@ fn tip20_view(c: &mut Criterion) {
     });
 
     c.bench_function("tip20_paused", |b| {
-        let admin = Address::from([0u8; 20]);
+        let admin = Address::ZERO;
         let mut storage = HashMapStorageProvider::new(1);
         StorageCtx::enter(&mut storage, || {
             let mut token = TIP20Setup::create("TestToken", "TEST", admin)
@@ -293,7 +296,7 @@ fn tip20_view(c: &mut Criterion) {
     });
 
     c.bench_function("tip20_transfer_policy_id", |b| {
-        let admin = Address::from([0u8; 20]);
+        let admin = Address::ZERO;
         let mut storage = HashMapStorageProvider::new(1);
         StorageCtx::enter(&mut storage, || {
             let mut token = TIP20Setup::create("TestToken", "TEST", admin)
@@ -311,8 +314,8 @@ fn tip20_view(c: &mut Criterion) {
 
 fn tip20_mutate(c: &mut Criterion) {
     c.bench_function("tip20_mint", |b| {
-        let admin = Address::from([0u8; 20]);
-        let user = Address::from([1u8; 20]);
+        let admin = Address::ZERO;
+        let user = Address::repeat_byte(1u8);
         let mut storage = HashMapStorageProvider::new(1);
         StorageCtx::enter(&mut storage, || {
             let mut token = TIP20Setup::create("TestToken", "TEST", admin)
@@ -331,7 +334,7 @@ fn tip20_mutate(c: &mut Criterion) {
     });
 
     c.bench_function("tip20_burn", |b| {
-        let admin = Address::from([0u8; 20]);
+        let admin = Address::ZERO;
         let mut storage = HashMapStorageProvider::new(1);
         StorageCtx::enter(&mut storage, || {
             let mut token = TIP20Setup::create("TestToken", "TEST", admin)
@@ -360,9 +363,9 @@ fn tip20_mutate(c: &mut Criterion) {
     });
 
     c.bench_function("tip20_approve", |b| {
-        let admin = Address::from([0u8; 20]);
-        let owner = Address::from([1u8; 20]);
-        let spender = Address::from([2u8; 20]);
+        let admin = Address::ZERO;
+        let owner = Address::repeat_byte(1u8);
+        let spender = Address::repeat_byte(2u8);
         let mut storage = HashMapStorageProvider::new(1);
         StorageCtx::enter(&mut storage, || {
             let mut token = TIP20Setup::create("TestToken", "TEST", admin)
@@ -381,9 +384,9 @@ fn tip20_mutate(c: &mut Criterion) {
     });
 
     c.bench_function("tip20_transfer", |b| {
-        let admin = Address::from([0u8; 20]);
-        let from = Address::from([1u8; 20]);
-        let to = Address::from([2u8; 20]);
+        let admin = Address::ZERO;
+        let from = Address::repeat_byte(1u8);
+        let to = Address::repeat_byte(2u8);
         let mut storage = HashMapStorageProvider::new(1);
         StorageCtx::enter(&mut storage, || {
             let mut token = TIP20Setup::create("TestToken", "TEST", admin)
@@ -413,10 +416,10 @@ fn tip20_mutate(c: &mut Criterion) {
     });
 
     c.bench_function("tip20_transfer_from", |b| {
-        let admin = Address::from([0u8; 20]);
-        let owner = Address::from([1u8; 20]);
-        let spender = Address::from([2u8; 20]);
-        let recipient = Address::from([3u8; 20]);
+        let admin = Address::ZERO;
+        let owner = Address::repeat_byte(1u8);
+        let spender = Address::repeat_byte(2u8);
+        let recipient = Address::repeat_byte(3u8);
         let mut storage = HashMapStorageProvider::new(1);
         StorageCtx::enter(&mut storage, || {
             let mut token = TIP20Setup::create("TestToken", "TEST", admin)
@@ -460,9 +463,9 @@ fn tip20_mutate(c: &mut Criterion) {
     });
 
     c.bench_function("tip20_transfer_with_memo", |b| {
-        let admin = Address::from([0u8; 20]);
-        let from = Address::from([1u8; 20]);
-        let to = Address::from([2u8; 20]);
+        let admin = Address::ZERO;
+        let from = Address::repeat_byte(1u8);
+        let to = Address::repeat_byte(2u8);
         let memo = FixedBytes::<32>::random();
         let mut storage = HashMapStorageProvider::new(1);
         StorageCtx::enter(&mut storage, || {
@@ -492,7 +495,7 @@ fn tip20_mutate(c: &mut Criterion) {
     });
 
     c.bench_function("tip20_pause", |b| {
-        let admin = Address::from([0u8; 20]);
+        let admin = Address::ZERO;
         let mut storage = HashMapStorageProvider::new(1);
         StorageCtx::enter(&mut storage, || {
             let mut token = TIP20Setup::create("TestToken", "TEST", admin)
@@ -510,7 +513,7 @@ fn tip20_mutate(c: &mut Criterion) {
     });
 
     c.bench_function("tip20_unpause", |b| {
-        let admin = Address::from([0u8; 20]);
+        let admin = Address::ZERO;
         let mut storage = HashMapStorageProvider::new(1);
         StorageCtx::enter(&mut storage, || {
             let mut token = TIP20Setup::create("TestToken", "TEST", admin)
@@ -528,7 +531,7 @@ fn tip20_mutate(c: &mut Criterion) {
     });
 
     c.bench_function("tip20_set_supply_cap", |b| {
-        let admin = Address::from([0u8; 20]);
+        let admin = Address::ZERO;
         let mut storage = HashMapStorageProvider::new(1);
         StorageCtx::enter(&mut storage, || {
             let mut token = TIP20Setup::create("TestToken", "TEST", admin)
@@ -548,7 +551,7 @@ fn tip20_mutate(c: &mut Criterion) {
     });
 
     c.bench_function("tip20_change_transfer_policy_id", |b| {
-        let admin = Address::from([0u8; 20]);
+        let admin = Address::ZERO;
         let mut storage = HashMapStorageProvider::new(1);
         StorageCtx::enter(&mut storage, || {
             let mut token = TIP20Setup::create("TestToken", "TEST", admin)
@@ -579,7 +582,7 @@ fn tip20_mutate(c: &mut Criterion) {
 
 fn tip20_factory_mutate(c: &mut Criterion) {
     c.bench_function("tip20_factory_create_token", |b| {
-        let sender = Address::from([1u8; 20]);
+        let sender = Address::repeat_byte(1u8);
         let mut storage = HashMapStorageProvider::new(1);
         StorageCtx::enter(&mut storage, || {
             // Setup pathUSD first
@@ -613,7 +616,7 @@ fn tip403_registry_view(c: &mut Criterion) {
     });
 
     c.bench_function("tip403_registry_policy_data", |b| {
-        let admin = Address::from([0u8; 20]);
+        let admin = Address::ZERO;
         let mut storage = HashMapStorageProvider::new(1);
         StorageCtx::enter(&mut storage, || {
             let mut registry = TIP403Registry::new();
@@ -639,8 +642,8 @@ fn tip403_registry_view(c: &mut Criterion) {
     });
 
     c.bench_function("tip403_registry_is_authorized", |b| {
-        let admin = Address::from([0u8; 20]);
-        let user = Address::from([1u8; 20]);
+        let admin = Address::ZERO;
+        let user = Address::repeat_byte(1u8);
         let mut storage = HashMapStorageProvider::new(1);
         StorageCtx::enter(&mut storage, || {
             let mut registry = TIP403Registry::new();
@@ -669,7 +672,7 @@ fn tip403_registry_view(c: &mut Criterion) {
 
 fn tip403_registry_mutate(c: &mut Criterion) {
     c.bench_function("tip403_registry_create_policy", |b| {
-        let admin = Address::from([0u8; 20]);
+        let admin = Address::ZERO;
         let mut storage = HashMapStorageProvider::new(1);
         StorageCtx::enter(&mut storage, || {
             let mut registry = TIP403Registry::new();
@@ -688,9 +691,9 @@ fn tip403_registry_mutate(c: &mut Criterion) {
     });
 
     c.bench_function("tip403_registry_create_policy_with_accounts", |b| {
-        let admin = Address::from([0u8; 20]);
-        let account1 = Address::from([1u8; 20]);
-        let account2 = Address::from([2u8; 20]);
+        let admin = Address::ZERO;
+        let account1 = Address::repeat_byte(1u8);
+        let account2 = Address::repeat_byte(2u8);
         let accounts = vec![account1, account2];
         let mut storage = HashMapStorageProvider::new(1);
         StorageCtx::enter(&mut storage, || {
@@ -711,7 +714,7 @@ fn tip403_registry_mutate(c: &mut Criterion) {
     });
 
     c.bench_function("tip403_registry_set_policy_admin", |b| {
-        let admin = Address::from([0u8; 20]);
+        let admin = Address::ZERO;
         let mut storage = HashMapStorageProvider::new(1);
         StorageCtx::enter(&mut storage, || {
             let mut registry = TIP403Registry::new();
@@ -738,8 +741,8 @@ fn tip403_registry_mutate(c: &mut Criterion) {
     });
 
     c.bench_function("tip403_registry_modify_policy_whitelist", |b| {
-        let admin = Address::from([0u8; 20]);
-        let user = Address::from([1u8; 20]);
+        let admin = Address::ZERO;
+        let user = Address::repeat_byte(1u8);
         let mut storage = HashMapStorageProvider::new(1);
         StorageCtx::enter(&mut storage, || {
             let mut registry = TIP403Registry::new();
@@ -767,8 +770,8 @@ fn tip403_registry_mutate(c: &mut Criterion) {
     });
 
     c.bench_function("tip403_registry_modify_policy_blacklist", |b| {
-        let admin = Address::from([0u8; 20]);
-        let user = Address::from([1u8; 20]);
+        let admin = Address::ZERO;
+        let user = Address::repeat_byte(1u8);
         let mut storage = HashMapStorageProvider::new(1);
         StorageCtx::enter(&mut storage, || {
             let mut registry = TIP403Registry::new();

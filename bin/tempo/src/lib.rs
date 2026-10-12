@@ -133,10 +133,7 @@ fn set_zone_factory_genesis_owner(genesis: &mut Genesis, owner: Address) -> eyre
         .storage
         .as_mut()
         .ok_or_eyre("DEV ZoneFactory is missing storage")?;
-    storage.insert(
-        B256::ZERO,
-        B256::from(initial_zone_factory_config(owner).to_be_bytes()),
-    );
+    storage.insert(B256::ZERO, B256::from(initial_zone_factory_config(owner)));
     Ok(())
 }
 
@@ -532,7 +529,7 @@ pub fn tempo_main_with(mut overrides: TempoOverrides) -> eyre::Result<()> {
         } else {
             None
         };
-        let chain_id = builder.config().chain.chain().id();
+        let chain_id = builder.config().chain.chain_id();
 
         #[cfg(feature = "custom-pcrs")]
         if let Some(policy) = args.custom_pcrs.clone() {
@@ -563,7 +560,7 @@ pub fn tempo_main_with(mut overrides: TempoOverrides) -> eyre::Result<()> {
         let NodeHandle {
             node,
             node_exit_future,
-        } = builder
+        } = tempo_node_launcher::launch(builder
             .node(tempo_node)
             .apply(|mut builder: WithLaunchContext<_>| {
                 // Uncertified follower mode: set debug RPC when certification is off
@@ -598,8 +595,7 @@ pub fn tempo_main_with(mut overrides: TempoOverrides) -> eyre::Result<()> {
 
                     Ok(())
                 })
-            })
-            .launch_with_debug_capabilities()
+            }))
             .await
             .wrap_err("failed launching execution node")?;
 
@@ -696,6 +692,19 @@ pub fn tempo_main_with(mut overrides: TempoOverrides) -> eyre::Result<()> {
     Ok(())
 }
 
+/// Creates a temporary directory on tmpfs where available.
+///
+/// For tests whose runtime is dominated by fsync or syncfs latency on the CI disk, which is
+/// shared with node tests, rather than by the behavior they check.
+#[cfg(test)]
+pub(crate) fn tmpfs_tempdir() -> tempfile::TempDir {
+    #[cfg(target_os = "linux")]
+    if let Ok(dir) = tempfile::tempdir_in("/dev/shm") {
+        return dir;
+    }
+    tempfile::tempdir().unwrap()
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -778,8 +787,8 @@ mod tests {
         };
         let filter = node_cmd.ext.node_args.txpool_filter.as_ref().unwrap();
         assert_eq!(filter.len(), 2);
-        assert!(filter.contains(&address!("0000000000000000000000000000000000000001")));
-        assert!(filter.contains(&address!("0000000000000000000000000000000000000002")));
+        assert!(filter.contains(&Address::with_last_byte(1)));
+        assert!(filter.contains(&Address::with_last_byte(2)));
 
         let file = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(
@@ -803,9 +812,9 @@ mod tests {
         };
         let filter = node_cmd.ext.node_args.txpool_filter.as_ref().unwrap();
         assert_eq!(filter.len(), 3);
-        assert!(filter.contains(&address!("0000000000000000000000000000000000000003")));
-        assert!(filter.contains(&address!("0000000000000000000000000000000000000004")));
-        assert!(filter.contains(&address!("0000000000000000000000000000000000000005")));
+        assert!(filter.contains(&Address::with_last_byte(3)));
+        assert!(filter.contains(&Address::with_last_byte(4)));
+        assert!(filter.contains(&Address::with_last_byte(5)));
     }
 
     #[test]
@@ -859,7 +868,7 @@ mod tests {
             code: Some(Bytes::from_static(&[0xef])),
             storage: Some(BTreeMap::from([(
                 B256::ZERO,
-                B256::from(initial_zone_factory_config(owner).to_be_bytes()),
+                B256::from(initial_zone_factory_config(owner)),
             )])),
             ..Default::default()
         };

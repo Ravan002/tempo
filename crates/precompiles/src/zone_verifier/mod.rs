@@ -14,16 +14,17 @@ use tempo_chainspec::{
     hardfork::TempoHardfork,
 };
 pub use tempo_contracts::precompiles::IZoneVerifier;
-use tempo_contracts::precompiles::{NitroBatchAttestation, ZONE_VERIFIER_ADDRESS};
-use tempo_nitro_attestation::{AWS_NITRO_ROOT_DER, to_measurements};
+use tempo_contracts::precompiles::{
+    NITRO_VERIFIER_CONFIG_V1 as MODE_NITRO_V1, NO_PROOF_FALLBACK_VERIFIER as MODE_NO_PROOF,
+    NitroBatchAttestation, ZONE_VERIFIER_ADDRESS,
+};
+use tempo_nitro_attestation::AWS_NITRO_ROOT_DER;
 use tempo_precompiles_macros::contract;
 
 pub use self::pcr::PcrError;
 use self::{attestation::verify_attestation_with_root, pcr::parse_pcrs};
 use crate::{error::Result, zone_factory::portal_address};
 
-const MODE_NITRO_V1: &[u8] = &[1];
-const MODE_NO_PROOF: &[u8] = &[2];
 const MAX_FUTURE_SKEW_MILLIS: u64 = 300_000;
 
 /// PCR0/1/2 policy changes. Each entry takes effect at its hardfork and remains in effect until a
@@ -101,7 +102,13 @@ impl ZoneVerifier {
         let Some(approved_pcrs) = approved_pcrs else {
             return Ok(false);
         };
-        if to_measurements(&attestation.pcrs) != Some(approved_pcrs) {
+        if !approved_pcrs.iter().enumerate().all(|(index, expected)| {
+            attestation
+                .pcrs
+                .iter()
+                .find(|pcr| usize::from(pcr.index) == index)
+                .is_some_and(|pcr| pcr.value.as_slice() == expected)
+        }) {
             return Ok(false);
         }
 
@@ -223,7 +230,13 @@ pub enum PolicyError {
 mod tests {
     use super::*;
     use crate::storage::{StorageCtx, hashmap::HashMapStorageProvider};
-    use alloy::{primitives::Bytes, sol_types::SolCall};
+    use alloy::{
+        primitives::{Bytes, b256},
+        sol_types::SolCall,
+    };
+    use tempo_contracts::zones::{
+        BlockTransition, DepositQueueTransition, TokenEnablementTransition,
+    };
 
     const BLOCK_TIMESTAMP: u64 = attestation::tests::BLOCK_TIMESTAMP;
 
@@ -235,17 +248,17 @@ mod tests {
             anchorBlockHash: B256::with_last_byte(11),
             expectedWithdrawalBatchIndex: 13,
             nextZoneHeight: U256::from(14),
-            blockTransition: IZoneVerifier::BlockTransition {
+            blockTransition: BlockTransition {
                 prevBlockHash: B256::with_last_byte(1),
                 nextBlockHash: B256::with_last_byte(2),
             },
-            depositQueueTransition: IZoneVerifier::DepositQueueTransition {
+            depositQueueTransition: DepositQueueTransition {
                 prevProcessedHash: B256::with_last_byte(3),
                 nextProcessedHash: B256::with_last_byte(4),
                 prevDepositNumber: 5,
                 nextDepositNumber: 6,
             },
-            tokenEnablementTransition: IZoneVerifier::TokenEnablementTransition {
+            tokenEnablementTransition: TokenEnablementTransition {
                 prevProcessedTokenCount: 7,
                 nextProcessedTokenCount: 8,
             },
@@ -263,15 +276,11 @@ mod tests {
         );
         assert_eq!(
             keccak256(NitroBatchAttestation::eip712_encode_type().as_bytes()),
-            B256::from(alloy::primitives::hex!(
-                "b6f39555cba9bf38842c669ea0c90bca6aad793881d75a0034e33352fbecb25e"
-            ))
+            b256!("b6f39555cba9bf38842c669ea0c90bca6aad793881d75a0034e33352fbecb25e")
         );
         assert_eq!(
             batch_commitment(42_431, &call()),
-            B256::from(alloy::primitives::hex!(
-                "1a703e80dd395e4720d1c88c877ed9f7d77c03052a985133b25cbf3e2b745b9d"
-            ))
+            b256!("1a703e80dd395e4720d1c88c877ed9f7d77c03052a985133b25cbf3e2b745b9d")
         );
     }
 
