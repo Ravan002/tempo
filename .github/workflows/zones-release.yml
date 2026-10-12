@@ -205,7 +205,7 @@ jobs:
           binary_checksum_name="${binary_name}.sha256"
 
           cp out/tempo-zone "$binary_name"
-          tar czf "$archive_name" "$binary_name"
+          tar --owner=0 --group=0 --numeric-owner --mode=0755 -czf "$archive_name" "$binary_name"
           shasum -a 256 "$archive_name" > "${archive_name}.sha256"
           printf '%s  %s\n' "$(sha256sum out/tempo-zone | awk '{print $1}')" "$binary_name" \
             > "$binary_checksum_name"
@@ -281,6 +281,9 @@ jobs:
     permissions:
       contents: read
       id-token: write
+    outputs:
+      archive_sha256: ${{ steps.verify.outputs.archive_sha256 }}
+      manifest_artifact_id: ${{ steps.manifest.outputs.artifact-id }}
     steps:
       - name: Secure runner
         uses: tempoxyz/gh-actions/actions/secure-runner@55fe3b63d9612623cc51e6c62d9d62fbcb175fb0 # 2026-09-29T01-25-15Z-55fe3b63
@@ -292,6 +295,7 @@ jobs:
           path: ${{ runner.temp }}/canonical-linux-x86_64-assets
 
       - name: Verify archived binary against clean rebuild
+        id: verify
         shell: bash
         env:
           COMMIT_SHA: ${{ needs.resolve-release.outputs.commit_sha }}
@@ -396,9 +400,23 @@ jobs:
             exit 1
           }
 
-          mapfile -t archive_entries < <(tar -tzf "$archive_path")
-          if [[ ${#archive_entries[@]} -ne 1 || "${archive_entries[0]}" != "$binary_name" ]]; then
-            failure="candidate archive does not contain exactly $binary_name"
+          # Validate headers before extraction: matching bytes alone cannot
+          # rule out a root-owned setuid executable or a link in the archive.
+          if ! python3 - "$archive_path" "$binary_name" <<'PY'
+          import sys
+          import tarfile
+
+          with tarfile.open(sys.argv[1], "r:gz") as archive:
+              members = archive.getmembers()
+              if len(members) != 1:
+                  raise SystemExit("Expected exactly one archive member")
+              member = members[0]
+              if (member.name != sys.argv[2] or not member.isfile()
+                      or member.uid != 0 or member.gid != 0 or member.mode != 0o755):
+                  raise SystemExit("Expected a root-owned regular binary with mode 0755")
+          PY
+          then
+            failure="candidate archive has unsafe member headers"
             echo "$failure" >&2
             exit 1
           fi
@@ -435,9 +453,11 @@ jobs:
           fi
 
           comparison_result="success"
+          echo "archive_sha256=$candidate_archive_sha256" >> "$GITHUB_OUTPUT"
           echo "Canonical Linux x86_64 release binary checksum matches clean rebuild"
 
       - name: Upload release verification manifest
+        id: manifest
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -531,7 +551,8 @@ jobs:
       - compare-linux-x86_64-release
       - build-other-release
     if: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dry_run == false) }}
-    runs-on: depot-ubuntu-latest
+    # Keep the release write token outside the candidate builder's trust domain.
+    runs-on: ubuntu-latest
     permissions:
       id-token: write
       contents: write
@@ -569,8 +590,33 @@ jobs:
       - name: Download Linux x86_64 verification manifest
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: tempo-zone-linux-x86_64-reproducible-verification
+          artifact-ids: ${{ needs.compare-linux-x86_64-release.outputs.manifest_artifact_id }}
           path: artifacts/verification
+
+      - name: Bind canonical assets to independent verification
+        env:
+          VERSION: ${{ needs.resolve-release.outputs.version }}
+          COMMIT_SHA: ${{ needs.resolve-release.outputs.commit_sha }}
+          CANDIDATE_ARTIFACT_ID: ${{ needs.build-linux-x86_64-release.outputs.asset_artifact_id }}
+          VERIFIED_ARCHIVE_SHA256: ${{ needs.compare-linux-x86_64-release.outputs.archive_sha256 }}
+          CLEAN_REBUILD_SHA256: ${{ needs.rebuild-linux-x86_64-release.outputs.binary_sha256 }}
+        run: |
+          set -euo pipefail
+          manifest=artifacts/verification/tempo-zone-linux-x86_64-verification.json
+          jq -e --arg commit "$COMMIT_SHA" --arg version "$VERSION" \
+            --arg artifact "$CANDIDATE_ARTIFACT_ID" --arg archive "$VERIFIED_ARCHIVE_SHA256" \
+            --arg binary "$CLEAN_REBUILD_SHA256" \
+            '.comparison_result == "success" and .commit_sha == $commit and .version == $version and
+             .candidate_artifact_id == $artifact and .candidate_archive_sha256 == $archive and
+             .candidate_binary_sha256 == $binary and .clean_rebuild_binary_sha256 == $binary' \
+            "$manifest" > /dev/null
+          binary_name="tempo-zone-${VERSION}-x86_64-unknown-linux-gnu"
+          cd artifacts/canonical
+          printf '%s  %s\n' "$VERIFIED_ARCHIVE_SHA256" "${binary_name}.tar.gz" \
+            > "${binary_name}.tar.gz.sha256"
+          sha256sum --strict --check "${binary_name}.tar.gz.sha256"
+          # Publish checksums from trusted verification, not candidate declarations.
+          printf '%s  %s\n' "$CLEAN_REBUILD_SHA256" "$binary_name" > "${binary_name}.sha256"
 
       - name: Create Release
         env:
