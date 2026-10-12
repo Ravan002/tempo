@@ -40,7 +40,7 @@ import {
     WithdrawalQueueLib
 } from "../../src/runtime/libraries/WithdrawalQueueLib.sol";
 import { ZoneMessenger } from "../../src/runtime/tempo/ZoneMessenger.sol";
-import { ZonePortal } from "../../src/runtime/tempo/ZonePortal.sol";
+import { ZonePortalT14 as ZonePortal } from "../../src/runtime/tempo/ZonePortalT14.sol";
 import { BaseTest } from "../BaseTest.t.sol";
 import { PortalRuntimeTest } from "../PortalRuntimeTest.sol";
 import { MockRevertingReceiver } from "../mocks/MockCallbackReceivers.sol";

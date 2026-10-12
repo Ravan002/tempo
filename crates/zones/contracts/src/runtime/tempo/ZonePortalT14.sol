@@ -35,7 +35,7 @@ import { ITIP403Registry } from "tempo-std/interfaces/ITIP403Registry.sol";
 
 /// @title ZonePortal
 /// @notice Per-zone portal that escrows zone tokens on Tempo and manages deposits/withdrawals
-contract ZonePortal is IZonePortal {
+contract ZonePortalT14 is IZonePortal {
 
     using WithdrawalQueueLib for WithdrawalQueue;
 
