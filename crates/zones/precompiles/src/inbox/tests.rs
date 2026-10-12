@@ -5,8 +5,10 @@ use alloy_primitives::{B256, Bytes, U256, address, keccak256};
 use alloy_sol_types::{SolCall, SolError, SolValue};
 use revm::precompile::PrecompileResult;
 use tempo_chainspec::hardfork::TempoHardfork;
-use tempo_contracts::precompiles::UnknownFunctionSelector;
-use tempo_contracts::zones::{MAX_UNPROCESSED_DEPOSITS, MAX_UNPROCESSED_TOKEN_ENABLEMENTS};
+use tempo_contracts::{
+    precompiles::UnknownFunctionSelector,
+    zones::{MAX_UNPROCESSED_DEPOSITS, MAX_UNPROCESSED_TOKEN_ENABLEMENTS},
+};
 use tempo_precompiles::{
     PATH_USD_ADDRESS, RECEIVE_POLICY_GUARD_ADDRESS, TIP403_REGISTRY_ADDRESS,
     receive_policy_guard::ReceivePolicyGuard,

@@ -37,4 +37,7 @@ thiserror = { version = "2", default-features = false }
 [features]
 default = []
 cli = ["dep:eyre", "dep:reth-cli"]
-test-utils = []
+test-utils = [
+	"reth-chainspec/test-utils",
+	"tempo-primitives/test-utils"
+]

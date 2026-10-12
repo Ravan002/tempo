@@ -10,8 +10,8 @@ pub fn continuous_seconds() -> f64 {
     {
         #[repr(C)]
         struct Timebase {
-            numer: u32,
-            denom: u32,
+            numerator: u32,
+            denominator: u32,
         }
         unsafe extern "C" {
             fn mach_continuous_time() -> u64;
@@ -19,11 +19,14 @@ pub fn continuous_seconds() -> f64 {
         }
         static SCALE: OnceLock<f64> = OnceLock::new();
         let scale = SCALE.get_or_init(|| {
-            let mut base = Timebase { numer: 0, denom: 0 };
+            let mut base = Timebase {
+                numerator: 0,
+                denominator: 0,
+            };
             // SAFETY: the OS writes exactly one initialized Timebase structure.
             let result = unsafe { mach_timebase_info(&mut base) };
             assert_eq!(result, 0);
-            f64::from(base.numer) / f64::from(base.denom) / 1e9
+            f64::from(base.numerator) / f64::from(base.denominator) / 1e9
         });
         // SAFETY: this OS clock takes no pointers and has no mutable process state.
         (unsafe { mach_continuous_time() } as f64) * scale

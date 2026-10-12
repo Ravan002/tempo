@@ -23,7 +23,6 @@ hyper-util = { version = "0.1", features = ["tokio", "server-auto", "service"], 
 rustls = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 tokio-rustls = { version = "0.26", optional = true }
-rustls-pemfile = { version = "2", optional = true }
 tracing = { workspace = true, optional = true }
 
 [dev-dependencies]
@@ -32,4 +31,4 @@ alloy-signer.workspace = true
 
 [features]
 default = []
-transport = ["dep:axum", "dep:eyre", "dep:hyper-util", "dep:rustls", "dep:tokio", "dep:tokio-rustls", "dep:rustls-pemfile", "dep:tracing"]
+transport = ["dep:axum", "dep:eyre", "dep:hyper-util", "dep:rustls", "dep:tokio", "dep:tokio-rustls", "dep:tracing"]

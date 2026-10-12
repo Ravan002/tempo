@@ -30,6 +30,6 @@ path = "src/main.rs"
 [features]
 default = ["asm-keccak", "jemalloc", "keccak-cache-global"]
 
-asm-keccak = ["zone-node/asm-keccak"]
-jemalloc = ["reth-cli-util/jemalloc", "zone-node/jemalloc"]
-keccak-cache-global = ["zone-node/keccak-cache-global"]
+asm-keccak = ["zone-node/asm-keccak", "reth-node-core/asm-keccak"]
+jemalloc = ["reth-cli-util/jemalloc", "zone-node/jemalloc", "reth-node-core/jemalloc"]
+keccak-cache-global = ["zone-node/keccak-cache-global", "reth-node-core/keccak-cache-global"]

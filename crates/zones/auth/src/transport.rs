@@ -8,8 +8,12 @@ use hyper_util::{
     server::conn::auto::Builder,
     service::TowerToHyperService,
 };
-use rustls::{RootCertStore, ServerConfig, server::WebPkiClientVerifier};
-use std::{fs::File, io::BufReader, path::PathBuf, sync::Arc, time::Duration};
+use rustls::{
+    RootCertStore, ServerConfig,
+    pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject},
+    server::WebPkiClientVerifier,
+};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 use tokio::{
     net::TcpListener,
     sync::{Semaphore, watch},
@@ -46,12 +50,10 @@ impl GatewayTlsConfig {
             self.gateway_certificate_hash != B256::ZERO,
             "gateway certificate pin is required"
         );
-        let certificates =
-            rustls_pemfile::certs(&mut BufReader::new(File::open(&self.certificate)?))
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-        let key = rustls_pemfile::private_key(&mut BufReader::new(File::open(&self.private_key)?))?
-            .ok_or_else(|| eyre::eyre!("missing server private key"))?;
-        let authorities = rustls_pemfile::certs(&mut BufReader::new(File::open(&self.gateway_ca)?))
+        let certificates = CertificateDer::pem_file_iter(&self.certificate)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let key = PrivateKeyDer::from_pem_file(&self.private_key)?;
+        let authorities = CertificateDer::pem_file_iter(&self.gateway_ca)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         ensure!(!authorities.is_empty(), "gateway CA is empty");
         let mut roots = RootCertStore::empty();
@@ -251,9 +253,7 @@ mod tests {
         client: Option<&str>,
     ) -> Result<String> {
         let mut roots = RootCertStore::empty();
-        for cert in
-            rustls_pemfile::certs(&mut BufReader::new(File::open(directory.join("ca.pem"))?))
-        {
+        for cert in CertificateDer::pem_file_iter(directory.join("ca.pem"))? {
             roots.add(cert?)?;
         }
         let builder =
@@ -261,14 +261,9 @@ mod tests {
                 .with_safe_default_protocol_versions()?
                 .with_root_certificates(roots);
         let config = if let Some(client) = client {
-            let certs = rustls_pemfile::certs(&mut BufReader::new(File::open(
-                directory.join(format!("{client}.pem")),
-            )?))
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-            let key = rustls_pemfile::private_key(&mut BufReader::new(File::open(
-                directory.join(format!("{client}.key")),
-            )?))?
-            .unwrap();
+            let certs = CertificateDer::pem_file_iter(directory.join(format!("{client}.pem")))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let key = PrivateKeyDer::from_pem_file(directory.join(format!("{client}.key")))?;
             builder.with_client_auth_cert(certs, key)?
         } else {
             builder.with_no_client_auth()
@@ -289,12 +284,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn only_pinned_mutually_authenticated_peer_receives_extension() {
         let directory = certificates();
-        let cert = rustls_pemfile::certs(&mut BufReader::new(
-            File::open(directory.0.join("client.pem")).unwrap(),
-        ))
-        .next()
-        .unwrap()
-        .unwrap();
+        let cert = CertificateDer::from_pem_file(directory.0.join("client.pem")).unwrap();
         let config = GatewayTlsConfig {
             certificate: directory.0.join("server.pem"),
             private_key: directory.0.join("server.key"),

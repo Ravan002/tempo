@@ -51,21 +51,29 @@ tempo-precompiles = { workspace = true, features = ["test-utils"] }
 
 [features]
 default = ["std"]
-test-utils = ["tempo-precompiles/test-utils"]
+dst = ["tempo-precompiles/dst"]
+test-utils = [
+	"tempo-precompiles/test-utils",
+	"tempo-primitives/test-utils"
+]
 std = [
-    "tempo-contracts/std",
-    "zone-primitives/std",
-    "tempo-primitives/std",
-    "alloy-consensus/std",
-    "alloy-evm/std",
-    "alloy-primitives/std",
-    "alloy-rlp/std",
-    "alloy-sol-types/std",
-    "revm/std",
-    "aes-gcm/std",
-    "k256/std",
-    "sha2/std",
-    "rand/std",
+	"tempo-contracts/std",
+	"zone-primitives/std",
+	"tempo-primitives/std",
+	"alloy-consensus/std",
+	"alloy-evm/std",
+	"alloy-primitives/std",
+	"alloy-rlp/std",
+	"alloy-sol-types/std",
+	"revm/std",
+	"aes-gcm/std",
+	"k256/std",
+	"sha2/std",
+	"rand/std",
+	"alloy/std",
+	"derive_more/std",
+	"serde/std",
+	"tempo-chainspec/std"
 ]
 
 [[test]]

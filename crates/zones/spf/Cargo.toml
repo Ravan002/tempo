@@ -44,8 +44,18 @@ thiserror = "2"
 [features]
 default = ["serde"]
 serde = [
-    "dep:serde",
-    "alloy-primitives/serde",
-    "tempo-contracts/serde",
-    "zone-primitives/serde",
+	"dep:serde",
+	"alloy-primitives/serde",
+	"tempo-contracts/serde",
+	"zone-primitives/serde",
+	"alloy-consensus/serde",
+	"alloy-eips/serde",
+	"reth-primitives-traits/serde",
+	"reth-storage-api/serde",
+	"reth-trie-common/serde",
+	"revm/serde",
+	"tempo-chainspec/serde",
+	"tempo-precompiles/serde",
+	"tempo-primitives/serde",
+	"tempo-revm/serde"
 ]

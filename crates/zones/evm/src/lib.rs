@@ -474,11 +474,11 @@ mod tests {
         hardfork::TempoHardfork,
         spec::{MODERATO, TempoHardforks},
     };
+    use tempo_contracts::zones::IZoneInbox;
     use tempo_precompiles::{
         TIP403_REGISTRY_ADDRESS, storage::StorageKey, tip403_registry::tip403_registry_slots,
         zone_factory::ZonePortalStorage,
     };
-    use tempo_contracts::zones::IZoneInbox;
     use zone_precompiles::{
         tempo_state::{TEMPO_BLOCK_NUMBER_SLOT, slots::TEMPO_BLOCK_HASH},
         test_utils::MockL1Reader,

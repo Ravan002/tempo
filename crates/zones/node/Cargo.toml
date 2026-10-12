@@ -137,7 +137,16 @@ url = "2"
 
 [features]
 default = []
-asm-keccak = ["alloy-primitives/asm-keccak"]
+asm-keccak = [
+  "alloy-primitives/asm-keccak",
+  "alloy/asm-keccak",
+  "alloy-evm/asm-keccak",
+  "reth-node-core/asm-keccak",
+  "revm/asm-keccak",
+  "tempo-alloy/asm-keccak",
+  "tempo-node/asm-keccak",
+  "zone-node/asm-keccak",
+]
 cli = [
   "dep:clap",
   "dep:reth-ethereum",
@@ -147,16 +156,25 @@ cli = [
   "dep:zone-checker",
   "zone-chainspec/cli",
 ]
-jemalloc = ["reth-ethereum?/jemalloc"]
-keccak-cache-global = ["alloy-primitives/keccak-cache-global"]
+jemalloc = ["reth-ethereum?/jemalloc", "reth-node-core/jemalloc", "reth-provider/jemalloc", "tempo-node/jemalloc", "zone-node/jemalloc"]
+keccak-cache-global = ["alloy-primitives/keccak-cache-global", "reth-ethereum?/keccak-cache-global", "reth-node-core/keccak-cache-global", "zone-node/keccak-cache-global"]
 test-utils = [
-  "reth-chainspec/test-utils",
-  "reth-ethereum?/test-utils",
-  "reth-node-builder/test-utils",
-  "reth-payload-builder/test-utils",
-  "reth-primitives-traits/test-utils",
-  "reth-provider/test-utils",
-  "reth-transaction-pool/test-utils",
-  "tempo-precompiles/test-utils",
-  "tempo-transaction-pool/test-utils",
+	"reth-chainspec/test-utils",
+	"reth-ethereum?/test-utils",
+	"reth-node-builder/test-utils",
+	"reth-payload-builder/test-utils",
+	"reth-primitives-traits/test-utils",
+	"reth-provider/test-utils",
+	"reth-transaction-pool/test-utils",
+	"tempo-precompiles/test-utils",
+	"tempo-transaction-pool/test-utils",
+	"reth-chain-state/test-utils",
+	"reth-evm/test-utils",
+	"reth-revm/test-utils",
+	"reth-tasks/test-utils",
+	"reth-trie-common/test-utils",
+	"tempo-primitives/test-utils",
+	"zone-chainspec/test-utils",
+	"zone-node/test-utils",
+	"zone-precompiles/test-utils"
 ]
