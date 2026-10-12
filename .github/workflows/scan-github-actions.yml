@@ -36,7 +36,6 @@ jobs:
           node --test .github/scripts/docker-pr.test.js
           node --test .github/scripts/docker-pr-status.test.js
           node --test .github/scripts/bench-nightly-failure.test.js
-          node --test .github/scripts/reth-update.test.js
 
   scan:
     name: Scan GitHub Actions

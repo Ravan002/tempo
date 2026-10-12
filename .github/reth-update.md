@@ -49,6 +49,4 @@ human-member comment dispatcher. Benchmark settings and its own Slack/reporting
 remain in that reusable workflow. Update/follow-up failures alert reth on-call.
 The existing reth-bump candidate-image workflow remains unchanged.
 
-Adapter tests run with the existing CI helper tests. Live worker/STS/benchmark
-integration remains a manual enablement check; tests do not run Amp or mutate
-upstream dependencies.
+Live worker/STS/benchmark integration remains a manual enablement check.
