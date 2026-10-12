@@ -327,7 +327,10 @@ mod tests {
     use clap::Parser;
     use serde_json::json;
     use tempo_alloy::rpc::ForkInfo;
-    use tempo_contracts::precompiles::ZoneInfo;
+    use tempo_contracts::{
+        precompiles::ZoneInfo,
+        zones::{BlockTransition, DepositQueueTransition, TokenEnablementTransition},
+    };
     use tempo_primitives::{TempoTransaction, transaction::Call};
 
     const PORTAL: Address = address!("5ad0000000000000000000000000000000000001");
@@ -359,11 +362,26 @@ mod tests {
             value: U256::ZERO,
             input: submitBatchCall {
                 tempoBlockNumber: 1,
+                recentTempoBlockNumber: 0,
+                blockTransition: BlockTransition {
+                    prevBlockHash: B256::ZERO,
+                    nextBlockHash: B256::ZERO,
+                },
+                depositQueueTransition: DepositQueueTransition {
+                    prevProcessedHash: B256::ZERO,
+                    nextProcessedHash: B256::ZERO,
+                    prevDepositNumber: 0,
+                    nextDepositNumber: 0,
+                },
+                tokenEnablementTransition: TokenEnablementTransition {
+                    prevProcessedTokenCount: 0,
+                    nextProcessedTokenCount: 0,
+                },
+                withdrawalQueueHash: B256::ZERO,
                 verifierConfig: config.to_vec().into(),
                 proof,
                 nextZoneHeight: U256::ONE,
                 signatures: Vec::new(),
-                ..Default::default()
             }
             .abi_encode()
             .into(),
@@ -392,7 +410,15 @@ mod tests {
     }
 
     fn batch_log(number: u64, tx_hash: B256) -> Log {
-        let event = BatchSubmitted::default();
+        let event = BatchSubmitted {
+            withdrawalBatchIndex: 0,
+            withdrawalQueueIndex: U256::ZERO,
+            nextProcessedDepositQueueHash: B256::ZERO,
+            nextBlockHash: B256::ZERO,
+            withdrawalQueueHash: B256::ZERO,
+            lastProcessedDepositNumber: 0,
+            lastProcessedEnabledTokenCount: 0,
+        };
         Log {
             inner: alloy_primitives::Log {
                 address: PORTAL,
