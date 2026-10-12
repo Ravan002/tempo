@@ -2,7 +2,7 @@
 
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
-use alloy_primitives::Address;
+use alloy_primitives::{Address, B256};
 use alloy_provider::{Provider, ProviderBuilder};
 use alloy_signer_local::PrivateKeySigner;
 use clap::{Args, CommandFactory, FromArgMatches};
@@ -146,6 +146,19 @@ fn run_node(mut cli: Cli<ZoneChainSpecParser, ZoneArgs>) -> eyre::Result<()> {
         builder.config_mut().rpc.disable_auth_server = true;
         builder.config_mut().rpc.rpc_max_logs_per_response = MAX_LOGS_PER_RESPONSE.into();
         builder.config_mut().rpc.rpc_max_blocks_per_filter = MAX_BLOCKS_PER_FILTER.into();
+        let gateway_tls = match (
+            args.gateway_rpc_certificate.clone(), args.gateway_rpc_private_key.clone(),
+            args.gateway_rpc_ca.clone(), args.gateway_rpc_client_pin,
+        ) {
+            (None, None, None, None) => None,
+            (Some(certificate), Some(private_key), Some(gateway_ca), Some(gateway_certificate_hash)) => {
+                // Keep ordinary unredacted verifier/operator endpoints on loopback.
+                builder.config_mut().rpc.http_addr = std::net::Ipv4Addr::LOCALHOST.into();
+                builder.config_mut().rpc.ws_addr = std::net::Ipv4Addr::LOCALHOST.into();
+                Some(zone_rpc::GatewayTlsConfig { certificate, private_key, gateway_ca, gateway_certificate_hash })
+            }
+            _ => eyre::bail!("gateway RPC requires certificate, private key, dedicated CA and client certificate pin"),
+        };
 
         let mut node = ZoneNode::new(
             args.l1_rpc_url.clone(),
@@ -155,6 +168,8 @@ fn run_node(mut cli: Cli<ZoneChainSpecParser, ZoneArgs>) -> eyre::Result<()> {
         )
         .with_withdrawal_batch_interval_blocks(args.zone_batch_interval_blocks)
         .with_redacted_rpc(ZoneRedactedRpcConfig {
+            bind_address: Some(args.redacted_rpc_addr),
+            gateway_tls,
             redacted_rpc_port: args.redacted_rpc_port,
             zone_id,
             max_auth_token_validity: Duration::from_secs(
@@ -553,6 +568,27 @@ pub struct ZoneArgs {
         default_value_t = 8544
     )]
     pub redacted_rpc_port: u16,
+
+    /// Listener bind address. Context-aware mode still requires mTLS on this address.
+    #[arg(
+        long = "redacted-rpc.addr",
+        env = "REDACTED_RPC_ADDR",
+        default_value = "127.0.0.1"
+    )]
+    pub redacted_rpc_addr: std::net::IpAddr,
+
+    /// Private gateway listener server certificate. Enables authenticated context mode.
+    #[arg(long = "gateway-rpc.cert", requires_all = ["gateway_rpc_private_key", "gateway_rpc_ca", "gateway_rpc_client_pin"])]
+    pub gateway_rpc_certificate: Option<PathBuf>,
+    /// Server TLS private key for the private gateway listener.
+    #[arg(long = "gateway-rpc.key", requires = "gateway_rpc_certificate")]
+    pub gateway_rpc_private_key: Option<PathBuf>,
+    /// Dedicated trusted CA for gateway workload client certificates.
+    #[arg(long = "gateway-rpc.ca", requires = "gateway_rpc_certificate")]
+    pub gateway_rpc_ca: Option<PathBuf>,
+    /// Keccak256 of the gateway workload's DER leaf certificate.
+    #[arg(long = "gateway-rpc.client-pin", requires = "gateway_rpc_certificate")]
+    pub gateway_rpc_client_pin: Option<B256>,
 
     /// Maximum auth token validity window the redacted RPC accepts, in seconds.
     #[arg(

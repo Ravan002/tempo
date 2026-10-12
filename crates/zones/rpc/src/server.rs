@@ -6,7 +6,7 @@
 //! Supports both HTTP POST and WebSocket transports.
 
 use axum::{
-    Router,
+    Extension, Router,
     body::Bytes,
     extract::State,
     http::{HeaderMap, StatusCode, header},
@@ -22,6 +22,7 @@ use tempo_primitives::transaction::{
     tt_signature::{KeychainSignature, TempoSignature},
 };
 use tracing::info;
+use zone_auth::transport::{GatewayTlsConfig, VerifiedGatewayPeer, serve_gateway};
 
 use crate::{
     auth::{self, AuthContext, now_unix_seconds},
@@ -45,6 +46,8 @@ pub struct RpcState {
     pub api: Arc<dyn ZoneRpcApi>,
     /// Authentication failure metric for the redacted RPC.
     auth_metrics: RedactedRpcAuthMetrics,
+    pub(crate) gateway_context: bool,
+    pub(crate) gateway_shutdown: Option<tokio::sync::watch::Receiver<bool>>,
 }
 
 /// Start the redacted zone RPC server.
@@ -60,6 +63,8 @@ pub async fn start_redacted_rpc(
         config,
         api,
         auth_metrics: RedactedRpcAuthMetrics::default(),
+        gateway_context: false,
+        gateway_shutdown: None,
     });
 
     let app = Router::new()
@@ -79,6 +84,108 @@ pub async fn start_redacted_rpc(
     });
 
     Ok(local_addr)
+}
+
+/// A private listener's lifecycle. Dropping the handle stops new connections.
+pub struct GatewayRpcHandle {
+    pub local_addr: std::net::SocketAddr,
+    shutdown: tokio::sync::watch::Sender<bool>,
+    task: Option<tokio::task::JoinHandle<eyre::Result<()>>>,
+}
+impl GatewayRpcHandle {
+    pub async fn stopped(&mut self) -> eyre::Result<()> {
+        if let Some(task) = self.task.as_mut() {
+            task.await??;
+        }
+        Ok(())
+    }
+    pub async fn shutdown(mut self) -> eyre::Result<()> {
+        let _ = self.shutdown.send(true);
+        if let Some(task) = self.task.take() {
+            task.await??;
+        }
+        Ok(())
+    }
+}
+impl Drop for GatewayRpcHandle {
+    fn drop(&mut self) {
+        let _ = self.shutdown.send(true);
+    }
+}
+
+/// Start a dedicated mTLS listener whose account context is authenticated by the service.
+/// The legacy listener never reads these headers as account authority.
+pub async fn start_gateway_rpc(
+    config: RedactedRpcConfig,
+    api: Arc<dyn ZoneRpcApi>,
+    tls: GatewayTlsConfig,
+) -> eyre::Result<GatewayRpcHandle> {
+    tls.validate()?;
+    let listener = tokio::net::TcpListener::bind(config.listen_addr).await?;
+    let local_addr = listener.local_addr()?;
+    let (shutdown, stop) = tokio::sync::watch::channel(false);
+    let state = Arc::new(RpcState {
+        config,
+        api,
+        auth_metrics: RedactedRpcAuthMetrics::default(),
+        gateway_context: true,
+        gateway_shutdown: Some(stop.clone()),
+    });
+    let router = Router::new()
+        .route("/", post(handle_rpc))
+        .route("/", get(handle_ws_upgrade))
+        .route("/gateway/context", get(gateway_protocol))
+        .with_state(state);
+    let task = tokio::spawn(serve_gateway(listener, router, tls, stop));
+    Ok(GatewayRpcHandle {
+        local_addr,
+        shutdown,
+        task: Some(task),
+    })
+}
+
+async fn gateway_protocol(
+    peer: Option<Extension<VerifiedGatewayPeer>>,
+) -> axum::response::Response {
+    if peer.is_none() {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    axum::Json(serde_json::json!({"protocol":1})).into_response()
+}
+
+pub(crate) fn authenticate_gateway(
+    headers: &HeaderMap,
+    peer: Option<&VerifiedGatewayPeer>,
+) -> Result<AuthContext, StatusCode> {
+    if peer.is_none() {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let field = |name: &str| -> Result<&str, StatusCode> {
+        if headers.get_all(name).iter().count() != 1 {
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .ok_or(StatusCode::UNAUTHORIZED)
+    };
+    if field("x-zone-context-version")? != "1" {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let caller = field("x-zone-account")?
+        .parse()
+        .map_err(|_| StatusCode::UNAUTHORIZED)?;
+    let expires_at: u64 = field("x-zone-expires-at")?
+        .parse()
+        .map_err(|_| StatusCode::UNAUTHORIZED)?;
+    if expires_at <= now_unix_seconds() {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    Ok(AuthContext {
+        caller,
+        expires_at,
+        keychain_key_id: None,
+    })
 }
 
 /// Pre-serialized JSON-RPC response body.
@@ -265,17 +372,25 @@ pub(crate) async fn dispatch_request(
 /// Main HTTP RPC handler — authenticates, dispatches, returns response.
 async fn handle_rpc(
     State(state): State<Arc<RpcState>>,
+    peer: Option<Extension<VerifiedGatewayPeer>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
-    let auth = match authenticate(&headers, &state.config, state.api.as_ref()).await {
-        Ok(auth) => auth,
-        Err(e) => {
-            if e.is_invalid() {
-                state.auth_metrics.auth_failures_total.increment(1);
+    let auth = if state.gateway_context {
+        match authenticate_gateway(&headers, peer.as_ref().map(|value| &value.0)) {
+            Ok(auth) => auth,
+            Err(status) => return status.into_response(),
+        }
+    } else {
+        match authenticate(&headers, &state.config, state.api.as_ref()).await {
+            Ok(auth) => auth,
+            Err(e) => {
+                if e.is_invalid() {
+                    state.auth_metrics.auth_failures_total.increment(1);
+                }
+                e.log("http");
+                return (e.status_code(), "").into_response();
             }
-            e.log("http");
-            return (e.status_code(), "").into_response();
         }
     };
 

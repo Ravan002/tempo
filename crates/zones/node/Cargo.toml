@@ -118,7 +118,7 @@ const-hex.workspace = true
 commonware-codec.workspace = true
 commonware-cryptography.workspace = true
 p256.workspace = true
-rand.workspace = true
+rand = "0.8"
 reth-ethereum = { workspace = true, features = ["node", "test-utils"] }
 reth-tracing.workspace = true
 reth-trie-common.workspace = true

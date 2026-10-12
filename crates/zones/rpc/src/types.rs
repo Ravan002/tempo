@@ -401,76 +401,8 @@ pub struct SetLeaderResponse {
     pub requested_leader: Address,
 }
 
-macro_rules! define_methods {
-    ($($variant:ident => $name:literal),+ $(,)?) => {
-        /// JSON-RPC method exposed by the redacted RPC.
-        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-        pub(crate) enum Method {
-            $($variant,)+
-        }
-
-        impl Method {
-            #[cfg(test)]
-            pub(crate) const ALL: &'static [Self] = &[
-                $(Self::$variant,)+
-            ];
-
-            /// Parse an exposed JSON-RPC method name into the authoritative method registry.
-            pub(crate) fn from_name(name: &str) -> Option<Self> {
-                match name {
-                    $($name => Some(Self::$variant),)+
-                    _ => None,
-                }
-            }
-
-            /// Exposed method name, also used as its bounded metrics label.
-            pub(crate) const fn name(self) -> &'static str {
-                match self {
-                    $(Self::$variant => $name,)+
-                }
-            }
-
-            /// Normalize a raw method name into the bounded metrics label set.
-            pub(crate) fn metric_label(name: &str) -> &'static str {
-                Self::from_name(name).map(Self::name).unwrap_or("unknown")
-            }
-        }
-    };
-}
-
-define_methods! {
-    EthBlockNumber => "eth_blockNumber",
-    EthChainId => "eth_chainId",
-    EthGasPrice => "eth_gasPrice",
-    EthGetBalance => "eth_getBalance",
-    EthGetTransactionCount => "eth_getTransactionCount",
-    EthCall => "eth_call",
-    EthEstimateGas => "eth_estimateGas",
-    EthFeeHistory => "eth_feeHistory",
-    EthMaxPriorityFeePerGas => "eth_maxPriorityFeePerGas",
-    EthGetBlockByNumber => "eth_getBlockByNumber",
-    EthGetBlockByHash => "eth_getBlockByHash",
-    EthSyncing => "eth_syncing",
-    EthCoinbase => "eth_coinbase",
-    NetVersion => "net_version",
-    NetListening => "net_listening",
-    Web3ClientVersion => "web3_clientVersion",
-    Web3Sha3 => "web3_sha3",
-    ZoneGetAuthorizationTokenInfo => "zone_getAuthorizationTokenInfo",
-    ZoneGetZoneInfo => "zone_getZoneInfo",
-    ZoneGetEncryptionKey => "zone_getEncryptionKey",
-    EthGetTransactionByHash => "eth_getTransactionByHash",
-    EthGetTransactionReceipt => "eth_getTransactionReceipt",
-    EthGetLogs => "eth_getLogs",
-    EthGetFilterLogs => "eth_getFilterLogs",
-    EthGetFilterChanges => "eth_getFilterChanges",
-    EthNewFilter => "eth_newFilter",
-    EthNewBlockFilter => "eth_newBlockFilter",
-    EthUninstallFilter => "eth_uninstallFilter",
-    EthFillTransaction => "eth_fillTransaction",
-    EthSendRawTransaction => "eth_sendRawTransaction",
-    EthSendRawTransactionSync => "eth_sendRawTransactionSync",
-}
+// One method registry defines backend dispatch and gateway scope classification.
+pub use zone_auth::RpcMethod as Method;
 
 /// Pre-serialized JSON `null`.
 pub fn raw_null() -> Box<RawValue> {

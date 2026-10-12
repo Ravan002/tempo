@@ -13,6 +13,7 @@ workspace = true
 [dependencies]
 # zones
 zone-primitives = { workspace = true, features = ["serde"] }
+zone-auth = { workspace = true, features = ["transport"] }
 
 # tempo
 tempo-alloy.workspace = true
@@ -52,7 +53,10 @@ url = "2"
 [dev-dependencies]
 base64.workspace = true
 p256.workspace = true
-rand.workspace = true
+rand = "0.8"
+rcgen = { workspace = true, features = ["pem"] }
+tempfile.workspace = true
+rustls.workspace = true
 sha2.workspace = true
 tokio-tungstenite.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

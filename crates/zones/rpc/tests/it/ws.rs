@@ -142,15 +142,48 @@ impl ZoneRpcApi for MockZoneRpcApi {
     stub!(gas_price);
     stub!(max_priority_fee_per_gas);
     stub!(fee_history, _a: u64, _b: alloy_rpc_types_eth::BlockNumberOrTag, _c: Option<Vec<f64>>);
-    stub!(get_balance, _a: Address, _b: Option<alloy_rpc_types_eth::BlockId>, _c: zone_rpc::auth::AuthContext);
+    fn get_balance(
+        &self,
+        account: Address,
+        _block: Option<alloy_rpc_types_eth::BlockId>,
+        auth: zone_rpc::auth::AuthContext,
+    ) -> BoxFut<'_> {
+        Box::pin(async move {
+            if account == auth.caller {
+                zone_rpc::types::to_raw(&"0x2a")
+            } else {
+                Ok(zone_rpc::types::raw_zero())
+            }
+        })
+    }
     stub!(get_transaction_count, _a: Address, _b: Option<alloy_rpc_types_eth::BlockId>, _c: zone_rpc::auth::AuthContext);
     stub!(block_by_number, _a: alloy_rpc_types_eth::BlockNumberOrTag, _b: bool, _c: zone_rpc::auth::AuthContext);
     stub!(block_by_hash, _a: alloy_primitives::B256, _b: bool, _c: zone_rpc::auth::AuthContext);
     stub!(transaction_by_hash, _a: alloy_primitives::B256, _c: zone_rpc::auth::AuthContext);
     stub!(transaction_receipt, _a: alloy_primitives::B256, _c: zone_rpc::auth::AuthContext);
-    stub!(call, _a: tempo_alloy::rpc::TempoTransactionRequest, _b: Option<alloy_rpc_types_eth::BlockId>, _c: Option<alloy_rpc_types_eth::state::StateOverride>, _d: zone_rpc::auth::AuthContext);
+    fn call(
+        &self,
+        mut request: tempo_alloy::rpc::TempoTransactionRequest,
+        _block: Option<alloy_rpc_types_eth::BlockId>,
+        _state: Option<alloy_rpc_types_eth::state::StateOverride>,
+        auth: zone_rpc::auth::AuthContext,
+    ) -> BoxFut<'_> {
+        Box::pin(async move {
+            zone_rpc::policy::enforce_authorized(&mut request, &auth)?;
+            zone_rpc::types::to_raw(&auth.caller)
+        })
+    }
     stub!(estimate_gas, _a: tempo_alloy::rpc::TempoTransactionRequest, _b: Option<alloy_rpc_types_eth::BlockId>, _c: Option<alloy_rpc_types_eth::state::StateOverride>, _d: zone_rpc::auth::AuthContext);
-    stub!(send_raw_transaction, _a: alloy_primitives::Bytes, _c: zone_rpc::auth::AuthContext);
+    fn send_raw_transaction(
+        &self,
+        data: alloy_primitives::Bytes,
+        auth: zone_rpc::auth::AuthContext,
+    ) -> BoxFut<'_> {
+        Box::pin(async move {
+            zone_rpc::policy::verify_raw_tx_sender(&data, &auth)?;
+            zone_rpc::types::to_raw(&B256::repeat_byte(0x33))
+        })
+    }
     fn send_raw_transaction_sync(
         &self,
         _data: alloy_primitives::Bytes,
@@ -263,6 +296,282 @@ impl ZoneRpcApi for MockZoneRpcApi {
 
 const ZONE_ID: u32 = 1;
 const CHAIN_ID: u64 = 42;
+
+#[tokio::test]
+async fn private_gateway_rpc_authenticates_context_and_preserves_account_policy() {
+    use alloy_consensus::{SignableTransaction, TxLegacy};
+    use alloy_eips::eip2718::Encodable2718;
+    use alloy_primitives::{TxKind, keccak256};
+    use rcgen::{
+        BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
+    };
+
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let directory = tempfile::tempdir().unwrap();
+    let mut ca_params = CertificateParams::new(vec![]).unwrap();
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    let ca_key = KeyPair::generate().unwrap();
+    let ca = ca_params.self_signed(&ca_key).unwrap();
+    let issuer = Issuer::from_params(&ca_params, &ca_key);
+    let server_key = KeyPair::generate().unwrap();
+    let mut server_params = CertificateParams::new(vec!["localhost".into()]).unwrap();
+    server_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+    let server = server_params.signed_by(&server_key, &issuer).unwrap();
+    let client_key = KeyPair::generate().unwrap();
+    let mut client_params = CertificateParams::new(vec![]).unwrap();
+    client_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+    let client = client_params.signed_by(&client_key, &issuer).unwrap();
+    let client_pem = format!("{}{}", client.pem(), client_key.serialize_pem());
+    std::fs::write(directory.path().join("server.pem"), server.pem()).unwrap();
+    std::fs::write(
+        directory.path().join("server.key"),
+        server_key.serialize_pem(),
+    )
+    .unwrap();
+    std::fs::write(directory.path().join("ca.pem"), ca.pem()).unwrap();
+    let config = RedactedRpcConfig {
+        listen_addr: ([127, 0, 0, 1], 0).into(),
+        zone_id: ZONE_ID,
+        chain_id: CHAIN_ID,
+        max_auth_token_validity: Duration::from_secs(600),
+        max_response_size: 1 << 20,
+        zone_portal: Address::ZERO,
+    };
+    let private = zone_rpc::start_gateway_rpc(
+        config,
+        Arc::new(MockZoneRpcApi::default()),
+        zone_rpc::GatewayTlsConfig {
+            certificate: directory.path().join("server.pem"),
+            private_key: directory.path().join("server.key"),
+            gateway_ca: directory.path().join("ca.pem"),
+            gateway_certificate_hash: keccak256(client.der().as_ref()),
+        },
+    )
+    .await
+    .unwrap();
+    let url = format!("https://localhost:{}", private.local_addr.port());
+    let http = reqwest::Client::builder()
+        .no_proxy()
+        .tls_certs_only([reqwest::Certificate::from_pem(ca.pem().as_bytes()).unwrap()])
+        .identity(reqwest::Identity::from_pem(client_pem.as_bytes()).unwrap())
+        .build()
+        .unwrap();
+    let untrusted = reqwest::Client::builder()
+        .no_proxy()
+        .tls_certs_only([reqwest::Certificate::from_pem(ca.pem().as_bytes()).unwrap()])
+        .build()
+        .unwrap();
+    assert_eq!(
+        http.get(format!("{url}/gateway/context"))
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap(),
+        json!({"protocol":1})
+    );
+    assert!(
+        untrusted
+            .get(format!("{url}/gateway/context"))
+            .send()
+            .await
+            .is_err()
+    );
+    let signer = PrivateKeySigner::random();
+    let caller = signer.address();
+    let expires = now_secs() + 600;
+    let request = |method: &str, params: Value| json!({"jsonrpc":"2.0","id":1,"method":method,"params":params});
+    let authenticated = |method: &str, params: Value| {
+        http.post(&url)
+            .header("x-zone-account", caller.to_string())
+            .header("x-zone-expires-at", expires.to_string())
+            .header("x-zone-context-version", "1")
+            .json(&request(method, params))
+    };
+    let info = authenticated("zone_getAuthorizationTokenInfo", json!([]))
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    assert_eq!(info["result"]["account"], json!(caller));
+    {
+        use tungstenite::client::IntoClientRequest;
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(ca.der().clone()).unwrap();
+        let tls = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_client_auth_cert(
+            vec![client.der().clone()],
+            rustls::pki_types::PrivatePkcs8KeyDer::from(client_key.serialize_der()).into(),
+        )
+        .unwrap();
+        let mut upgrade = format!("wss://localhost:{}/", private.local_addr.port())
+            .into_client_request()
+            .unwrap();
+        upgrade
+            .headers_mut()
+            .insert("x-zone-account", caller.to_string().parse().unwrap());
+        upgrade
+            .headers_mut()
+            .insert("x-zone-expires-at", expires.to_string().parse().unwrap());
+        upgrade
+            .headers_mut()
+            .insert("x-zone-context-version", "1".parse().unwrap());
+        let (mut socket, _) = tokio_tungstenite::connect_async_tls_with_config(
+            upgrade,
+            None,
+            false,
+            Some(tokio_tungstenite::Connector::Rustls(Arc::new(tls))),
+        )
+        .await
+        .unwrap();
+        socket
+            .send(tungstenite::Message::Text(
+                request("zone_getAuthorizationTokenInfo", json!([]))
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        let reply: Value =
+            serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+        assert_eq!(reply["result"]["account"], json!(caller));
+        socket.close(None).await.unwrap();
+    }
+    assert_eq!(
+        authenticated("eth_getBalance", json!([caller, "latest"]))
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap()["result"],
+        json!("0x2a")
+    );
+    let other = Address::repeat_byte(0x55);
+    assert_eq!(
+        authenticated("eth_getBalance", json!([other, "latest"]))
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap()["result"],
+        json!("0x0")
+    );
+    assert_eq!(
+        authenticated(
+            "eth_call",
+            json!([{"from":other,"to":Address::repeat_byte(0x66)},"latest"])
+        )
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap()["error"]["code"],
+        json!(-32004)
+    );
+    let raw = |signer: &PrivateKeySigner| {
+        let tx = TxLegacy {
+            chain_id: Some(CHAIN_ID),
+            gas_limit: 21_000,
+            to: TxKind::Call(other),
+            ..Default::default()
+        };
+        let signature = signer.sign_hash_sync(&tx.signature_hash()).unwrap();
+        alloy_primitives::Bytes::from(
+            tempo_primitives::TempoTxEnvelope::from(tx.into_signed(signature)).encoded_2718(),
+        )
+    };
+    assert!(
+        authenticated("eth_sendRawTransaction", json!([raw(&signer)]))
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap()
+            .get("result")
+            .is_some()
+    );
+    assert_eq!(
+        authenticated(
+            "eth_sendRawTransaction",
+            json!([raw(&PrivateKeySigner::random())])
+        )
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap()["error"]["code"],
+        json!(-32003)
+    );
+    for (expiry, version, account) in [
+        (expires, "2", caller.to_string()),
+        (now_secs(), "1", caller.to_string()),
+        (expires, "1", "forged".into()),
+    ] {
+        assert_eq!(
+            http.post(&url)
+                .header("x-zone-account", account)
+                .header("x-zone-expires-at", expiry.to_string())
+                .header("x-zone-context-version", version)
+                .json(&request("eth_chainId", json!([])))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::UNAUTHORIZED
+        );
+    }
+    assert_eq!(
+        http.post(&url)
+            .json(&request("eth_chainId", json!([])))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+    let public = TestContext::start(MockZoneRpcApi::default()).await;
+    let forged = reqwest::Client::new()
+        .post(format!("http://{}", public.addr))
+        .header("x-zone-account", caller.to_string())
+        .header("x-zone-expires-at", expires.to_string())
+        .header("x-zone-context-version", "1")
+        .json(&request("zone_getAuthorizationTokenInfo", json!([])))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(forged.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let public_info = reqwest::Client::new()
+        .post(format!("http://{}", public.addr))
+        .header("x-authorization-token", public.build_token())
+        .header("x-zone-account", caller.to_string())
+        .header("x-zone-expires-at", expires.to_string())
+        .header("x-zone-context-version", "1")
+        .json(&request("zone_getAuthorizationTokenInfo", json!([])))
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    assert_eq!(
+        public_info["result"]["account"],
+        json!(public.signer.address())
+    );
+    private.shutdown().await.unwrap();
+}
 
 struct TestContext {
     addr: std::net::SocketAddr,

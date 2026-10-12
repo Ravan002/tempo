@@ -24,5 +24,6 @@ pub use config::RedactedRpcConfig;
 pub use debug::{ZoneDebugApi, ZoneDebugApiRpcServer};
 pub use handlers::ZoneRpcApi;
 pub use provider::{ZoneProvider, ZoneProviderConfig};
-pub use server::start_redacted_rpc;
+pub use server::{GatewayRpcHandle, start_gateway_rpc, start_redacted_rpc};
 pub use subscription::{BoxWsSubscriptionFut, WsSubscriptionStream};
+pub use zone_auth::transport::GatewayTlsConfig;

@@ -324,6 +324,10 @@ pub async fn dispatch(
         Method::ZoneGetEncryptionKey => {
             api_result(id, method, api.zone_get_encryption_key(auth.clone()).await)
         }
+        Method::EthSubscribe | Method::EthUnsubscribe => JsonRpcResponse::error(
+            id,
+            JsonRpcError::invalid_params("subscriptions require WebSocket transport"),
+        ),
     }
 }
 

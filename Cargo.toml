@@ -15,6 +15,11 @@ exclude = ["crates/nitro-attestation/fuzz"]
 members = [
   "bin/tempo",
   "bin/tempo-sidecar",
+  "crates/zones/auth",
+  "crates/zones/gateway",
+  "crates/zones/rpc",
+  "crates/zones/node",
+  "bin/tempo-zone",
   "crates/alloy",
   "crates/chainspec",
   "crates/consensus",
@@ -139,6 +144,30 @@ panic = "abort"
 incremental = false
 
 [workspace.dependencies]
+alloy-chains = "0.2.36"
+bincode = "1.3.3"
+minicbor = { version = "=2.3.0", default-features = false, features = ["alloc"] }
+minicbor-serde = { version = "=0.7.1", default-features = false, features = ["alloc"] }
+rcgen = { version = "0.14.7", default-features = false, features = ["crypto", "aws_lc_rs"] }
+reth-chain-state = { git = "https://github.com/paradigmxyz/reth", rev = "1a4dbbe" }
+reth-exex = { git = "https://github.com/paradigmxyz/reth", rev = "1a4dbbe" }
+reth-trie-sparse = { git = "https://github.com/paradigmxyz/reth", rev = "1a4dbbe", default-features = false, features = ["std"] }
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["aws_lc_rs"] }
+toml = "0.9.12"
+zone-chainspec = { path = "crates/zones/chainspec" }
+zone-checker = { path = "crates/zones/checker" }
+zone-evm = { path = "crates/zones/evm" }
+zone-l1 = { path = "crates/zones/l1" }
+zone-p2p = { path = "crates/zones/p2p" }
+zone-payload = { path = "crates/zones/payload" }
+zone-precompiles = { path = "crates/zones/precompiles", default-features = false }
+zone-prover = { path = "crates/zones/prover" }
+zone-sequencer = { path = "crates/zones/sequencer" }
+zone-spf = { path = "crates/zones/spf" }
+zone-auth = { path = "crates/zones/auth" }
+zone-gateway = { path = "crates/zones/gateway" }
+zone-rpc = { path = "crates/zones/rpc" }
+zone-node = { path = "crates/zones/node" }
 tempo-state-bloat = { path = "crates/state-bloat" }
 aws-lc-rs = { version = "1.17.0", default-features = false, features = ["alloc", "non-fips", "ring-sig-verify"] }
 tempo-alloy = { path = "crates/alloy" }
@@ -256,6 +285,7 @@ alloy-rlp = { version = "0.3.16", default-features = false }
 alloy-rpc-client = { version = "2.5.0", default-features = false }
 alloy-rpc-types-admin = "2.5.0"
 alloy-rpc-types-engine = "2.5.0"
+alloy-rpc-types-debug = "2.5.0"
 alloy-rpc-types-eth = { version = "2.5.0" }
 alloy-serde = { version = "2.5.0", default-features = false }
 alloy-signer = "2.5.0"
@@ -339,6 +369,7 @@ thiserror = "2.0.18"
 tokio = { version = "1.49.0", features = ["full"] }
 tokio-stream = { version = "0.1.18" }
 tokio-util = "0.7.18"
+tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
 tower = { version = "0.5", default-features = false }
 tracy-client = "0.18.4"
 tracing = "0.1.44"

@@ -245,6 +245,10 @@ impl ZoneProverConfig {
 /// Configuration for the Zone redacted RPC server extension.
 #[derive(Debug, Clone, Default)]
 pub struct ZoneRedactedRpcConfig {
+    /// Bind address. Unspecified programmatic configurations stay on loopback.
+    pub bind_address: Option<std::net::IpAddr>,
+    /// Replace the legacy listener with the authenticated private context listener.
+    pub gateway_tls: Option<zone_rpc::GatewayTlsConfig>,
     /// Port for RPC traffic.
     pub redacted_rpc_port: u16,
     /// Zone ID used by redacted RPC authentication.
@@ -918,6 +922,7 @@ where
             self.enabled_tokens.clone(),
             chain_id,
             max_response_size,
+            task_executor.clone(),
         )
         .await?;
 
@@ -1607,6 +1612,7 @@ where
         enabled_tokens: EnabledTokenRegistry,
         chain_id: u64,
         max_response_size: usize,
+        task_executor: reth_tasks::TaskExecutor,
     ) -> eyre::Result<()> {
         let eth_handlers = handle.eth_handlers().clone();
         let l1_provider = alloy_provider::ProviderBuilder::new_with_network::<TempoNetwork>()
@@ -1617,7 +1623,13 @@ where
             .await?
             .erased();
         let redacted_rpc_config = zone_rpc::RedactedRpcConfig {
-            listen_addr: ([0, 0, 0, 0], config.redacted_rpc_port).into(),
+            listen_addr: (
+                config
+                    .bind_address
+                    .unwrap_or(std::net::Ipv4Addr::LOCALHOST.into()),
+                config.redacted_rpc_port,
+            )
+                .into(),
             zone_id: config.zone_id,
             chain_id,
             max_auth_token_validity: config.max_auth_token_validity,
@@ -1630,6 +1642,27 @@ where
             enabled_tokens,
             l1_provider,
         ));
+        if let Some(tls) = config.gateway_tls {
+            let mut private = zone_rpc::start_gateway_rpc(redacted_rpc_config, api, tls).await?;
+            info!(target: "reth::cli", local_addr=%private.local_addr, "Authenticated gateway RPC server started");
+            task_executor.spawn_critical_with_graceful_shutdown_signal(
+                "zone-gateway-rpc",
+                move |shutdown| async move {
+                    tokio::select! {
+                        result = private.stopped() => {
+                            panic!("private gateway RPC stopped unexpectedly: {result:?}");
+                        }
+                        guard = shutdown => {
+                            if let Err(error) = private.shutdown().await {
+                                tracing::error!(%error, "private gateway RPC shutdown failed");
+                            }
+                            drop(guard);
+                        }
+                    }
+                },
+            );
+            return Ok(());
+        }
         let local_addr = start_redacted_rpc(redacted_rpc_config, api).await?;
         info!(target: "reth::cli", %local_addr, "Redacted zone RPC server started");
 

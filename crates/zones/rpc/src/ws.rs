@@ -12,6 +12,7 @@ use alloy_rpc_types_eth::{
     pubsub::{Params as SubscriptionParams, SubscriptionKind},
 };
 use axum::{
+    Extension,
     extract::{
         Query, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
@@ -32,12 +33,13 @@ use tokio::{
     task::JoinHandle,
 };
 use tracing::warn;
+use zone_auth::transport::VerifiedGatewayPeer;
 
 use crate::{
     auth::{self, AuthContext, AuthError},
     server::{
-        MAX_BATCH_SIZE, RpcState, append_batch_response, authenticate_token, dispatch_request,
-        serialize_response_with_limit, validate_keychain_key_info,
+        MAX_BATCH_SIZE, RpcState, append_batch_response, authenticate_gateway, authenticate_token,
+        dispatch_request, serialize_response_with_limit, validate_keychain_key_info,
     },
     subscription::WsSubscriptionStream,
     types::{JsonRpcError, JsonRpcRequest, JsonRpcResponse, to_raw},
@@ -496,6 +498,7 @@ async fn keychain_auth_still_valid(auth: &AuthContext, state: &RpcState) -> bool
 /// WebSocket upgrade handler — authenticates via header or `?token=` query param.
 pub(crate) async fn handle_ws_upgrade(
     State(state): State<Arc<RpcState>>,
+    peer: Option<Extension<VerifiedGatewayPeer>>,
     headers: HeaderMap,
     Query(query): Query<WsQuery>,
     ws: WebSocketUpgrade,
@@ -506,9 +509,16 @@ pub(crate) async fn handle_ws_upgrade(
         .and_then(|v| v.to_str().ok())
         .or(query.token.as_deref());
 
-    let auth = match token_str {
-        Some(token) => authenticate_token(token, &state.config, state.api.as_ref()).await,
-        None => Err(AuthError::Missing.into()),
+    let auth = if state.gateway_context {
+        match authenticate_gateway(&headers, peer.as_ref().map(|value| &value.0)) {
+            Ok(auth) => Ok(auth),
+            Err(status) => return (status, "").into_response(),
+        }
+    } else {
+        match token_str {
+            Some(token) => authenticate_token(token, &state.config, state.api.as_ref()).await,
+            None => Err(AuthError::Missing.into()),
+        }
     };
 
     let auth = match auth {
@@ -548,12 +558,19 @@ async fn handle_ws_session(
         tokio::pin!(token_expiry);
         let mut keychain_recheck = tokio::time::interval(Duration::from_secs(1));
         let mut close_session_rx = close_session_rx;
+        let mut gateway_shutdown = state.gateway_shutdown.clone();
 
         loop {
             tokio::select! {
                 biased;
                 _ = &mut token_expiry => break,
                 _ = close_session_rx.changed() => break,
+                _ = async {
+                    if let Some(shutdown) = &mut gateway_shutdown {
+                        if *shutdown.borrow() { return; }
+                        let _ = shutdown.changed().await;
+                    } else { std::future::pending::<()>().await; }
+                } => break,
                 _ = keychain_recheck.tick(), if auth.keychain_key_id.is_some() => {
                     // Revalidation may be slow; allow token expiry / forced close to
                     // interrupt it so those deadlines are not delayed by a hung RPC.
