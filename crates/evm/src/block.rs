@@ -27,7 +27,7 @@ use tempo_contracts::precompiles::{
     ADDRESS_REGISTRY_ADDRESS, CURRENT_COMMITTEE_ADDRESS, ICurrentCommittee, INITIAL_FACTORY_OWNER,
     InitialZoneFactoryAccount, RECEIVE_POLICY_GUARD_ADDRESS, SIGNATURE_VERIFIER_ADDRESS,
     STORAGE_CREDITS_ADDRESS, TIP20_CHANNEL_RESERVE_ADDRESS, VALIDATOR_CONFIG_V2_ADDRESS,
-    initial_zone_factory_state, t13_zone_factory_state,
+    initial_zone_factory_state, t13_zone_factory_state, t14_zone_factory_state,
 };
 use tempo_primitives::{SubBlockMetadata, TempoReceipt, TempoTxEnvelope, TempoTxType};
 use tempo_revm::{ExecutionContext, evm::TempoContext};
@@ -280,9 +280,9 @@ where
     }
 
     /// Installs shared Zone runtimes without modifying their existing storage.
-    fn install_zone_runtimes_at_boundary(
+    fn install_zone_runtimes_at_boundary<const N: usize>(
         &mut self,
-        runtimes: [InitialZoneFactoryAccount; 3],
+        runtimes: [InitialZoneFactoryAccount; N],
     ) -> Result<(), BlockExecutionError> {
         let db = self.inner.evm.db_mut();
         let mut state = EvmState::default();
@@ -487,6 +487,12 @@ where
             }
         }
     }
+
+    /// Installs the pause-gated refund runtime at T14.
+    fn upgrade_zone_refunds_at_boundary(&mut self) -> Result<(), BlockExecutionError> {
+        let [_, portal, _, _] = t14_zone_factory_state(INITIAL_FACTORY_OWNER);
+        self.install_zone_runtimes_at_boundary([portal])
+    }
 }
 
 impl<'a, DB, I> BlockExecutor for TempoBlockExecutor<'a, DB, I>
@@ -546,12 +552,22 @@ where
         // allocations (including locally compiled contracts on test chains). Chains
         // that activate T13 later still follow the normal runtime upgrade path.
         if self.inner.spec.is_t13_active_at_timestamp(timestamp)
+            && !self.inner.spec.is_t14_active_at_timestamp(timestamp)
             && !self
                 .inner
                 .spec
                 .is_t13_active_at_timestamp(self.inner.spec.genesis().timestamp)
         {
             self.upgrade_zone_runtimes_at_boundary()?;
+        }
+        // Preserve genesis-supplied runtimes on chains starting at T14, just as at T13.
+        if self.inner.spec.is_t14_active_at_timestamp(timestamp)
+            && !self
+                .inner
+                .spec
+                .is_t14_active_at_timestamp(self.inner.spec.genesis().timestamp)
+        {
+            self.upgrade_zone_refunds_at_boundary()?;
         }
 
         Ok(())
@@ -762,7 +778,8 @@ mod tests {
         },
         zones::{
             T13_ZONE_MESSENGER_RUNTIME, T13_ZONE_PORTAL_RUNTIME, T13_ZONE_VERIFIER_RUNTIME,
-            ZONE_MESSENGER_RUNTIME, ZONE_PORTAL_RUNTIME, ZONE_VERIFIER_RUNTIME,
+            T14_ZONE_PORTAL_RUNTIME, ZONE_MESSENGER_RUNTIME, ZONE_PORTAL_RUNTIME,
+            ZONE_VERIFIER_RUNTIME,
         },
     };
     use tempo_dkg_onchain_artifacts::OnchainDkgOutcome;
@@ -2092,65 +2109,77 @@ mod tests {
     }
 
     #[test]
-    fn t13_at_genesis_preserves_zone_runtimes() {
-        // Use the actual genesis timestamp, not just t13Time == 0.
-        for (genesis_timestamp, activation) in [(0, 0), (100, 50), (100, 100)] {
-            let mut genesis = DEV.genesis().clone();
-            genesis.timestamp = genesis_timestamp;
-            genesis
-                .config
-                .extra_fields
-                .insert_value("t13Time".into(), activation)
-                .unwrap();
-            let chainspec = Arc::new(TempoChainSpec::from_genesis(genesis));
-            let mut db = State::builder().with_bundle_update().build();
-            let mut expected = Vec::new();
-            for (index, address) in [
-                ZONE_FACTORY_ADDRESS,
-                ZONE_PORTAL_IMPL_ADDRESS,
-                ZONE_VERIFIER_ADDRESS,
-                ZONE_MESSENGER_ADDRESS,
-            ]
-            .into_iter()
-            .enumerate()
-            {
-                let code = Bytecode::new_legacy(Bytes::from(vec![0x00, index as u8]));
-                let info = AccountInfo {
-                    balance: U256::from(42),
-                    nonce: 7,
-                    code_hash: code.hash_slow(),
-                    code: Some(code),
-                    ..Default::default()
-                };
-                db.insert_account_with_storage(
-                    address,
-                    info.clone(),
-                    [(U256::from(9), U256::from(123))].into_iter().collect(),
-                );
-                expected.push((address, info));
-            }
-            for block_number in [1, 2] {
-                let mut executor = TestExecutorBuilder::default()
-                    .with_spec(TempoHardfork::T13)
-                    .with_block_number(block_number)
-                    .with_parent_beacon_block_root(B256::ZERO)
-                    .build(&mut db, &chainspec);
-                executor.evm_mut().ctx_mut().block.timestamp =
-                    U256::from(genesis_timestamp + block_number);
-                executor.apply_pre_execution_changes().unwrap();
-                drop(executor);
-                for (address, info) in &expected {
-                    assert_eq!(
-                        &db.load_cache_account(*address)
-                            .unwrap()
-                            .account_info()
-                            .unwrap(),
-                        info
+    fn zone_runtimes_active_at_genesis_preserve_allocations() {
+        // Use the actual genesis timestamp, not just a zero activation time.
+        for (fork, key) in [
+            (TempoHardfork::T13, "t13Time"),
+            (TempoHardfork::T14, "t14Time"),
+        ] {
+            for (genesis_timestamp, activation) in [(0, 0), (100, 50), (100, 100)] {
+                let mut genesis = DEV.genesis().clone();
+                genesis.timestamp = genesis_timestamp;
+                if fork == TempoHardfork::T13 {
+                    genesis
+                        .config
+                        .extra_fields
+                        .insert_value("t14Time".into(), serde_json::Value::Null)
+                        .unwrap();
+                }
+                genesis
+                    .config
+                    .extra_fields
+                    .insert_value(key.into(), activation)
+                    .unwrap();
+                let chainspec = Arc::new(TempoChainSpec::from_genesis(genesis));
+                let mut db = State::builder().with_bundle_update().build();
+                let mut expected = Vec::new();
+                for (index, address) in [
+                    ZONE_FACTORY_ADDRESS,
+                    ZONE_PORTAL_IMPL_ADDRESS,
+                    ZONE_VERIFIER_ADDRESS,
+                    ZONE_MESSENGER_ADDRESS,
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    let code = Bytecode::new_legacy(Bytes::from(vec![0x00, index as u8]));
+                    let info = AccountInfo {
+                        balance: U256::from(42),
+                        nonce: 7,
+                        code_hash: code.hash_slow(),
+                        code: Some(code),
+                        ..Default::default()
+                    };
+                    db.insert_account_with_storage(
+                        address,
+                        info.clone(),
+                        [(U256::from(9), U256::from(123))].into_iter().collect(),
                     );
-                    assert_eq!(
-                        revm::Database::storage(&mut db, *address, U256::from(9)).unwrap(),
-                        U256::from(123)
-                    );
+                    expected.push((address, info));
+                }
+                for block_number in [1, 2] {
+                    let mut executor = TestExecutorBuilder::default()
+                        .with_spec(fork)
+                        .with_block_number(block_number)
+                        .with_parent_beacon_block_root(B256::ZERO)
+                        .build(&mut db, &chainspec);
+                    executor.evm_mut().ctx_mut().block.timestamp =
+                        U256::from(genesis_timestamp + block_number);
+                    executor.apply_pre_execution_changes().unwrap();
+                    drop(executor);
+                    for (address, info) in &expected {
+                        assert_eq!(
+                            &db.load_cache_account(*address)
+                                .unwrap()
+                                .account_info()
+                                .unwrap(),
+                            info
+                        );
+                        assert_eq!(
+                            revm::Database::storage(&mut db, *address, U256::from(9)).unwrap(),
+                            U256::from(123)
+                        );
+                    }
                 }
             }
         }
@@ -2197,6 +2226,11 @@ mod tests {
             ),
         ] {
             let mut genesis = DEV.genesis().clone();
+            genesis
+                .config
+                .extra_fields
+                .insert_value("t14Time".into(), serde_json::Value::Null)
+                .unwrap();
             genesis
                 .config
                 .extra_fields
@@ -2416,5 +2450,83 @@ mod tests {
              not block_regular_gas_used ({})",
             result.gas_used, cumulative, regular
         );
+    }
+
+    #[test]
+    fn zone_runtime_upgrade_activates_at_t14() {
+        for activation in [u64::MAX, 10] {
+            let mut genesis = DEV.genesis().clone();
+            genesis
+                .config
+                .extra_fields
+                .insert_value("t14Time".into(), activation)
+                .unwrap();
+            let chainspec = Arc::new(TempoChainSpec::from_genesis(genesis));
+            let mut db = State::builder().with_bundle_update().build();
+            // T13-at-genesis chains may supply custom verifier and messenger runtimes.
+            let mut runtimes = t13_zone_factory_state(INITIAL_FACTORY_OWNER);
+            runtimes[2].code = Bytes::from_static(&[0x00, 0x02]);
+            runtimes[3].code = Bytes::from_static(&[0x00, 0x03]);
+            for runtime in runtimes.clone() {
+                let code = Bytecode::new_legacy(runtime.code);
+                db.insert_account_with_storage(
+                    runtime.address,
+                    AccountInfo {
+                        balance: U256::from(42),
+                        nonce: 7,
+                        code_hash: code.hash_slow(),
+                        code: Some(code),
+                        ..Default::default()
+                    },
+                    [(U256::from(9), U256::from(123))].into_iter().collect(),
+                );
+            }
+            let hook_calls = Arc::new(Mutex::new(Vec::<EvmState>::new()));
+            let hook_calls_clone = hook_calls.clone();
+            db.set_state_hook(Some(Box::new(move |state: EvmState| {
+                if state.contains_key(&ZONE_PORTAL_IMPL_ADDRESS) {
+                    hook_calls_clone.lock().unwrap().push(state);
+                }
+            })));
+            for timestamp in [9, 10, 11] {
+                let mut executor = TestExecutorBuilder::default()
+                    .with_spec(if timestamp >= activation {
+                        TempoHardfork::T14
+                    } else {
+                        TempoHardfork::T13
+                    })
+                    .with_parent_beacon_block_root(B256::ZERO)
+                    .build(&mut db, &chainspec);
+                executor.evm_mut().ctx_mut().block.timestamp = U256::from(timestamp);
+                executor.apply_pre_execution_changes().unwrap();
+                drop(executor);
+                for runtime in runtimes.clone() {
+                    let expected =
+                        if runtime.address == ZONE_PORTAL_IMPL_ADDRESS && timestamp >= activation {
+                            T14_ZONE_PORTAL_RUNTIME
+                        } else {
+                            runtime.code
+                        };
+                    let info = db
+                        .load_cache_account(runtime.address)
+                        .unwrap()
+                        .account_info()
+                        .unwrap();
+                    assert_eq!(info.code.unwrap().original_bytes(), expected);
+                    assert_eq!(info.nonce, 7);
+                    assert_eq!(info.balance, U256::from(42));
+                    assert_eq!(
+                        revm::Database::storage(&mut db, runtime.address, U256::from(9)).unwrap(),
+                        U256::from(123)
+                    );
+                }
+            }
+            let calls = hook_calls.lock().unwrap();
+            assert_eq!(calls.len(), usize::from(activation == 10));
+            if let Some(state) = calls.first() {
+                assert_eq!(state.len(), 1);
+                assert!(state.contains_key(&ZONE_PORTAL_IMPL_ADDRESS));
+            }
+        }
     }
 }

@@ -1237,7 +1237,7 @@ contract ZonePortal is IZonePortal {
         }
     }
 
-    function claimRefund(address token) external returns (uint128 amount) {
+    function claimRefund(address token) external whenNotPaused returns (uint128 amount) {
         _requireAllowed(msg.sender);
         amount = refunds[token][msg.sender];
         refunds[token][msg.sender] = 0;

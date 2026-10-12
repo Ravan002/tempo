@@ -5661,6 +5661,57 @@ contract ZonePortalTest is BaseTest {
         assertEq(portal.refunds(address(pathUSD), alice), 0);
     }
 
+    function test_claimRefund_revertsWhenPaused() public {
+        vm.prank(sequencer);
+        portal.pause();
+
+        vm.prank(alice);
+        vm.expectRevert(IZonePortal.PortalIsPaused.selector);
+        portal.claimRefund(address(pathUSD));
+    }
+
+    function test_claimRefund_preservesRefundWhilePaused(bool resumeEarly) public {
+        vm.fee(0);
+        uint128 amount = 250e6;
+        _fundCallbackWithdrawal(amount);
+        Withdrawal memory withdrawal =
+            _withdrawal(address(pathUSD), alice, bob, amount, bytes32(0), 0, address(0), "");
+        _enqueueWithdrawal(withdrawal);
+        vm.mockCall(
+            address(pathUSD),
+            abi.encodeWithSelector(ITIP20.transfer.selector, bob, amount),
+            abi.encode(false)
+        );
+        portal.processWithdrawals(_singleWithdrawal(withdrawal), bytes32(0));
+        vm.clearMockedCalls();
+        assertEq(portal.refunds(address(pathUSD), bob), amount);
+
+        vm.prank(sequencer);
+        portal.pause();
+        uint256 bobBalanceBefore = pathUSD.balanceOf(bob);
+        uint256 portalBalanceBefore = pathUSD.balanceOf(address(portal));
+
+        vm.prank(bob);
+        vm.expectRevert(IZonePortal.PortalIsPaused.selector);
+        portal.claimRefund(address(pathUSD));
+
+        assertEq(portal.refunds(address(pathUSD), bob), amount);
+        assertEq(pathUSD.balanceOf(bob), bobBalanceBefore);
+        assertEq(pathUSD.balanceOf(address(portal)), portalBalanceBefore);
+
+        if (resumeEarly) {
+            vm.prank(admin);
+            portal.resume();
+        } else {
+            vm.warp(portal.pauseExpiry());
+        }
+        vm.prank(bob);
+        assertEq(portal.claimRefund(address(pathUSD)), amount);
+        assertEq(portal.refunds(address(pathUSD), bob), 0);
+        assertEq(pathUSD.balanceOf(bob), bobBalanceBefore + amount);
+        assertEq(pathUSD.balanceOf(address(portal)), portalBalanceBefore - amount);
+    }
+
     /// @notice Claiming pays out a refund parked by a failed bounced withdrawal.
     function test_claimRefund_successAfterDepositBounceBackPending() public {
         vm.fee(0);
