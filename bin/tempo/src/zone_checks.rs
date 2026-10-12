@@ -6,18 +6,13 @@ use std::{
 };
 
 use alloy_consensus::BlockHeader;
-use alloy_network::TransactionBuilder;
 use alloy_primitives::{Address, FixedBytes, TxKind};
-use alloy_provider::{CallItem, Provider, ProviderBuilder};
+use alloy_provider::{Provider, ProviderBuilder};
 use alloy_rpc_types_eth::Filter;
 use alloy_sol_types::{SolCall, SolEvent};
 use eyre::{OptionExt, WrapErr, ensure, eyre};
 use serde::Serialize;
-use tempo_alloy::{
-    TempoNetwork,
-    provider::TempoProviderExt,
-    rpc::{ForkSchedule, TempoHeaderResponse, TempoTransactionRequest},
-};
+use tempo_alloy::{TempoNetwork, provider::TempoProviderExt, rpc::ForkSchedule};
 use tempo_contracts::{
     precompiles::{IZoneFactory, ZONE_FACTORY_ADDRESS},
     zones::{BatchSubmitted, submitBatchCall},
@@ -73,12 +68,15 @@ impl ZonePcrHistory {
         };
         ensure!(from_block <= to_block, "from-block can't exceed to-block");
         info!(from_block, to_block, "Fetching fork schedule");
-        let schedule = provider.get_fork_schedule().await?;
-
-        // Sampling starts at T13, so an unscheduled T13 has no covered intervals.
-        if !schedule.schedule.iter().any(|fork| fork.name == "T13") {
-            info!("T13 not scheduled yet");
-            return Ok(Vec::new());
+        let mut intervals = fork_intervals(
+            provider,
+            provider.get_fork_schedule().await?,
+            from_block,
+            to_block,
+        )
+        .await?;
+        if intervals.is_empty() {
+            return Ok(intervals);
         }
         let portals = match self.portal {
             Some(portal) => BTreeSet::from([portal]),
@@ -88,7 +86,6 @@ impl ZonePcrHistory {
             info!("no portals to scan");
             return Ok(Vec::new());
         }
-        let mut intervals = fork_intervals(provider, schedule, from_block, to_block).await?;
         for interval in &mut intervals {
             info!(hardfork = %interval.hardfork, "sampling hardfork interval");
             interval.observed_pcrs = sample_interval(provider, interval, &portals)
@@ -118,45 +115,38 @@ async fn fork_intervals(
     from: u64,
     to: u64,
 ) -> eyre::Result<Vec<ForkInterval>> {
-    let end = to.checked_add(1).ok_or_eyre("to-block is too large")?;
+    let mut end = to.checked_add(1).ok_or_eyre("to-block is too large")?;
     let mut forks = schedule.schedule;
     // Stable sorting preserves schedule order for forks activated together at genesis.
     forks.sort_by_key(|fork| fork.activation_time);
     let Some(t13) = forks.iter().position(|fork| fork.name == "T13") else {
         return Ok(Vec::new());
     };
-    let mut activations = BTreeMap::new();
-    for fork in forks.into_iter().skip(t13) {
-        // Earlier forks at the same timestamp have no observable block interval.
-        activations.insert(fork.activation_time, fork.name);
-    }
-    let mut activations = activations.into_iter().peekable();
     let mut timestamps = BTreeMap::new();
     let mut intervals = Vec::new();
-    // Finding T13 above guarantees at least one activation.
-    let timestamp = activations.peek().unwrap().0;
-    let mut first = activation_block(provider, timestamp, from, to, &mut timestamps).await?;
-    while let Some((_, name)) = activations.next() {
-        if first == end {
+    // Visit newest first: equal activations naturally leave earlier forks empty.
+    for fork in forks.into_iter().skip(t13).rev() {
+        if end == from {
             break;
         }
-        let next = match activations.peek() {
-            Some((timestamp, _)) => {
-                activation_block(provider, *timestamp, first, to, &mut timestamps).await?
-            }
-            None => end,
-        };
-        if first < next {
+        let first = activation_block(
+            provider,
+            fork.activation_time,
+            from,
+            end - 1,
+            &mut timestamps,
+        )
+        .await?;
+        if first < end {
             intervals.push(ForkInterval {
-                hardfork: name,
+                hardfork: fork.name,
                 from_block: first,
-                to_block: next - 1,
+                to_block: end - 1,
                 observed_pcrs: None,
             });
         }
-        first = next;
+        end = first;
     }
-    intervals.reverse();
     Ok(intervals)
 }
 
@@ -175,7 +165,15 @@ async fn activation_block(
         let block_timestamp = match timestamps.entry(middle) {
             Entry::Occupied(timestamp) => *timestamp.get(),
             Entry::Vacant(timestamp) => {
-                *timestamp.insert(fetch_header(provider, middle).await?.timestamp())
+                let block = provider
+                    .get_block_by_number(middle.into())
+                    .await?
+                    .ok_or_eyre(format!("block {middle} is unavailable"))?;
+                ensure!(
+                    block.header.number() == middle,
+                    "RPC returned the wrong block number for {middle}"
+                );
+                *timestamp.insert(block.header.timestamp())
             }
         };
         if block_timestamp < timestamp {
@@ -187,21 +185,6 @@ async fn activation_block(
     Ok(low)
 }
 
-async fn fetch_header(
-    provider: &impl Provider<TempoNetwork>,
-    number: u64,
-) -> eyre::Result<TempoHeaderResponse> {
-    let block = provider
-        .get_block_by_number(number.into())
-        .await?
-        .ok_or_eyre(format!("block {number} is unavailable"))?;
-    ensure!(
-        block.header.number() == number,
-        "RPC returned the wrong block number for {number}"
-    );
-    Ok(block.header)
-}
-
 async fn sample_interval(
     provider: &impl Provider<TempoNetwork>,
     interval: &ForkInterval,
@@ -210,8 +193,10 @@ async fn sample_interval(
     let mut filter = Filter::new()
         .address(portals.iter().copied().collect::<Vec<_>>())
         .event_signature(BatchSubmitted::SIGNATURE_HASH);
-    let mut end_block = interval.to_block;
-    loop {
+    for end_block in (interval.from_block..=interval.to_block)
+        .rev()
+        .step_by(LOG_QUERY_BLOCKS as usize)
+    {
         let start = end_block
             .saturating_sub(LOG_QUERY_BLOCKS - 1)
             .max(interval.from_block);
@@ -244,12 +229,9 @@ async fn sample_interval(
                 return Ok(Some(pcrs));
             }
         }
-        if start == interval.from_block {
-            info!(hardfork = %interval.hardfork, "no Nitro submission found");
-            return Ok(None);
-        }
-        end_block = start - 1;
     }
+    info!(hardfork = %interval.hardfork, "no Nitro submission found");
+    Ok(None)
 }
 
 /// Read registered portals at the selected upper block bound.
@@ -257,15 +239,8 @@ async fn discover_portals(
     provider: &impl Provider<TempoNetwork>,
     to: u64,
 ) -> eyre::Result<BTreeSet<Address>> {
-    let output = provider
-        .call(
-            TempoTransactionRequest::default()
-                .with_to(ZONE_FACTORY_ADDRESS)
-                .with_input(IZoneFactory::nextZoneIdCall {}.abi_encode()),
-        )
-        .block(to.into())
-        .await?;
-    let next = IZoneFactory::nextZoneIdCall::abi_decode_returns(&output)?;
+    let factory = IZoneFactory::new(ZONE_FACTORY_ADDRESS, provider);
+    let next = factory.nextZoneId().block(to.into()).call().await?;
     if next <= 1 {
         return Ok(BTreeSet::new());
     }
@@ -273,19 +248,10 @@ async fn discover_portals(
         .multicall()
         .dynamic::<IZoneFactory::zonesCall>()
         .block(to.into())
-        .extend_calls((1..next).map(|id| {
-            CallItem::new(
-                ZONE_FACTORY_ADDRESS,
-                IZoneFactory::zonesCall { id }.abi_encode().into(),
-            )
-        }))
+        .extend((1..next).map(|id| factory.zones(id)))
         .aggregate()
         .await?;
-    let portals = zones
-        .into_iter()
-        .map(|zone| zone.portal)
-        .collect::<BTreeSet<_>>();
-    Ok(portals)
+    Ok(zones.into_iter().map(|zone| zone.portal).collect())
 }
 
 /// Find one qualifying direct call; subsequent proofs need not be decoded.
@@ -326,7 +292,7 @@ mod tests {
     use base64::Engine;
     use clap::Parser;
     use serde_json::json;
-    use tempo_alloy::rpc::ForkInfo;
+    use tempo_alloy::rpc::{ForkInfo, TempoHeaderResponse};
     use tempo_contracts::{
         precompiles::ZoneInfo,
         zones::{BlockTransition, DepositQueueTransition, TokenEnablementTransition},
@@ -529,14 +495,14 @@ mod tests {
                 vec![("T12", 0), ("T13", 0), ("T14", 0), ("FutureFork", 5)],
                 2,
                 6,
-                vec![4, 3, 2, 6, 5],
+                vec![4, 6, 5, 3, 2],
                 vec![("FutureFork", 5, 6), ("T14", 2, 4)],
             ),
             (
                 vec![("T13", 2), ("FutureFork", 5), ("LaterFork", 100)],
                 0,
                 9,
-                vec![5, 2, 1, 6, 4, 7, 9],
+                vec![5, 8, 9, 2, 4, 1],
                 vec![("FutureFork", 5, 9), ("T13", 2, 4)],
             ),
             (vec![("T12", 0)], 0, 3, Vec::new(), Vec::new()),
