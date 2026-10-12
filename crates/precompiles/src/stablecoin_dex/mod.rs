@@ -31,7 +31,7 @@ use crate::{
     storage_credits::{StorageCreditDeltas, StorageCredits},
     tip20::{ITIP20, TIP20Token, validate_usd_currency},
     tip20_factory::TIP20Factory,
-    tip403_registry::{AuthRole, TIP403Registry, is_policy_lookup_error},
+    tip403_registry::{AuthRole, is_policy_lookup_error},
 };
 use alloy::primitives::{Address, B256, U256};
 use tempo_precompiles_macros::contract;
@@ -1852,9 +1852,7 @@ impl StablecoinDEX {
 /// Checks whether `address` is authorized under the transfer policy of `token` for the given
 /// `role`. Returns `false` instead of erroring when the policy lookup fails.
 fn is_authorized_for_token(token: Address, address: Address, role: AuthRole) -> Result<bool> {
-    let policy_id = TIP20Token::from_address(token)?.transfer_policy_id()?;
-    let registry = TIP403Registry::new();
-    match registry.is_authorized_as(policy_id, address, role) {
+    match TIP20Token::from_address(token)?.is_authorized_as(address, role) {
         Ok(authorized) => Ok(authorized),
         Err(e) if is_policy_lookup_error(&e) => Ok(false),
         Err(e) => Err(e),

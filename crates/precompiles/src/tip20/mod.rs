@@ -9,8 +9,11 @@
 //! [TIP-1022]: <https://docs.tempo.xyz/protocol/tip1022>
 
 pub mod dispatch;
+pub mod layout;
 pub mod rewards;
 pub mod roles;
+
+pub use layout::StorageVersion;
 
 pub use tempo_contracts::precompiles::{
     IRolesAuth, ITIP20, RolesAuthError, RolesAuthEvent, TIP20Error, TIP20Event, USD_CURRENCY,
@@ -27,9 +30,16 @@ use crate::{
     error::{Result, TempoPrecompileError},
     receive_policy_guard::{InboundKind, ReceivePolicyGuard, RecoveryMode},
     storage::{Handler, Mapping},
-    tip20::{rewards::UserRewardInfo, roles::DEFAULT_ADMIN_ROLE},
+    tip20::{
+        layout::{Supply, TokenControl},
+        rewards::UserRewardInfo,
+        roles::DEFAULT_ADMIN_ROLE,
+    },
     tip20_factory::TIP20Factory,
-    tip403_registry::{ALLOW_ALL_POLICY_ID, AuthRole, ITIP403Registry, TIP403Registry},
+    tip403_registry::{
+        ALLOW_ALL_POLICY_ID, AuthRole, ITIP403Registry, TIP403Registry, TIP403RegistryError,
+        TOKEN_POLICY_ID, TokenPolicy,
+    },
 };
 use alloy::{
     primitives::{Address, B256, U256, uint},
@@ -54,7 +64,7 @@ pub const U128_MAX: U256 = uint!(0xffffffffffffffffffffffffffffffff_U256);
 /// - `InvalidToken` — address does not have the TIP-20 prefix
 /// - `InvalidCurrency` — token currency is not `"USD"`
 pub fn validate_usd_currency(token: Address) -> Result<()> {
-    if TIP20Token::from_address(token)?.currency()? != USD_CURRENCY {
+    if !TIP20Token::from_address(token)?.is_usd()? {
         return Err(TIP20Error::invalid_currency().into());
     }
     Ok(())
@@ -168,7 +178,8 @@ impl TIP20Token {
 
     /// Returns the token's currency denomination (e.g. `"USD"`).
     pub fn currency(&self) -> Result<String> {
-        self.currency.read()
+        self.load_currency()?
+            .map_or_else(|| self.currency.read(), Ok)
     }
 
     /// Returns the logo URI for this token (TIP-1026).
@@ -180,31 +191,78 @@ impl TIP20Token {
 
     /// Returns the current total supply.
     pub fn total_supply(&self) -> Result<U256> {
-        self.total_supply.read()
+        Ok(self.load_supply(self.token_control()?.is_some())?.total)
     }
 
     /// Returns the active quote token address used for pricing.
     pub fn quote_token(&self) -> Result<Address> {
-        self.quote_token.read()
+        self.load_quote(false)
     }
 
     /// Returns the pending next quote token address (set but not yet finalized).
     pub fn next_quote_token(&self) -> Result<Address> {
-        self.next_quote_token.read()
+        self.load_quote(true)
     }
 
     /// Returns the maximum mintable supply.
     pub fn supply_cap(&self) -> Result<U256> {
-        self.supply_cap.read()
+        let supply = self.load_supply(self.token_control()?.is_some())?;
+        self.supply_cap_of(&supply)
     }
 
     /// Returns whether the token is currently paused.
     pub fn paused(&self) -> Result<bool> {
-        self.paused.read()
+        Ok(self.load_control()?.is_paused())
     }
 
     /// Returns the TIP-403 transfer policy ID governing this token's transfers.
+    ///
+    /// (T14+) Tokens with a token-specific policy report [`TOKEN_POLICY_ID`].
     pub fn transfer_policy_id(&self) -> Result<u64> {
+        Ok(match self.issuer_policy(None)? {
+            IssuerPolicy::Generic(policy_id) => policy_id,
+            IssuerPolicy::TokenSpecific(_) => TOKEN_POLICY_ID,
+        })
+    }
+
+    /// Returns the active token-specific modes (TIP-1145).
+    ///
+    /// # Errors
+    /// - `InvalidTransferPolicyId` — the token uses a generic TIP-403 policy
+    pub fn transfer_policy(&self) -> Result<ITIP20::transferPolicyReturn> {
+        match self.issuer_policy(None)? {
+            IssuerPolicy::TokenSpecific(policy) => Ok(ITIP20::transferPolicyReturn {
+                senderMode: policy.sender as u8,
+                recipientMode: policy.recipient as u8,
+                mintRecipientMode: policy.mint_recipient as u8,
+            }),
+            IssuerPolicy::Generic(_) => Err(TIP20Error::invalid_transfer_policy_id().into()),
+        }
+    }
+
+    /// Resolves the active issuer policy. `control` may carry the already-loaded control word.
+    ///
+    /// Packed tokens read their cached modes; (T14+) unconverted tokens check the registry for a
+    /// token-specific policy before falling back to the generic policy ID.
+    pub(crate) fn issuer_policy(&self, control: Option<&TokenControl>) -> Result<IssuerPolicy> {
+        if !self.storage.spec().is_t14() {
+            return self.generic_transfer_policy_id().map(IssuerPolicy::Generic);
+        }
+        let cached = match control {
+            Some(control) => control.policy(),
+            None => self.token_control()?.and_then(|control| control.policy()),
+        };
+        match cached {
+            Some(policy) => Ok(IssuerPolicy::TokenSpecific(policy)),
+            None => match TIP403Registry::new().active_token_policy(self.address)? {
+                Some(policy) => Ok(IssuerPolicy::TokenSpecific(policy)),
+                None => self.generic_transfer_policy_id().map(IssuerPolicy::Generic),
+            },
+        }
+    }
+
+    /// Returns the generic TIP-403 policy ID bound to this token.
+    fn generic_transfer_policy_id(&self) -> Result<u64> {
         if StorageCtx.spec().is_t9()
             && let Some(policy_id) =
                 TIP403Registry::new().registered_token_transfer_policy_id(self.address)?
@@ -284,6 +342,26 @@ impl TIP20Token {
     ) -> Result<()> {
         self.check_role(msg_sender, DEFAULT_ADMIN_ROLE)?;
 
+        // (T14+) TIP-1145 activation: the reserved ID permanently selects the prepared
+        // token-specific policy. Afterwards, generic policy IDs are unsupported.
+        if self.storage.spec().is_t14() {
+            let mut registry = TIP403Registry::new();
+            let is_token_specific = registry.active_token_policy(self.address)?.is_some();
+            if call.newPolicyId == TOKEN_POLICY_ID {
+                if !is_token_specific {
+                    registry.activate_token_policy(self.address)?;
+                    self.emit_event(TIP20Event::transfer_policy_update(
+                        msg_sender,
+                        TOKEN_POLICY_ID,
+                    ))?;
+                }
+                return Ok(());
+            }
+            if is_token_specific {
+                return Err(TIP403RegistryError::token_policy_ids_unsupported().into());
+            }
+        }
+
         // Validate that the policy exists
         if !TIP403Registry::new().policy_exists(ITIP403Registry::policyExistsCall {
             policyId: call.newPolicyId,
@@ -315,7 +393,8 @@ impl TIP20Token {
         call: ITIP20::setSupplyCapCall,
     ) -> Result<()> {
         self.check_role(msg_sender, DEFAULT_ADMIN_ROLE)?;
-        if call.newSupplyCap < self.total_supply()? {
+        let supply = self.load_supply(self.token_control()?.is_some())?;
+        if call.newSupplyCap < supply.total {
             return Err(TIP20Error::invalid_supply_cap().into());
         }
 
@@ -323,7 +402,7 @@ impl TIP20Token {
             return Err(TIP20Error::supply_cap_exceeded().into());
         }
 
-        self.supply_cap.write(call.newSupplyCap)?;
+        self.store_supply_cap(&supply, call.newSupplyCap)?;
 
         self.emit_event(TIP20Event::supply_cap_update(msg_sender, call.newSupplyCap))
     }
@@ -418,7 +497,7 @@ impl TIP20Token {
     /// - `Unauthorized` — caller does not hold `PAUSE_ROLE`
     pub fn pause(&mut self, msg_sender: Address, _call: ITIP20::pauseCall) -> Result<()> {
         self.check_role(msg_sender, PAUSE_ROLE)?;
-        self.paused.write(true)?;
+        self.store_paused(true)?;
 
         self.emit_event(TIP20Event::pause_state_update(msg_sender, true))
     }
@@ -429,7 +508,7 @@ impl TIP20Token {
     /// - `Unauthorized` — caller does not hold `UNPAUSE_ROLE`
     pub fn unpause(&mut self, msg_sender: Address, _call: ITIP20::unpauseCall) -> Result<()> {
         self.check_role(msg_sender, UNPAUSE_ROLE)?;
-        self.paused.write(false)?;
+        self.store_paused(false)?;
 
         self.emit_event(TIP20Event::pause_state_update(msg_sender, false))
     }
@@ -460,15 +539,11 @@ impl TIP20Token {
         }
 
         // Check if the currency is USD, if so then the quote token's currency MUST also be USD
-        let currency = self.currency()?;
-        if currency == USD_CURRENCY {
-            let quote_token_currency = Self::from_address(call.newQuoteToken)?.currency()?;
-            if quote_token_currency != USD_CURRENCY {
-                return Err(TIP20Error::invalid_quote_token().into());
-            }
+        if self.is_usd()? && !Self::from_address(call.newQuoteToken)?.is_usd()? {
+            return Err(TIP20Error::invalid_quote_token().into());
         }
 
-        self.next_quote_token.write(call.newQuoteToken)?;
+        self.store_quote(true, call.newQuoteToken)?;
 
         self.emit_event(TIP20Event::next_quote_token_set(
             msg_sender,
@@ -503,7 +578,7 @@ impl TIP20Token {
         }
 
         // Update the quote token
-        self.quote_token.write(next_quote_token)?;
+        self.store_quote(false, next_quote_token)?;
 
         self.emit_event(TIP20Event::quote_token_update(msg_sender, next_quote_token))
     }
@@ -532,13 +607,13 @@ impl TIP20Token {
         call: ITIP20::mintCall,
         recipient_role: AuthRole,
     ) -> Result<()> {
-        let Some((total_supply, to)) =
+        let Some((supply, to)) =
             self.validate_mint(msg_sender, call.to, call.amount, B256::ZERO, recipient_role)?
         else {
             return Ok(());
         };
 
-        self._mint(&to, total_supply, call.amount)?;
+        self._mint(&to, supply, call.amount)?;
         self.emit_event(TIP20Event::mint(call.to, call.amount))?;
         if let Some(hop) = to.build_virtual_transfer_event(call.amount) {
             self.emit_event(hop)?;
@@ -553,7 +628,7 @@ impl TIP20Token {
         msg_sender: Address,
         call: ITIP20::mintWithMemoCall,
     ) -> Result<()> {
-        let Some((total_supply, to)) = self.validate_mint(
+        let Some((supply, to)) = self.validate_mint(
             msg_sender,
             call.to,
             call.amount,
@@ -564,7 +639,7 @@ impl TIP20Token {
             return Ok(());
         };
 
-        self._mint(&to, total_supply, call.amount)?;
+        self._mint(&to, supply, call.amount)?;
         self.emit_event(TIP20Event::transfer_with_memo(
             Address::ZERO,
             call.to,
@@ -578,20 +653,22 @@ impl TIP20Token {
         Ok(())
     }
 
-    /// Internal helper to mint new tokens and update balances.
-    pub(crate) fn _mint(&mut self, to: &Recipient, total_supply: U256, amount: U256) -> Result<()> {
-        let new_supply = total_supply
+    /// Internal helper to mint new tokens and update balances. Checks the `uint256` sum
+    /// against the cap before any packed narrowing.
+    pub(crate) fn _mint(&mut self, to: &Recipient, supply: Supply, amount: U256) -> Result<()> {
+        let new_supply = supply
+            .total
             .checked_add(amount)
             .ok_or(TempoPrecompileError::under_overflow())?;
 
-        let supply_cap = self.supply_cap()?;
+        let supply_cap = self.supply_cap_of(&supply)?;
         if new_supply > supply_cap {
             return Err(TIP20Error::supply_cap_exceeded().into());
         }
 
         self.handle_rewards_on_mint(to.target, amount)?;
 
-        self.set_total_supply(new_supply)?;
+        self.store_total_supply(&supply, new_supply)?;
         self.increment_balance(to.target, amount)?;
 
         self.emit_event(to.build_transfer_event(Address::ZERO, amount))
@@ -643,9 +720,11 @@ impl TIP20Token {
         let hardfork = self.storage.spec();
 
         // Validate burner role and (+T3) ensure token is not paused
-        if hardfork.is_t3() {
-            self.check_not_paused()?;
-        }
+        let control = if hardfork.is_t3() {
+            Some(self.check_not_paused()?)
+        } else {
+            None
+        };
         self.check_role(msg_sender, BURN_BLOCKED_ROLE)?;
 
         if check_protected {
@@ -653,8 +732,8 @@ impl TIP20Token {
         }
 
         // Check if the address is blocked from transferring (sender authorization)
-        let policy_id = self.transfer_policy_id()?;
-        if TIP403Registry::new().is_authorized_as(policy_id, owner, AuthRole::sender())? {
+        let policy = self.issuer_policy(control.as_ref())?;
+        if self.policy_allows(policy, owner, AuthRole::sender())? {
             // Only allow burning from addresses that are blocked from transferring
             return Err(TIP20Error::policy_forbids().into());
         }
@@ -665,17 +744,7 @@ impl TIP20Token {
             RECEIVE_POLICY_GUARD_ADDRESS
         };
         self._transfer(burn_from, &Recipient::direct(Address::ZERO), amount)?;
-
-        let total_supply = self.total_supply()?;
-        let new_supply =
-            total_supply
-                .checked_sub(amount)
-                .ok_or(TIP20Error::insufficient_balance(
-                    total_supply,
-                    amount,
-                    self.address,
-                ))?;
-        self.set_total_supply(new_supply)?;
+        self.decrease_total_supply(control.as_ref(), amount)?;
 
         self.emit_event(TIP20Event::burn_blocked(owner, amount))
     }
@@ -685,22 +754,13 @@ impl TIP20Token {
     /// Requires `BURN_AT_ROLE` and an unpaused token. When `from` is the transaction origin,
     /// the burn consumes the access key's spending limit even if a bridge is the caller.
     pub fn burn_at(&mut self, msg_sender: Address, call: ITIP20::burnAtCall) -> Result<()> {
-        self.check_not_paused()?;
+        let control = self.check_not_paused()?;
         self.check_role(msg_sender, BURN_AT_ROLE)?;
         self.check_burn_address(call.from)?;
         self.check_and_update_spending_limit(call.from, call.amount)?;
 
         self._transfer(call.from, &Recipient::direct(Address::ZERO), call.amount)?;
-        let total_supply = self.total_supply()?;
-        let new_supply =
-            total_supply
-                .checked_sub(call.amount)
-                .ok_or(TIP20Error::insufficient_balance(
-                    total_supply,
-                    call.amount,
-                    self.address,
-                ))?;
-        self.set_total_supply(new_supply)?;
+        self.decrease_total_supply(Some(&control), call.amount)?;
 
         self.emit_event(TIP20Event::burn_at(msg_sender, call.from, call.amount))
     }
@@ -721,23 +781,39 @@ impl TIP20Token {
 
     fn _burn(&mut self, msg_sender: Address, amount: U256) -> Result<()> {
         // Validate issuer role and (+T3) ensure token is not paused
-        if self.storage.spec().is_t3() {
-            self.check_not_paused()?;
-        }
+        let control = if self.storage.spec().is_t3() {
+            Some(self.check_not_paused()?)
+        } else {
+            None
+        };
         self.check_role(msg_sender, ISSUER_ROLE)?;
 
         self._transfer(msg_sender, &Recipient::direct(Address::ZERO), amount)?;
+        self.decrease_total_supply(control.as_ref(), amount)
+    }
 
-        let total_supply = self.total_supply()?;
+    /// Reduces total supply by a burned `amount`, reverting with `InsufficientBalance` on
+    /// underflow. `control` may carry the already-loaded control word.
+    fn decrease_total_supply(
+        &mut self,
+        control: Option<&TokenControl>,
+        amount: U256,
+    ) -> Result<()> {
+        let packed = match control {
+            Some(control) => control.is_packed(),
+            None => self.token_control()?.is_some(),
+        };
+        let supply = self.load_supply(packed)?;
         let new_supply =
-            total_supply
+            supply
+                .total
                 .checked_sub(amount)
                 .ok_or(TIP20Error::insufficient_balance(
-                    total_supply,
+                    supply.total,
                     amount,
                     self.address,
                 ))?;
-        self.set_total_supply(new_supply)
+        self.store_total_supply(&supply, new_supply)
     }
 
     /// Sets `spender`'s allowance to `amount` for the caller's tokens.
@@ -1083,6 +1159,9 @@ impl TIP20Token {
 
     /// Initializes the TIP-20 token precompile with metadata, quote token, supply cap, and
     /// default admin role. Called once by [`TIP20Factory`] during token creation.
+    ///
+    /// (T14+) New tokens use the TIP-1145 packed layout with an `ALLOW` token-specific policy,
+    /// unless their quote cannot be packed (a non-pathUSD token with a null quote).
     pub fn initialize(
         &mut self,
         msg_sender: Address,
@@ -1092,6 +1171,31 @@ impl TIP20Token {
         quote_token: Address,
         admin: Address,
     ) -> Result<()> {
+        self.initialize_with_layout(
+            msg_sender,
+            name,
+            symbol,
+            currency,
+            quote_token,
+            admin,
+            self.storage.spec().is_t14(),
+        )
+    }
+
+    /// Like [`Self::initialize`], with `packed` selecting the TIP-1145 layout. Environments
+    /// mirroring an external registry (e.g. zones) pass `false`, so that authorization always
+    /// follows the canonical TIP-403 registry instead of a local mode cache.
+    #[allow(clippy::too_many_arguments)]
+    pub fn initialize_with_layout(
+        &mut self,
+        msg_sender: Address,
+        name: &str,
+        symbol: &str,
+        currency: &str,
+        quote_token: Address,
+        admin: Address,
+        packed: bool,
+    ) -> Result<()> {
         trace!(%name, address=%self.address, "Initializing token");
 
         // must ensure the account is not empty, by setting some code
@@ -1099,18 +1203,22 @@ impl TIP20Token {
 
         self.name.write(name.to_string())?;
         self.symbol.write(symbol.to_string())?;
-        self.currency.write(currency.to_string())?;
 
-        self.quote_token.write(quote_token)?;
-        // Initialize nextQuoteToken to the same value as quoteToken
-        self.next_quote_token.write(quote_token)?;
+        if !(packed && self.try_initialize_packed(currency, quote_token)?) {
+            self.currency.write(currency.to_string())?;
 
-        // Set default values
-        self.supply_cap.write(U128_MAX)?;
-        if StorageCtx.spec().is_t9() {
-            TIP403Registry::new().set_token_transfer_policy(self.address, ALLOW_ALL_POLICY_ID)?;
-        } else {
-            self.transfer_policy_id.write(ALLOW_ALL_POLICY_ID)?;
+            self.quote_token.write(quote_token)?;
+            // Initialize nextQuoteToken to the same value as quoteToken
+            self.next_quote_token.write(quote_token)?;
+
+            // Set default values
+            self.supply_cap.write(U128_MAX)?;
+            if StorageCtx.spec().is_t9() {
+                TIP403Registry::new()
+                    .set_token_transfer_policy(self.address, ALLOW_ALL_POLICY_ID)?;
+            } else {
+                self.transfer_policy_id.write(ALLOW_ALL_POLICY_ID)?;
+            }
         }
 
         // Initialize roles system and grant admin role
@@ -1164,15 +1272,13 @@ impl TIP20Token {
         self.allowances[owner][spender].write(amount)
     }
 
-    fn set_total_supply(&mut self, amount: U256) -> Result<()> {
-        self.total_supply.write(amount)
-    }
-
-    pub fn check_not_paused(&self) -> Result<()> {
-        if self.paused()? {
+    /// Loads the control word, reverting with `ContractPaused` if the token is paused.
+    pub fn check_not_paused(&self) -> Result<TokenControl> {
+        let control = self.load_control()?;
+        if control.is_paused() {
             return Err(TIP20Error::contract_paused().into());
         }
-        Ok(())
+        Ok(control)
     }
 
     /// Resolves `to`, checks pause state and recipient validity, ensures TIP-403 transfer
@@ -1193,9 +1299,12 @@ impl TIP20Token {
         memo: B256,
     ) -> Result<Option<Recipient>> {
         let to = Recipient::resolve(to)?;
-        self.check_not_paused()?;
+        let control = self.check_not_paused()?;
         to.validate()?;
-        self.ensure_transfer_authorized(from, to.target)?;
+        let policy = self.issuer_policy(Some(&control))?;
+        if !self.policy_allows_transfer(policy, from, to.target)? {
+            return Err(TIP20Error::policy_forbids().into());
+        }
 
         if let Some(spender) = spender {
             self.consume_allowance(from, spender, amount)?;
@@ -1223,30 +1332,37 @@ impl TIP20Token {
         amount: U256,
         memo: B256,
         recipient_role: AuthRole,
-    ) -> Result<Option<(U256, Recipient)>> {
+    ) -> Result<Option<(Supply, Recipient)>> {
         let to = Recipient::resolve(to)?;
         self.check_role(msg_sender, ISSUER_ROLE)?;
-        let total_supply = self.total_supply()?;
 
-        if self.storage.spec().is_t3() {
-            self.check_not_paused()?;
+        // (T14+) The control word selects the supply layout, so it is checked first.
+        let spec = self.storage.spec();
+        let (supply, control) = if spec.is_t14() {
+            let control = self.check_not_paused()?;
+            (self.load_supply(control.is_packed())?, Some(control))
+        } else {
+            let supply = self.load_supply(false)?;
+            (
+                supply,
+                spec.is_t3().then(|| self.check_not_paused()).transpose()?,
+            )
+        };
+        if spec.is_t3() {
             to.validate()?;
         }
 
         // Authorize the resolved target using the role selected by the mint operation.
-        if !TIP403Registry::new().is_authorized_as(
-            self.transfer_policy_id()?,
-            to.target,
-            recipient_role,
-        )? {
+        let policy = self.issuer_policy(control.as_ref())?;
+        if !self.policy_allows(policy, to.target, recipient_role)? {
             return Err(TIP20Error::policy_forbids().into());
         }
 
-        if self.validate_inbound_or_block(msg_sender, &to, amount, Some(total_supply), memo)? {
+        if self.validate_inbound_or_block(msg_sender, &to, amount, Some(supply), memo)? {
             return Ok(None);
         }
 
-        Ok(Some((total_supply, to)))
+        Ok(Some((supply, to)))
     }
 
     /// Check whether a transfer is authorized by the token's [`TIP403Registry`] policy.
@@ -1254,16 +1370,40 @@ impl TIP20Token {
     ///
     /// [TIP-1015]: <https://docs.tempo.xyz/protocol/tips/tip-1015>
     pub fn is_transfer_authorized(&self, from: Address, to: Address) -> Result<bool> {
-        let policy_id = self.transfer_policy_id()?;
-        let registry = TIP403Registry::new();
+        let policy = self.issuer_policy(None)?;
+        self.policy_allows_transfer(policy, from, to)
+    }
 
+    /// Returns whether `policy` allows `from` as sender, then `to` as recipient.
+    fn policy_allows_transfer(
+        &self,
+        policy: IssuerPolicy,
+        from: Address,
+        to: Address,
+    ) -> Result<bool> {
+        let sender_auth = self.policy_allows(policy, from, AuthRole::sender())?;
         // (spec: +T2) short-circuit and skip recipient check if sender fails
-        let sender_auth = registry.is_authorized_as(policy_id, from, AuthRole::sender())?;
         if self.storage.spec().is_t2() && !sender_auth {
             return Ok(false);
         }
-        let recipient_auth = registry.is_authorized_as(policy_id, to, AuthRole::recipient())?;
-        Ok(sender_auth && recipient_auth)
+        Ok(self.policy_allows(policy, to, AuthRole::recipient())? && sender_auth)
+    }
+
+    /// Returns whether the resolved `policy` allows `user` in `role`. Callers resolve `policy` once
+    /// via [`Self::issuer_policy`], so repeated checks don't re-read the policy selection.
+    fn policy_allows(&self, policy: IssuerPolicy, user: Address, role: AuthRole) -> Result<bool> {
+        let registry = TIP403Registry::new();
+        match policy {
+            IssuerPolicy::Generic(policy_id) => registry.is_authorized_as(policy_id, user, role),
+            IssuerPolicy::TokenSpecific(policy) => {
+                registry.token_policy_allows(self.address, &policy, user, role.mask())
+            }
+        }
+    }
+
+    /// Returns whether `user` is authorized for `role` by the token's active issuer policy.
+    pub fn is_authorized_as(&self, user: Address, role: AuthRole) -> Result<bool> {
+        self.policy_allows(self.issuer_policy(None)?, user, role)
     }
 
     /// Ensures the transfer is authorized by the token's [`TIP403Registry`] policy.
@@ -1302,10 +1442,9 @@ impl TIP20Token {
     /// # Errors
     /// - `PolicyForbids` — a user is not authorized for the requested role by the active transfer policy
     pub fn ensure_authorized_as(&self, user_auth: &[(Address, AuthRole)]) -> Result<()> {
-        let policy_id = self.transfer_policy_id()?;
-        let registry = TIP403Registry::new();
+        let policy = self.issuer_policy(None)?;
         for &(user, role) in user_auth {
-            if !registry.is_authorized_as(policy_id, user, role)? {
+            if !self.policy_allows(policy, user, role)? {
                 return Err(TIP20Error::policy_forbids().into());
             }
         }
@@ -1370,7 +1509,7 @@ impl TIP20Token {
         originator: Address,
         to: &Recipient,
         amount: U256,
-        mint_total_supply: Option<U256>,
+        mint_supply: Option<Supply>,
         memo: B256,
     ) -> Result<bool> {
         if !self.storage.spec().is_t6() {
@@ -1388,8 +1527,8 @@ impl TIP20Token {
         };
 
         let guard = Recipient::direct(RECEIVE_POLICY_GUARD_ADDRESS);
-        let kind = if let Some(total_supply) = mint_total_supply {
-            self._mint(&guard, total_supply, amount)?;
+        let kind = if let Some(supply) = mint_supply {
+            self._mint(&guard, supply, amount)?;
             self.emit_event(TIP20Event::mint(guard.target, amount))?;
             InboundKind::MINT
         } else {
@@ -1418,23 +1557,24 @@ impl TIP20Token {
             "checked in ReceivePolicyGuard::claim"
         );
 
-        self.check_not_paused()?;
+        let control = self.check_not_paused()?;
         let destination = Recipient::resolve(to)?;
         destination.validate()?;
+        let policy = self.issuer_policy(Some(&control))?;
         if recovery_mode.is_reroute(to, receiver) {
             let policy_subject = recovery_mode.policy_subject(originator, receiver);
-            self.ensure_transfer_authorized(policy_subject, destination.target)?;
-            if TIP403Registry::new()
-                .validate_receive_policy(self.address, policy_subject, destination.target)?
-                .is_some()
+            if !self.policy_allows_transfer(policy, policy_subject, destination.target)?
+                || TIP403Registry::new()
+                    .validate_receive_policy(self.address, policy_subject, destination.target)?
+                    .is_some()
             {
                 return Err(TIP20Error::policy_forbids().into());
             }
             if let Some(addr) = recovery_mode.spending_account(recovery_auth) {
                 self.check_and_update_spending_limit(addr, amount)?;
             }
-        } else {
-            self.ensure_authorized_as(&[(destination.target, AuthRole::recipient())])?;
+        } else if !self.policy_allows(policy, destination.target, AuthRole::recipient())? {
+            return Err(TIP20Error::policy_forbids().into());
         }
 
         self._transfer(RECEIVE_POLICY_GUARD_ADDRESS, &destination, amount)?;
@@ -1527,6 +1667,15 @@ impl TIP20Token {
     }
 }
 
+/// Issuer authorization source of a TIP-20 token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IssuerPolicy {
+    /// Generic (shared) TIP-403 policy ID.
+    Generic(u64),
+    /// TIP-1145 token-specific flat modes.
+    TokenSpecific(TokenPolicy),
+}
+
 /// Descriptive TIP-20 token metadata, written once when the token is initialized.
 ///
 /// `decimals` is omitted because all TIP-20 tokens use a fixed decimal count.
@@ -1609,6 +1758,9 @@ impl Recipient {
             .map(|virtual_addr| TIP20Event::transfer(virtual_addr, self.target, amount))
     }
 }
+
+#[cfg(test)]
+mod tip1145_tests;
 
 #[cfg(test)]
 mod recipient_tests {

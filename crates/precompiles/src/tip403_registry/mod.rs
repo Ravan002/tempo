@@ -6,6 +6,12 @@
 //! [TIP-403]: <https://docs.tempo.xyz/protocol/tip403>
 
 pub mod dispatch;
+mod token_policy;
+
+pub use token_policy::{
+    MINT_RECIPIENT_FLAG, RECEIVE_CONFIG_KIND, RECEIVE_TOKEN_FLAG, RECIPIENT_FLAG, SENDER_FLAG,
+    TOKEN_POLICY_ID,
+};
 
 // Re-export the generated slots module for external access to storage slot constants.
 pub use slots as tip403_registry_slots;
@@ -15,7 +21,7 @@ use crate::{
     receive_policy_guard::{RECOVERY_ORIGINATOR, RecoveryMode},
 };
 pub use tempo_contracts::precompiles::{
-    ITIP403Registry::{self, PolicyType},
+    ITIP403Registry::{self, PolicyMode, PolicyType},
     TIP403RegistryError, TIP403RegistryEvent,
 };
 use tempo_precompiles_macros::{Storable, contract};
@@ -23,7 +29,10 @@ use tempo_precompiles_macros::{Storable, contract};
 use crate::{
     RECEIVE_POLICY_GUARD_ADDRESS, TIP403_REGISTRY_ADDRESS,
     error::{Result, TempoPrecompileError},
-    storage::{Handler, Mapping},
+    storage::{
+        Handler, Layout, LayoutCtx, Mapping, Slot, Storable, StorableType, StorageOps,
+        packing::PackedSlot,
+    },
     tip20::TIP20Token,
     tip20_factory::TIP20Factory,
 };
@@ -61,11 +70,17 @@ pub struct TIP403Registry {
     /// value is `true` when the address is allowed; for blacklists it is `true` when the
     /// address is restricted.
     policy_set: Mapping<u64, Mapping<Address, bool>>,
-    /// Account receive policy configuration.
+    /// Account receive policy configuration (legacy TIP-1028 or TIP-1145).
     receive_policies: Mapping<Address, ReceivePolicy>,
     /// TIP-1092 token-to-policy bindings. Unset entries fall back to the policy ID stored on the
     /// TIP-20 token.
     token_transfer_policies: Mapping<Address, TokenTransferPolicy>,
+    /// TIP-1145 token-specific issuer policies (root 5).
+    token_policies: Mapping<Address, TokenPolicy>,
+    /// TIP-1145 packed issuer memberships and receive-token membership (root 6).
+    token_user_flags: Mapping<Address, Mapping<Address, u8>>,
+    /// TIP-1145 receive-sender memberships (root 7).
+    receive_sender_members: Mapping<Address, Mapping<Address, bool>>,
 }
 
 /// Packed TIP-1092 token-to-policy binding.
@@ -77,16 +92,75 @@ pub struct TokenTransferPolicy {
     is_set: bool,
 }
 
-/// Per-account TIP-1028 receive policy configuration.
-#[derive(Debug, Clone, Default, Storable)]
+/// TIP-1145 token-specific issuer policy (`tokenPolicies[token]`, one word).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Storable)]
+pub struct TokenPolicy {
+    /// Whether the policy is active (registered). Prepared policies leave it unset.
+    pub is_set: bool,
+    pub sender: PolicyMode,
+    pub recipient: PolicyMode,
+    pub mint_recipient: PolicyMode,
+}
+
+/// TIP-1145 receive configuration, stored in the first word of `receivePolicies[receiver]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Storable)]
+pub struct ReceiveConfig {
+    /// Always [`RECEIVE_CONFIG_KIND`], distinguishing it from the legacy `hasReceivePolicy`
+    /// byte (`0`/`1`). Opting in is permanent.
+    kind: u8,
+    token_mode: PolicyMode,
+    sender_mode: PolicyMode,
+    recovery_mode: RecoveryMode,
+    /// Recovery authority, only nonzero for [`RecoveryMode::ThirdParty`].
+    third_party_recovery_authority: Address,
+}
+
+/// Per-account receive policy.
+#[derive(Debug, Clone, Storable)]
 struct ReceivePolicy {
     config: ReceivePolicyConfig,
+    /// Legacy third-party recovery authority. Unused by TIP-1145 configs.
     recovery_address: Address,
+}
+
+/// First word of a receive policy, discriminated by its first byte: the legacy
+/// `hasReceivePolicy` flag (`0`/`1`) or [`RECEIVE_CONFIG_KIND`] for TIP-1145 configs.
+#[derive(Debug, Clone)]
+enum ReceivePolicyConfig {
+    Legacy(LegacyReceiveConfig),
+    Config(ReceiveConfig),
+}
+
+impl StorableType for ReceivePolicyConfig {
+    const LAYOUT: Layout = Layout::Slots(1);
+    type Handler = Slot<Self>;
+
+    fn handle(slot: U256, ctx: LayoutCtx, address: Address) -> Self::Handler {
+        Slot::new_with_ctx(slot, ctx, address)
+    }
+}
+
+impl Storable for ReceivePolicyConfig {
+    fn load<S: StorageOps>(storage: &S, slot: U256, ctx: LayoutCtx) -> Result<Self> {
+        let word = PackedSlot(storage.load(slot)?);
+        if word.0.byte(0) == RECEIVE_CONFIG_KIND {
+            ReceiveConfig::load(&word, U256::ZERO, ctx).map(Self::Config)
+        } else {
+            LegacyReceiveConfig::load(&word, U256::ZERO, ctx).map(Self::Legacy)
+        }
+    }
+
+    fn store<S: StorageOps>(&self, storage: &mut S, slot: U256, ctx: LayoutCtx) -> Result<()> {
+        match self {
+            Self::Legacy(config) => config.store(storage, slot, ctx),
+            Self::Config(config) => config.store(storage, slot, ctx),
+        }
+    }
 }
 
 /// Per-account TIP-1028 receive policy configuration. Packed in a single slot.
 #[derive(Debug, Clone, Default, Storable)]
-struct ReceivePolicyConfig {
+struct LegacyReceiveConfig {
     /// Whether the account has configured a receive policy.
     has_receive_policy: bool,
     /// Policy ID authorizing senders for inbound transfers.
@@ -185,7 +259,7 @@ impl PolicyData {
     }
 }
 
-impl ReceivePolicyConfig {
+impl LegacyReceiveConfig {
     fn sender_policy_data(&self) -> PolicyData {
         PolicyData {
             policy_type: self.sender_policy_type,
@@ -250,6 +324,13 @@ impl TIP403Registry {
             return Err(tempo_contracts::precompiles::TIP20Error::invalid_token().into());
         }
 
+        if self.storage.spec().is_t14() && self.active_token_policy(call.token)?.is_some() {
+            return Ok(ITIP403Registry::tokenTransferPolicyIdReturn {
+                isSet: true,
+                policyId: TOKEN_POLICY_ID,
+            });
+        }
+
         let registered_policy_id = self.registered_token_transfer_policy_id(call.token)?;
         let is_set = registered_policy_id.is_some();
         let policy_id = match registered_policy_id {
@@ -285,7 +366,7 @@ impl TIP403Registry {
     }
 
     /// Migrates valid, unregistered TIP-20 tokens to registry-owned transfer policy bindings.
-    /// Invalid and already-registered token addresses are skipped.
+    /// Invalid, already-registered, and (T14+) token-specific token addresses are skipped.
     pub fn migrate_transfer_policy_ids(
         &mut self,
         call: ITIP403Registry::migrateTransferPolicyIdsCall,
@@ -296,6 +377,7 @@ impl TIP403Registry {
         for token in call.tokens {
             if !factory.is_tip20(token)?
                 || self.registered_token_transfer_policy_id(token)?.is_some()
+                || (self.storage.spec().is_t14() && self.active_token_policy(token)?.is_some())
             {
                 continue;
             }
@@ -385,8 +467,14 @@ impl TIP403Registry {
     }
 
     /// Returns `account`'s receive-policy configuration.
+    ///
+    /// # Errors
+    /// - `ReceivePolicyIdsUnsupported` — (T14+) `account` opted into TIP-1145 receive configs
     pub fn receive_policy(&self, account: Address) -> Result<ITIP403Registry::receivePolicyReturn> {
-        let config = self.receive_policies[account].config.read()?;
+        let ReceivePolicyConfig::Legacy(config) = self.receive_policies[account].config.read()?
+        else {
+            return Err(TIP403RegistryError::receive_policy_ids_unsupported().into());
+        };
         Ok(ITIP403Registry::receivePolicyReturn {
             hasReceivePolicy: config.has_receive_policy,
             senderPolicyId: config.sender_policy_id,
@@ -412,13 +500,21 @@ impl TIP403Registry {
 
     /// Checks the receive policy. If valid, returns `None`. Otherwise returns the
     /// blocking reason and recovery address.
+    ///
+    /// (T14+) Receivers with a TIP-1145 configuration use flat modes; others fall back to their
+    /// legacy policy IDs.
     pub(crate) fn check_receive_policy(
         &self,
         token: Address,
         sender: Address,
         receiver: Address,
     ) -> Result<Option<(ITIP403Registry::BlockedReason, Address)>> {
-        let config = self.receive_policies[receiver].config.read()?;
+        let config = match self.receive_policies[receiver].config.read()? {
+            ReceivePolicyConfig::Config(config) => {
+                return self.check_receive_config(&config, token, sender, receiver);
+            }
+            ReceivePolicyConfig::Legacy(config) => config,
+        };
         if !config.has_receive_policy {
             return Ok(None);
         }
@@ -505,18 +601,19 @@ impl TIP403Registry {
         if msg_sender.is_virtual() {
             return Err(TIP403RegistryError::virtual_address_not_allowed().into());
         }
+        // (T14+) TIP-1145 receivers cannot switch back to policy IDs.
+        if self.storage.spec().is_t14() && self.active_receive_config(msg_sender)?.is_some() {
+            return Err(TIP403RegistryError::receive_policy_ids_unsupported().into());
+        }
 
         let recovery_address = call.recoveryAuthority;
-        let (recovery_mode, recovery_write) = RecoveryMode::encode(recovery_address, msg_sender);
-
-        if recovery_address.is_precompile(self.storage.spec()) || recovery_address.is_virtual() {
-            return Err(TIP403RegistryError::invalid_recovery_authority().into());
-        }
+        let (recovery_mode, recovery_write) =
+            self.encode_recovery_authority(recovery_address, msg_sender)?;
 
         let sender_policy_type = self.validate_receive_policy_id(call.senderPolicyId)?;
         let token_filter_type = self.validate_receive_policy_id(call.tokenFilterId)?;
 
-        let config = ReceivePolicyConfig {
+        let config = LegacyReceiveConfig {
             has_receive_policy: true,
             sender_policy_id: call.senderPolicyId,
             sender_policy_type,
@@ -524,13 +621,15 @@ impl TIP403Registry {
             token_filter_type,
             recovery_mode,
         };
-        self.receive_policies[msg_sender].config.write(config)?;
+        self.receive_policies[msg_sender]
+            .config
+            .write(ReceivePolicyConfig::Legacy(config))?;
         self.receive_policies[msg_sender]
             .recovery_address
             .write(recovery_write)?;
 
-        self.emit_event(TIP403RegistryEvent::ReceivePolicyUpdated(
-            ITIP403Registry::ReceivePolicyUpdated {
+        self.emit_event(TIP403RegistryEvent::ReceivePolicyUpdated_0(
+            ITIP403Registry::ReceivePolicyUpdated_0 {
                 account: msg_sender,
                 senderPolicyId: call.senderPolicyId,
                 tokenFilterId: call.tokenFilterId,
@@ -1364,8 +1463,8 @@ mod tests {
                 recovery
             );
 
-            registry.assert_emitted_events(vec![TIP403RegistryEvent::ReceivePolicyUpdated(
-                ITIP403Registry::ReceivePolicyUpdated {
+            registry.assert_emitted_events(vec![TIP403RegistryEvent::ReceivePolicyUpdated_0(
+                ITIP403Registry::ReceivePolicyUpdated_0 {
                     account,
                     senderPolicyId: REJECT_ALL_POLICY_ID,
                     tokenFilterId: ALLOW_ALL_POLICY_ID,

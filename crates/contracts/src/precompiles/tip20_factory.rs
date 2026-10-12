@@ -12,8 +12,17 @@ crate::sol! {
         error AddressNotReserved();
         error InvalidQuoteToken();
         error TokenAlreadyExists(address token);
+        error InvalidStorageMigrationToken(address token);
+        error InvalidStorageMigrationState(address token);
 
         event TokenCreated(address indexed token, string name, string symbol, string currency, address quoteToken, address admin, bytes32 salt);
+        event TokenStorageMigrated(address indexed token, uint8 version);
+
+        /// @notice Returns the TIP-1145 storage layout version of `token` (0 = LEGACY, 1 = PACKED).
+        function tokenStorageVersion(address token) external view returns (uint8 version);
+
+        /// @notice Converts eligible TIP-20 tokens from the legacy to the packed storage layout.
+        function migrateTokenStorage(address[] calldata tokens) external returns (uint256 migrated);
 
         function createToken(
             string memory name,

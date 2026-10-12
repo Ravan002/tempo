@@ -38,6 +38,8 @@ impl Precompile for TIP20Token {
                     totalSupply(call) => view(call, |_| self.total_supply()),
                     supplyCap(call) => view(call, |_| self.supply_cap()),
                     transferPolicyId(call) => view(call, |_| self.transfer_policy_id()),
+                    #[schedule(since = T14)]
+                    transferPolicy(call) => view(call, |_| self.transfer_policy()),
                     paused(call) => view(call, |_| self.paused()),
                     #[schedule(since = T5)]
                     logoURI(call) => view(call, |_| self.logo_uri()),
@@ -648,8 +650,8 @@ mod tests {
         use crate::test_util::{assert_full_coverage, check_selector_coverage};
         use tempo_contracts::precompiles::{IRolesAuth::IRolesAuthCalls, ITIP20::ITIP20Calls};
 
-        // Use T12 so the TIP-1006 selectors are active too.
-        let mut storage = HashMapStorageProvider::new_with_spec(1, TempoHardfork::T12);
+        // Use T14 so the TIP-1006 and TIP-1145 selectors are active too.
+        let mut storage = HashMapStorageProvider::new_with_spec(1, TempoHardfork::T14);
         let admin = Address::random();
 
         StorageCtx::enter(&mut storage, || {

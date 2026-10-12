@@ -321,7 +321,11 @@ where
         .await?
         .get_receipt()
         .await?;
-    let event = ITIP20Factory::TokenCreated::decode_log(&receipt.logs()[1].inner).unwrap();
+    let event = receipt
+        .logs()
+        .iter()
+        .find_map(|log| ITIP20Factory::TokenCreated::decode_log(&log.inner).ok())
+        .unwrap();
 
     let token_addr = event.token;
     let token = ITIP20::new(token_addr, provider.clone());

@@ -130,6 +130,9 @@ pub trait TempoStateAccess<M = ()> {
         self.with_read_only_storage_ctx(spec, actions, || {
             // SAFETY: caller must ensure prefix is already checked
             let token = TIP20Token::from_address_unchecked(fee_token);
+            if let Some(is_usd) = token.packed_is_usd()? {
+                return Ok(is_usd);
+            }
             Ok(token.currency.len()? == 3 && token.currency.read()?.as_str() == "USD")
         })
     }
@@ -149,13 +152,7 @@ pub trait TempoStateAccess<M = ()> {
         self.with_read_only_storage_ctx(spec, actions, || {
             // SAFETY: caller must ensure prefix is already checked
             let token = TIP20Token::from_address_unchecked(fee_token);
-            let len = token.currency.len()?;
-
-            let currency = if len > 31 {
-                format!("<{len} bytes>")
-            } else {
-                token.currency.read()?
-            };
+            let currency = token.currency_summary()?;
 
             if currency.as_str() != "USD" {
                 return Ok(Err(EVMError::Transaction(
