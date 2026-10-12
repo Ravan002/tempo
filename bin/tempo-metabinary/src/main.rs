@@ -171,6 +171,7 @@ async fn bootstrap(
                 name: era.name.clone(),
                 start_timestamp: era.start_timestamp,
                 binary: Some(era.binary.clone()),
+                checkpoint: None,
             }],
         )?);
         let worker = workers.get(0).await?;

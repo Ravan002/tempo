@@ -292,6 +292,9 @@ where
         &mut self,
         tx: Self::Tx,
     ) -> Result<ResultAndState<Self::HaltReason>, Self::Error> {
+        #[cfg(feature = "genesis-t10")]
+        crate::ensure_supported_hardfork(self.cfg.spec)
+            .map_err(|error| EVMError::Custom(error.to_string()))?;
         if tx.is_system_tx {
             let TxKind::Call(to) = tx.inner.kind else {
                 return Err(TempoInvalidTransaction::SystemTransactionMustBeCall.into());
@@ -328,6 +331,9 @@ where
         contract: Address,
         data: Bytes,
     ) -> Result<ResultAndState<Self::HaltReason>, Self::Error> {
+        #[cfg(feature = "genesis-t10")]
+        crate::ensure_supported_hardfork(self.cfg.spec)
+            .map_err(|error| EVMError::Custom(error.to_string()))?;
         self.inner.system_call_with_caller(caller, contract, data)
     }
 

@@ -133,6 +133,8 @@ path = "src/localnet.rs"
 required-features = ["localnet"]
 
 [features]
+# Frozen worker for historical Genesis through T10 execution.
+genesis-t10 = ["tempo-evm/genesis-t10", "tempo-node/genesis-t10"]
 default = ["asm-keccak", "jemalloc", "otlp", "keccak-cache-global"]
 
 localnet = ["dep:nix"]

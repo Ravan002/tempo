@@ -60,6 +60,17 @@ pub use tempo_revm::{
 #[cfg(test)]
 mod test_utils;
 
+/// Reject successor forks in the frozen Genesis through T10 artifact.
+#[cfg(feature = "genesis-t10")]
+fn ensure_supported_hardfork(spec: TempoHardfork) -> Result<(), TempoEvmError> {
+    if spec > TempoHardfork::T10 {
+        return Err(TempoEvmError::InvalidEvmConfig(format!(
+            "genesis-t10 worker does not support {spec}; maximum supported fork is T10"
+        )));
+    }
+    Ok(())
+}
+
 /// Tempo-related EVM configuration.
 #[derive(Debug, Clone)]
 pub struct TempoEvmConfig {
@@ -174,6 +185,8 @@ impl ConfigureEvm for TempoEvmConfig {
         );
 
         let spec = self.chain_spec().tempo_hardfork_at(header.timestamp());
+        #[cfg(feature = "genesis-t10")]
+        ensure_supported_hardfork(spec)?;
 
         // Apply TIP-1000 gas params for T1 hardfork.
         //
@@ -232,6 +245,8 @@ impl ConfigureEvm for TempoEvmConfig {
         );
 
         let spec = self.chain_spec().tempo_hardfork_at(attributes.timestamp);
+        #[cfg(feature = "genesis-t10")]
+        ensure_supported_hardfork(spec)?;
 
         // Apply TIP-1000 gas params for T1 hardfork. TIP-1016 is gated by
         // `cfg_env.enable_amsterdam_eip8037`, independent of the T4 hardfork

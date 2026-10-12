@@ -117,6 +117,8 @@ vergen.workspace = true
 vergen-git2.workspace = true
 
 [features]
+# Forward the frozen ceiling and include it in worker build metadata.
+genesis-t10 = ["tempo-evm/genesis-t10"]
 default = []
 asm-keccak = [
 	"alloy/asm-keccak",
