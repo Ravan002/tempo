@@ -4,7 +4,6 @@ use alloy::{
 };
 use evm2::{
     Evm, EvmTypes,
-    bytecode::Bytecode,
     evm::{AccountInfo, StateCheckpoint, precompile::PrecompileOutput},
     interpreter::GasTracker,
     precompiles::{PrecompileError, PrecompileResult},
@@ -118,18 +117,6 @@ impl StorageCtx {
             })
         })?;
         result.unwrap()
-    }
-
-    /// Returns `EXTCODEHASH(address)` and the account's runtime bytecode.
-    pub fn account_code(&self, address: Address) -> Result<(B256, Bytecode)> {
-        Self::try_with_storage(|s| s.account_code(address))
-    }
-
-    /// Copies deployed runtime bytecode between accounts.
-    ///
-    /// Returns `None` when the source account's runtime bytecode is empty.
-    pub fn copy_runtime(&mut self, source: Address, destination: Address) -> Result<Option<B256>> {
-        Self::try_with_storage(|s| s.copy_runtime(source, destination))
     }
 
     /// Returns the chain ID.

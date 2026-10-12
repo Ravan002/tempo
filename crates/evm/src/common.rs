@@ -1,11 +1,10 @@
 use crate::{TempoEvmTypes, TempoInvalidTransaction, TempoTxEnv};
 use alloy_consensus::transaction::Recovered;
-use alloy_primitives::{Address, B256, Bytes, LogData, TxKind, U256};
+use alloy_primitives::{Address, Bytes, LogData, TxKind, U256};
 use alloy_sol_types::SolCall;
 use core::marker::PhantomData;
 use evm2::{
     DatabaseError, Evm,
-    bytecode::Bytecode,
     evm::{AccountInfo, Database, DynDatabase, StateCheckpoint},
     registry::{HandlerError, HandlerResult},
 };
@@ -367,10 +366,6 @@ where
         let info = self.state.basic(address)?;
         f(&info);
         Ok(())
-    }
-
-    fn account_code(&mut self, _: Address) -> TempoResult<(B256, Bytecode)> {
-        unreachable!("'account_code' not supported in read-only context")
     }
 
     // No-op methods are unimplemented in read-only context.

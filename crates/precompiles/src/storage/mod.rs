@@ -23,7 +23,6 @@ pub use types::mapping as slots;
 
 use alloy::primitives::{Address, B256, Bytes, KECCAK256_EMPTY, LogData, Signature, U256};
 use evm2::{
-    bytecode::Bytecode,
     evm::{AccountInfo, StateCheckpoint},
     interpreter::gas::{KECCAK256, KECCAK256WORD},
 };
@@ -59,21 +58,6 @@ pub trait PrecompileStorageProvider {
         address: Address,
         f: &mut dyn FnMut(&AccountInfo),
     ) -> Result<()>;
-
-    /// Returns `EXTCODEHASH(address)` and the account's runtime bytecode.
-    fn account_code(&mut self, address: Address) -> Result<(B256, Bytecode)>;
-
-    /// Copies deployed runtime bytecode between accounts.
-    ///
-    /// Returns `None` when the source account's runtime bytecode is empty.
-    fn copy_runtime(&mut self, source: Address, destination: Address) -> Result<Option<B256>> {
-        let (code_hash, code) = self.account_code(source)?;
-        if code.is_empty() {
-            return Ok(None);
-        }
-        self.set_code(destination, code.original_bytes())?;
-        Ok(Some(code_hash))
-    }
 
     /// Performs an SLOAD operation (persistent storage read).
     fn sload(&mut self, address: Address, key: U256) -> Result<U256>;

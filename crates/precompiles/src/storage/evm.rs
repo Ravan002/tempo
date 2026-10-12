@@ -3,7 +3,7 @@ use crate::{
     storage::{PrecompileStorageProvider, StorageActions, actions::StorageAction},
     storage_credits::{NonCreditableSlots, StorageCreditsBackend, sstore_storage_credits},
 };
-use alloy::primitives::{Address, B256, Bytes, Log, LogData, U256};
+use alloy::primitives::{Address, Bytes, Log, LogData, U256};
 use bitflags::bitflags;
 use evm2::{
     Evm, EvmFeatures, EvmTypes, Version,
@@ -292,7 +292,7 @@ where
     fn with_loaded_account<R>(
         &mut self,
         address: Address,
-        f: impl FnOnce(bool, &AccountInfo) -> R,
+        f: impl FnOnce(&AccountInfo) -> R,
     ) -> Result<R, TempoPrecompileError> {
         let additional_cost = self.version.gas_params.cold_account_additional_cost();
 
@@ -322,9 +322,8 @@ where
 
         account.load_code()?;
 
-        let exists = account.exists();
         let default = AccountInfo::default();
-        Ok(f(exists, account.get().unwrap_or(&default)))
+        Ok(f(account.get().unwrap_or(&default)))
     }
 }
 
@@ -452,16 +451,7 @@ where
         address: Address,
         f: &mut dyn FnMut(&AccountInfo),
     ) -> Result<(), TempoPrecompileError> {
-        self.with_loaded_account(address, |_, info| f(info))
-    }
-
-    #[inline]
-    fn account_code(&mut self, address: Address) -> Result<(B256, Bytecode), TempoPrecompileError> {
-        self.with_loaded_account(address, |exists, info| {
-            let code_hash = if exists { info.code_hash } else { B256::ZERO };
-            let code = info.code.clone().unwrap_or_default();
-            (code_hash, code)
-        })
+        self.with_loaded_account(address, |info| f(info))
     }
 
     #[inline]

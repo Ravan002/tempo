@@ -1,4 +1,4 @@
-use alloy::primitives::{Address, B256, Bytes, LogData, U256};
+use alloy::primitives::{Address, Bytes, LogData, U256};
 use evm2::{
     SpecId,
     bytecode::Bytecode,
@@ -129,13 +129,6 @@ impl PrecompileStorageProvider for HashMapStorageProvider {
         let account = self.accounts.entry(address).or_default();
         f(&*account);
         Ok(())
-    }
-
-    fn account_code(&mut self, address: Address) -> Result<(B256, Bytecode), TempoPrecompileError> {
-        let Some(account) = self.accounts.get(&address) else {
-            return Ok((B256::ZERO, Bytecode::default()));
-        };
-        Ok((account.code_hash, account.code.clone().unwrap_or_default()))
     }
 
     fn sstore(
