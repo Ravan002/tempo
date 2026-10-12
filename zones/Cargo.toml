@@ -146,6 +146,7 @@ tempo-nitro-attestation = { git = "https://github.com/tempoxyz/tempo", rev = "44
 reth-basic-payload-builder = { git = "https://github.com/paradigmxyz/reth", rev = "42fa3c5" }
 reth-chain-state = { git = "https://github.com/paradigmxyz/reth", rev = "42fa3c5" }
 reth-chainspec = { git = "https://github.com/paradigmxyz/reth", rev = "42fa3c5" }
+reth-consensus-common = { git = "https://github.com/paradigmxyz/reth", rev = "42fa3c5" }
 reth-cli = { git = "https://github.com/paradigmxyz/reth", rev = "42fa3c5" }
 reth-cli-util = { git = "https://github.com/paradigmxyz/reth", rev = "42fa3c5" }
 reth-codecs = { version = "0.8.1", default-features = false }
