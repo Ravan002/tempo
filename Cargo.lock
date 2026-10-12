@@ -17180,7 +17180,6 @@ dependencies = [
  "rcgen",
  "reqwest 0.13.3",
  "rustls",
- "rustls-pemfile",
  "serde",
  "serde_json",
  "sqlx",

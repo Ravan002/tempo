@@ -1,12 +1,15 @@
 use crate::config::{ServerTls, TlsFiles};
 use axum::Router;
-use eyre::{Result, eyre};
+use eyre::Result;
 use hyper_util::{
     rt::{TokioExecutor, TokioIo},
     service::TowerToHyperService,
 };
-use rustls::{ClientConfig, RootCertStore, ServerConfig};
-use std::{io::Cursor, sync::Arc, time::Duration};
+use rustls::{
+    ClientConfig, RootCertStore, ServerConfig,
+    pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject},
+};
+use std::{sync::Arc, time::Duration};
 use tokio::{
     net::TcpListener,
     sync::{Semaphore, watch},
@@ -22,16 +25,13 @@ pub(crate) async fn backend_client(
         ca.len() <= 64 * 1024 && cert.len() <= 64 * 1024 && key.len() <= 64 * 1024,
         "TLS material too large"
     );
-    let mut identity = cert.clone();
-    identity.extend_from_slice(&key);
     let mut roots = RootCertStore::empty();
-    for certificate in rustls_pemfile::certs(&mut Cursor::new(&ca)) {
+    for certificate in CertificateDer::pem_slice_iter(&ca) {
         roots.add(certificate?)?;
     }
-    let certs = rustls_pemfile::certs(&mut Cursor::new(cert))
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    let key = rustls_pemfile::private_key(&mut Cursor::new(key))?
-        .ok_or_else(|| eyre!("TLS private key missing"))?;
+    let certs =
+        CertificateDer::pem_slice_iter(&cert).collect::<std::result::Result<Vec<_>, _>>()?;
+    let key = PrivateKeyDer::from_pem_slice(&key)?;
     let mut tls = ClientConfig::builder()
         .with_root_certificates(roots)
         .with_client_auth_cert(certs, key)?;
@@ -63,10 +63,9 @@ pub(crate) async fn serve_public(
     };
     let certs = tokio::fs::read(files.cert).await?;
     let key = tokio::fs::read(files.key).await?;
-    let certs = rustls_pemfile::certs(&mut Cursor::new(certs))
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    let key = rustls_pemfile::private_key(&mut Cursor::new(key))?
-        .ok_or_else(|| eyre!("TLS private key missing"))?;
+    let certs =
+        CertificateDer::pem_slice_iter(&certs).collect::<std::result::Result<Vec<_>, _>>()?;
+    let key = PrivateKeyDer::from_pem_slice(&key)?;
     let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(
         ServerConfig::builder()
             .with_no_client_auth()
