@@ -1,4 +1,4 @@
-"""Run with python3 -m unittest discover -s .github/tests (requires PyYAML and Node)."""
+"""Run with uv run --with pyyaml python -m unittest discover -s .github/tests."""
 
 import json
 from pathlib import Path
@@ -15,13 +15,13 @@ OTHER_SHA = "b" * 40
 
 
 def run_step(job, name, *, actor="member", triggering_actor="member", members=None,
-             body=None, head=SHA, repo="tempoxyz/zones", event="issue_comment", feature_sha=""):
+             body=None, head=SHA, repo="tempoxyz/tempo", event="issue_comment", feature_sha=""):
     step = next(s for s in WORKFLOW["jobs"][job]["steps"] if s.get("name") == name)
     payload = {
         "script": step["with"]["script"],
         "context": {"actor": actor, "eventName": event,
                     "payload": {"comment": {"body": body if body is not None else f"derek bench {SHA}"}},
-                    "issue": {"number": 1507}, "repo": {"owner": "tempoxyz", "repo": "zones"}},
+                    "issue": {"number": 1507}, "repo": {"owner": "tempoxyz", "repo": "tempo"}},
         "members": members if members is not None else ["member", "other-member"],
         "head": {"sha": head, "repo": {"full_name": repo} if repo else None},
         "env": {"TRIGGERING_ACTOR": triggering_actor, "FEATURE_SHA": feature_sha},
@@ -88,7 +88,7 @@ class AuthorizationTests(unittest.TestCase):
         steps = WORKFLOW["jobs"]["benchmark"]["steps"]
         names = [step.get("name") for step in steps]
         check = names.index("Check org membership")
-        for name in ("Mint Earn read token", "Check out feature Zones", "Configure AWS benchmark role"):
+        for name in ("Mint Earn read token", "Check out feature Tempo with Zones", "Configure AWS benchmark role"):
             self.assertLess(check, names.index(name))
-        checkout = steps[names.index("Check out feature Zones")]
+        checkout = steps[names.index("Check out feature Tempo with Zones")]
         self.assertEqual(checkout["with"]["ref"], "${{ needs.authorize.outputs.feature-sha }}")
