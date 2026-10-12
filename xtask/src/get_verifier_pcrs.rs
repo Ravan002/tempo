@@ -15,8 +15,8 @@ use alloy::{
 use alloy_consensus::BlockHeader;
 use eyre::{Context, OptionExt, ensure, eyre};
 use serde::Serialize;
-use tempo_alloy::TempoNetwork;
-use tempo_chainspec::{TempoChainSpec, TempoHardfork, TempoHardforks};
+use tempo_alloy::{TempoNetwork, provider::TempoProviderExt, rpc::ForkSchedule};
+use tempo_chainspec::{TempoChainSpec, TempoHardfork};
 use tempo_contracts::{
     precompiles::{IZoneVerifier, NITRO_VERIFIER_CONFIG_V1, ZONE_VERIFIER_ADDRESS},
     zones::{BatchSubmitted, submitBatchCall},
@@ -26,11 +26,11 @@ use tempo_precompiles::zone_factory::portal_address;
 
 #[derive(Debug, clap::Args)]
 pub(crate) struct GetVerifierPcrs {
-    /// Chain whose hardfork schedule to use, or a genesis JSON path for a custom network.
+    /// Chain used for the default RPC URL and chain ID check, or a custom genesis JSON path.
     #[arg(long, short, value_parser = tempo_chainspec::spec::chain_value_parser)]
     chain: Arc<TempoChainSpec>,
 
-    /// RPC endpoint supporting eth_getLogs and debug_traceTransaction with callTracer.
+    /// RPC endpoint supporting tempo_forkSchedule, eth_getLogs and debug_traceTransaction.
     #[arg(long)]
     rpc_url: Option<String>,
 
@@ -83,6 +83,10 @@ impl GetVerifierPcrs {
             "RPC chain ID {chain_id} does not match selected chain {}",
             self.chain.inner.chain.id()
         );
+        let schedule = provider
+            .get_fork_schedule()
+            .await
+            .wrap_err("failed reading tempo_forkSchedule")?;
         let head = provider.get_block_number().await?;
         let to = self.to_block.unwrap_or(head);
         ensure!(
@@ -92,8 +96,9 @@ impl GetVerifierPcrs {
         let hardfork = if let Some(hardfork) = self.hardfork {
             hardfork
         } else {
-            self.chain
-                .tempo_hardfork_at(block_timestamp(&provider, to).await?)
+            hardfork_at(&schedule, block_timestamp(&provider, to).await?)
+                .parse::<TempoHardfork>()
+                .wrap_err("RPC reports a hardfork unsupported by this xtask version")?
         };
         ensure!(
             hardfork >= TempoHardfork::T13,
@@ -101,10 +106,10 @@ impl GetVerifierPcrs {
         );
 
         // Locate the selected fork's block interval using RPC timestamps and the selected
-        // chainspec. This avoids scanning unrelated history, including proofless rollouts.
+        // RPC's fork schedule. This avoids scanning unrelated history, including proofless rollouts.
         let from =
-            fork_boundary(&provider, &self.chain, self.from_block, to, hardfork, false).await?;
-        let upper = fork_boundary(&provider, &self.chain, from, to, hardfork, true).await?;
+            fork_boundary(&provider, &schedule, self.from_block, to, hardfork, false).await?;
+        let upper = fork_boundary(&provider, &schedule, from, to, hardfork, true).await?;
         ensure!(
             from < upper,
             "no blocks for {hardfork} in the requested range"
@@ -167,7 +172,7 @@ impl GetVerifierPcrs {
                         "batch block is no longer canonical; retry after reorg"
                     );
                     ensure!(
-                        self.chain.tempo_hardfork_at(block.header.timestamp()) == hardfork,
+                        hardfork_at(&schedule, block.header.timestamp()) == hardfork.to_string(),
                         "batch does not belong to selected hardfork"
                     );
                     println!(
@@ -211,24 +216,44 @@ async fn block_timestamp(provider: &impl Provider<TempoNetwork>, number: u64) ->
 /// First block at (or strictly after) the requested hardfork, or `to + 1` if absent.
 async fn fork_boundary(
     provider: &impl Provider<TempoNetwork>,
-    chain: &TempoChainSpec,
+    schedule: &ForkSchedule,
     from: u64,
     to: u64,
     fork: TempoHardfork,
     strictly_after: bool,
 ) -> eyre::Result<u64> {
+    let fork_index = schedule
+        .schedule
+        .iter()
+        .position(|entry| entry.name == fork.to_string())
+        .ok_or_else(|| eyre!("{fork} is not scheduled by the RPC"))?;
     let mut low = from;
     let mut high = to.checked_add(1).ok_or_eyre("block range overflows")?;
     while low < high {
         let mid = low + (high - low) / 2;
-        let active = chain.tempo_hardfork_at(block_timestamp(provider, mid).await?);
-        if active > fork || (!strictly_after && active == fork) {
+        let timestamp = block_timestamp(provider, mid).await?;
+        let active = schedule
+            .schedule
+            .iter()
+            .rposition(|entry| entry.activation_time <= timestamp);
+        if active
+            .is_some_and(|index| index > fork_index || (!strictly_after && index == fork_index))
+        {
             high = mid;
         } else {
             low = mid + 1;
         }
     }
     Ok(low)
+}
+
+fn hardfork_at(schedule: &ForkSchedule, timestamp: u64) -> &str {
+    schedule
+        .schedule
+        .iter()
+        .rev()
+        .find(|entry| entry.activation_time <= timestamp)
+        .map_or("Genesis", |entry| entry.name.as_str())
 }
 
 /// Ignore failed ancestors, including reverted calls caught by a multicall or AA transaction.
@@ -294,11 +319,8 @@ fn verifier_pcrs(frame: &CallFrame, portal: Address) -> eyre::Result<Option<(u32
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy::{
-        genesis::Genesis, primitives::U256, rpc::types::Block, transports::mock::Asserter,
-    };
+    use alloy::{primitives::U256, rpc::types::Block, transports::mock::Asserter};
     use base64::Engine;
-    use tempo_chainspec::cli::TempoHardforkArgs;
     use tempo_contracts::{
         precompiles::NO_PROOF_FALLBACK_VERIFIER,
         zones::{BlockTransition, DepositQueueTransition, TokenEnablementTransition},
@@ -444,22 +466,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bounds_search_to_historical_fork_and_handles_absent_fork() {
-        let mut genesis = Genesis::default();
-        TempoHardforkArgs {
-            hardfork: Some(TempoHardfork::T14),
-            t13_time: Some(30),
-            t14_time: Some(70),
-            ..Default::default()
-        }
-        .write_to(&mut genesis.config);
-        let chain = TempoChainSpec::from_genesis(genesis);
+    async fn bounds_search_to_rpc_fork_including_unknown_successor() {
+        let schedule: ForkSchedule = serde_json::from_value(serde_json::json!({
+            "active": "T14",
+            "schedule": [
+                {"name": "T13", "activationTime": 30, "active": true},
+                {"name": "T14", "activationTime": 70, "active": true},
+                {"name": "FutureFork", "activationTime": 90, "active": false}
+            ]
+        }))
+        .unwrap();
         for (fork, after, timestamps, expected) in [
             (TempoHardfork::T13, false, vec![50, 20, 40, 30], 3),
             (TempoHardfork::T13, true, vec![50, 80, 70, 60], 7),
-            (TempoHardfork::T14, true, vec![50, 80, 90], 10),
+            (TempoHardfork::T14, true, vec![50, 80, 90], 9),
         ] {
             let asserter = Asserter::new();
+            asserter.push_success(&schedule);
             for timestamp in timestamps {
                 let mut block = Block::<B256>::default();
                 block.header.inner.timestamp = timestamp;
@@ -472,13 +495,53 @@ mod tests {
             }
             let provider = ProviderBuilder::new_with_network::<TempoNetwork>()
                 .connect_mocked_client(asserter.clone());
+            let schedule = provider.get_fork_schedule().await.unwrap();
             assert_eq!(
-                fork_boundary(&provider, &chain, 0, 9, fork, after)
+                fork_boundary(&provider, &schedule, 0, 9, fork, after)
                     .await
                     .unwrap(),
                 expected
             );
             assert!(asserter.read_q().is_empty());
         }
+    }
+
+    #[test]
+    fn historical_hardfork_selection_uses_timestamps_and_preserves_unknown_forks() {
+        let schedule: ForkSchedule = serde_json::from_value(serde_json::json!({
+            "active": "T13",
+            "schedule": [
+                {"name": "T13", "activationTime": 30, "active": true},
+                {"name": "T14", "activationTime": 70, "active": false},
+                {"name": "FutureFork", "activationTime": 90, "active": false}
+            ]
+        }))
+        .unwrap();
+        for (timestamp, expected) in [
+            (29, "Genesis"),
+            (30, "T13"),
+            (69, "T13"),
+            (70, "T14"),
+            (90, "FutureFork"),
+        ] {
+            assert_eq!(hardfork_at(&schedule, timestamp), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_forks_missing_from_rpc_schedule() {
+        let provider = ProviderBuilder::new_with_network::<TempoNetwork>()
+            .connect_mocked_client(Asserter::new());
+        let schedule = ForkSchedule {
+            schedule: Vec::new(),
+            active: "Genesis".to_owned(),
+        };
+        assert_eq!(
+            fork_boundary(&provider, &schedule, 0, 9, TempoHardfork::T13, false)
+                .await
+                .unwrap_err()
+                .to_string(),
+            "T13 is not scheduled by the RPC"
+        );
     }
 }
