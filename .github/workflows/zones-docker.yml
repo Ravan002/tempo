@@ -131,11 +131,11 @@ jobs:
               exit 1
             }
           fi
-          [[ "$BINARY_VERIFY" != true || ( "$EIF_VERIFY" != true && "$IMAGE_VERIFY" != true ) ]] &&
-          [[ "$EIF_VERIFY" != true || "$IMAGE_VERIFY" != true ]] || {
+          if [[ "$BINARY_VERIFY" == true && ( "$EIF_VERIFY" == true || "$IMAGE_VERIFY" == true ) ]] ||
+             [[ "$EIF_VERIFY" == true && "$IMAGE_VERIFY" == true ]]; then
             echo "Select only one reproducibility verification mode" >&2
             exit 1
-          }
+          fi
 
 
   resolve-production-build-inputs:

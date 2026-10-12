@@ -52,7 +52,7 @@ fn render_results(report_json: &str, scenario_yaml: &str) -> Result<String> {
     let report: ScenarioReport =
         serde_json::from_str(report_json).wrap_err("failed to parse txgen scenario report")?;
     let scenario: ScenarioSpec =
-        serde_yaml::from_str(scenario_yaml).wrap_err("failed to parse rendered scenario YAML")?;
+        serde_saphyr::from_str(scenario_yaml).wrap_err("failed to parse rendered scenario YAML")?;
     render_scenario_results(&report, &scenario)
 }
 
@@ -194,9 +194,9 @@ struct ScenarioStep {
     #[serde(default)]
     save: Option<String>,
     #[serde(default, rename = "timeout")]
-    _timeout: Option<serde_yaml::Value>,
+    _timeout: Option<serde_json::Value>,
     #[serde(flatten)]
-    operation: BTreeMap<String, serde_yaml::Value>,
+    operation: BTreeMap<String, serde_json::Value>,
 }
 
 struct ResolvedStep<'a> {
@@ -611,15 +611,15 @@ fn resolve_steps<'a>(
                     reported.name
                 );
             }
-            let body = body.as_mapping().ok_or_else(|| {
+            let body = body.as_object().ok_or_else(|| {
                 eyre::eyre!(
                     "rendered scenario step {} operation must be a mapping",
                     expected_name
                 )
             })?;
             let chain = body
-                .get(serde_yaml::Value::String("chain".to_owned()))
-                .and_then(serde_yaml::Value::as_str)
+                .get("chain")
+                .and_then(serde_json::Value::as_str)
                 .ok_or_else(|| {
                     eyre::eyre!("rendered scenario step {} has no chain", expected_name)
                 })?;
@@ -936,4 +936,60 @@ fn code(value: &str) -> String {
         .replace('`', "&#96;")
         .replace(['\n', '\r'], " ");
     format!("`{escaped}`")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_rendered_scenario_operations() {
+        let scenario = serde_saphyr::from_str::<ScenarioSpec>(
+            r#"
+version: 1
+chains:
+  zone: { chain_id: 42431 }
+scenario:
+  name: transfer
+  steps:
+    - id: submit
+      timeout: 30s
+      send_transaction: &transaction
+        chain: zone
+        value: 0
+        wait_for_receipt: true
+        labels: [benchmark, transfer]
+    - id: repeat
+      depends_on: [submit]
+      send_transaction: *transaction
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(scenario.chains["zone"].chain_id, 42431);
+        let steps = &scenario.scenario.steps;
+        assert_eq!(steps[0]._timeout, Some(serde_json::json!("30s")));
+        assert_eq!(
+            steps[0].operation["send_transaction"],
+            serde_json::json!({
+                "chain": "zone",
+                "value": 0,
+                "wait_for_receipt": true,
+                "labels": ["benchmark", "transfer"],
+            })
+        );
+        assert_eq!(steps[1].operation, steps[0].operation);
+        assert_eq!(steps[1].depends_on, ["submit"]);
+    }
+
+    #[test]
+    fn reject_invalid_scenario_yaml() {
+        assert!(serde_saphyr::from_str::<ScenarioSpec>("version: [").is_err());
+        assert!(
+            serde_saphyr::from_str::<ScenarioSpec>(
+                "version: 1\nchains: {zone: {chain_id: invalid}}\nscenario: {name: transfer, steps: []}"
+            )
+            .is_err()
+        );
+    }
 }
