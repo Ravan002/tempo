@@ -45,7 +45,7 @@ impl TempoBlockExecutor<'_> {
             return Err(StorageActionReplayError::TransactionExecutionFailed.into());
         }
 
-        let next_section = self
+        let is_system_tx = self
             .validate_tx_pre_execution(original)
             .map_err(BlockExecutionError::from)?;
 
@@ -62,23 +62,20 @@ impl TempoBlockExecutor<'_> {
         } else {
             gas.tx_gas_used()
         };
-        let next_section = if let Some(next_section) = next_section {
-            next_section
-        } else {
-            self.validate_tx(
-                *original.tx_hash(),
-                self.is_payment(original),
-                block_gas_used,
-            )
-            .map_err(BlockExecutionError::from)?
-        };
+        self.validate_tx(
+            *original.tx_hash(),
+            is_system_tx,
+            self.is_payment(original),
+            block_gas_used,
+        )
+        .map_err(BlockExecutionError::from)?;
 
         let result = TempoTxResult::new_precomputed(
             original,
             tx_env.inner().execution_context(),
             result,
             state,
-            next_section,
+            is_system_tx,
             self.is_payment(original),
             block_gas_used,
             validator_fee,

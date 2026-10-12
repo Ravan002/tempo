@@ -84,10 +84,16 @@ pub struct TempoTxResult {
     inner: EthTransactionResultWithState<TempoEvmTypes, TempoTxType>,
     /// Transaction type retained separately because Reth's detached result metadata is private.
     tx_type: TempoTxType,
+    /// Hash of the executed transaction.
+    tx_hash: B256,
     /// Execution provenance used to exempt RPC simulations from block gas validation.
     execution_context: ExecutionContext,
-    /// Next section of the block.
-    next_section: BlockSection,
+    /// Whether the transaction is a system transaction.
+    ///
+    /// The block section is not stored: results may be committed by a different executor than the
+    /// one that produced them (e.g. BAL workers), so [`TempoBlockExecutor::commit_transaction`]
+    /// derives it from the committing executor's state.
+    is_system_tx: bool,
     /// Whether the transaction is a payment transaction.
     is_payment: bool,
     /// Block gas consumed by this transaction. The block `gas_used` field will be incremented by this value.
@@ -104,8 +110,9 @@ impl Clone for TempoTxResult {
         Self {
             inner: EthTransactionResultWithState::new(self.inner.result().clone(), self.tx_type, 0),
             tx_type: self.tx_type,
+            tx_hash: self.tx_hash,
             execution_context: self.execution_context,
-            next_section: self.next_section,
+            is_system_tx: self.is_system_tx,
             is_payment: self.is_payment,
             block_gas_used: self.block_gas_used,
             validator_fee: self.validator_fee,
@@ -124,7 +131,7 @@ impl TempoTxResult {
         execution_context: ExecutionContext,
         result: TxResult<TempoEvmTypes>,
         state: PendingState,
-        next_section: BlockSection,
+        is_system_tx: bool,
         is_payment: bool,
         block_gas_used: u64,
         validator_fee: U256,
@@ -140,8 +147,9 @@ impl TempoTxResult {
                 0,
             ),
             tx_type: tx.tx_type(),
+            tx_hash: *tx.tx_hash(),
             execution_context,
-            next_section,
+            is_system_tx,
             is_payment,
             block_gas_used,
             validator_fee,
@@ -407,29 +415,18 @@ impl<'a> TempoBlockExecutor<'a> {
     }
 
     /// Validates a system transaction.
+    ///
+    /// Its position in the block is validated by [`Self::validate_tx`].
     pub(crate) fn validate_system_tx(
         &self,
         tx: &TempoTxEnvelope,
-    ) -> Result<BlockSection, BlockValidationError> {
+    ) -> Result<(), BlockValidationError> {
         let block = self.evm().block();
         let block_number = block.number.to_be_bytes::<32>();
         let to = tx.to().unwrap_or_default();
 
         // Handle end-of-block system transactions (subblocks signatures only)
-        let mut seen_subblocks_signatures = match self.section {
-            BlockSection::System {
-                seen_subblocks_signatures,
-            } => seen_subblocks_signatures,
-            _ => false,
-        };
-
         if to.is_zero() {
-            if seen_subblocks_signatures {
-                return Err(BlockValidationError::msg(
-                    "duplicate subblocks metadata system transaction",
-                ));
-            }
-
             if self.evm().config_spec_id().is_t4() {
                 return Err(BlockValidationError::msg("subblocks are disabled in T4+"));
             }
@@ -460,32 +457,28 @@ impl<'a> TempoBlockExecutor<'a> {
                 ));
             }
 
-            seen_subblocks_signatures = true;
+            Ok(())
         } else {
-            return Err(BlockValidationError::msg("invalid system transaction"));
+            Err(BlockValidationError::msg("invalid system transaction"))
         }
-
-        Ok(BlockSection::System {
-            seen_subblocks_signatures,
-        })
     }
 
-    /// Pre-validate a transaction before execution.
+    /// Pre-validate a transaction before execution, returning whether it is a system transaction.
     ///
     /// Reject reserved subblock nonces and restrict system transactions to explicitly
     /// allowed actions, since they bypass regular block gas limit checks.
     pub(crate) fn validate_tx_pre_execution(
         &self,
         tx: &TempoTxEnvelope,
-    ) -> Result<Option<BlockSection>, BlockValidationError> {
+    ) -> Result<bool, BlockValidationError> {
         if tx.is_system_tx() {
-            self.validate_system_tx(tx).map(Some)
+            self.validate_system_tx(tx).map(|()| true)
         } else if tx.has_sub_block_nonce_key_prefix() {
             Err(BlockValidationError::msg(
                 "subblock transactions are not supported",
             ))
         } else {
-            Ok(None)
+            Ok(false)
         }
     }
 
@@ -504,12 +497,32 @@ impl<'a> TempoBlockExecutor<'a> {
         }
     }
 
+    /// Returns the section an executed transaction enters at the current position in the block.
     pub(crate) fn validate_tx(
         &self,
         tx_hash: B256,
+        is_system_tx: bool,
         is_payment: bool,
         gas_used: u64,
     ) -> Result<BlockSection, BlockValidationError> {
+        if is_system_tx {
+            // End-of-block system transactions are limited to a single subblocks metadata
+            // transaction.
+            if matches!(
+                self.section,
+                BlockSection::System {
+                    seen_subblocks_signatures: true
+                }
+            ) {
+                return Err(BlockValidationError::msg(
+                    "duplicate subblocks metadata system transaction",
+                ));
+            }
+            return Ok(BlockSection::System {
+                seen_subblocks_signatures: true,
+            });
+        }
+
         match self.section {
             BlockSection::StartOfBlock | BlockSection::NonShared => {
                 if gas_used > self.non_shared_gas_left
@@ -614,7 +627,7 @@ impl<'a> BlockExecutor for TempoBlockExecutor<'a> {
         tx_env.inner_mut().set_expiring_nonce_idx(None);
         let execution_context = tx_env.inner().execution_context();
         let original = recovered.tx();
-        let next_section = self.validate_tx_pre_execution(original)?;
+        let is_system_tx = self.validate_tx_pre_execution(original)?;
         let tx_hash = *original.tx_hash();
         let tx_type = original.tx_type();
         let is_payment = self.is_payment(original);
@@ -630,19 +643,17 @@ impl<'a> BlockExecutor for TempoBlockExecutor<'a> {
             inner.result().result.tx_gas_used()
         };
 
-        let next_section = if let Some(next_section) = next_section {
-            // If pre-execution validation returned a section to use, just use it.
-            next_section
-        } else {
-            self.validate_tx(tx_hash, is_payment, block_gas_used)?
-        };
+        // Reject before the result is observed; `commit_transaction` derives the section again
+        // from the committing executor's state.
+        self.validate_tx(tx_hash, is_system_tx, is_payment, block_gas_used)?;
         // Snapshot the per-tx validator-credited fee set by the handler's `reimburse_caller`
         let validator_fee = inner.result().result.ext.validator_fee;
         Ok(TempoTxResult {
             inner,
             tx_type,
+            tx_hash,
             execution_context,
-            next_section,
+            is_system_tx,
             is_payment,
             block_gas_used,
             validator_fee,
@@ -656,12 +667,17 @@ impl<'a> BlockExecutor for TempoBlockExecutor<'a> {
         let TempoTxResult {
             inner,
             tx_type: _,
+            tx_hash,
             execution_context,
-            next_section,
+            is_system_tx,
             is_payment,
             block_gas_used,
             validator_fee: _,
         } = output;
+
+        // The result may have been produced by another executor (e.g. a BAL worker) whose
+        // section and lane budgets do not reflect the transactions committed before it.
+        let next_section = self.validate_tx(tx_hash, is_system_tx, is_payment, block_gas_used)?;
 
         let gas_output = self.inner.commit_transaction(inner)?;
         self.block_gas_used = self.block_gas_used.saturating_add(block_gas_used);
@@ -1270,6 +1286,33 @@ mod tests {
         TempoTxEnvelope::Legacy(Signed::new_unhashed(tx, Signature::test_signature()))
     }
 
+    /// Creates a non-payment transaction result as produced by a speculative executor.
+    fn create_precomputed_result(is_system_tx: bool, block_gas_used: u64) -> TempoTxResult {
+        TempoTxResult {
+            tx_type: TempoTxType::Legacy,
+            tx_hash: B256::ZERO,
+            execution_context: ExecutionContext::Transaction {
+                tx_hash: B256::ZERO,
+            },
+            inner: EthTransactionResultWithState::new(
+                TxResultWithState {
+                    result: TxResult::<TempoEvmTypes> {
+                        status: true,
+                        total_gas_spent: block_gas_used,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                TempoTxType::Legacy,
+                0,
+            ),
+            is_system_tx,
+            is_payment: false,
+            block_gas_used,
+            validator_fee: U256::ZERO,
+        }
+    }
+
     fn create_tip20_empty_calldata_tx() -> TempoTxEnvelope {
         let tx = TxLegacy {
             chain_id: Some(1),
@@ -1371,12 +1414,6 @@ mod tests {
             "validate_system_tx failed: {:?}",
             result.err()
         );
-        assert_eq!(
-            result.unwrap(),
-            BlockSection::System {
-                seen_subblocks_signatures: true
-            }
-        );
     }
 
     fn create_system_tx_input(metadata: Vec<SubBlockMetadata>, block_number: u64) -> Bytes {
@@ -1412,7 +1449,7 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_system_tx_duplicate_subblocks_system_tx() {
+    fn test_validate_tx_duplicate_subblocks_system_tx() {
         let chainspec = test_chainspec();
         let mut db = InMemoryDB::default();
         let executor = TestExecutorBuilder::default()
@@ -1426,7 +1463,8 @@ mod tests {
         let input = create_system_tx_input(metadata, 1);
         let system_tx = create_system_tx(chainspec.chain_id(), input);
 
-        let result = executor.validate_system_tx(&system_tx);
+        executor.validate_system_tx(&system_tx).unwrap();
+        let result = executor.validate_tx(*system_tx.tx_hash(), true, false, 0);
         assert!(result.is_err());
         assert_eq!(
             result.unwrap_err().to_string(),
@@ -1535,7 +1573,7 @@ mod tests {
 
         // Test regular transaction in StartOfBlock section goes to NonShared
         let tx = create_legacy_tx();
-        let result = executor.validate_tx(*tx.tx_hash(), executor.is_payment(&tx), 21_000);
+        let result = executor.validate_tx(*tx.tx_hash(), false, executor.is_payment(&tx), 21_000);
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), BlockSection::NonShared);
     }
@@ -1604,7 +1642,7 @@ mod tests {
 
         // Try to validate a regular tx
         let tx = create_legacy_tx();
-        let result = executor.validate_tx(*tx.tx_hash(), executor.is_payment(&tx), 21_000);
+        let result = executor.validate_tx(*tx.tx_hash(), false, executor.is_payment(&tx), 21_000);
         assert!(result.is_err());
         assert_eq!(
             result.unwrap_err().to_string(),
@@ -1627,6 +1665,7 @@ mod tests {
         let tx = create_legacy_tx();
         let output = TempoTxResult {
             tx_type: TempoTxType::Legacy,
+            tx_hash: B256::ZERO,
             execution_context: ExecutionContext::Transaction {
                 tx_hash: B256::ZERO,
             },
@@ -1642,7 +1681,7 @@ mod tests {
                 tx.tx_type(),
                 0,
             ),
-            next_section: BlockSection::NonShared,
+            is_system_tx: false,
             is_payment: false,
             block_gas_used: 21000,
             validator_fee: U256::ZERO,
@@ -1652,6 +1691,75 @@ mod tests {
 
         assert_eq!(gas_output.tx_gas_used(), 21000);
         assert_eq!(executor.section(), BlockSection::NonShared);
+    }
+
+    /// A result computed against a stale executor must not bypass lane gas limits.
+    #[test]
+    fn test_commit_transaction_revalidates_stale_lane_section() {
+        let chainspec = test_chainspec();
+        let mut db = InMemoryDB::default();
+        let mut executor = TestExecutorBuilder::default()
+            .with_general_gas_limit(30_000)
+            .with_parent_beacon_block_root(B256::ZERO)
+            .build(&mut db, &chainspec);
+        executor.apply_pre_execution_changes().unwrap();
+
+        executor
+            .commit_transaction(create_precomputed_result(false, 21_000))
+            .unwrap();
+        assert_eq!(executor.section(), BlockSection::NonShared);
+        assert_eq!(executor.non_payment_gas_left, 9_000);
+
+        // A speculative executor with untouched lane budgets would select the non-shared section,
+        // but the remaining non-payment budget can no longer fit this transaction.
+        executor
+            .commit_transaction(create_precomputed_result(false, 21_000))
+            .unwrap();
+        assert_eq!(executor.section(), BlockSection::GasIncentive);
+        assert_eq!(executor.non_payment_gas_left, 9_000);
+        assert_eq!(executor.incentive_gas_used, 21_000);
+    }
+
+    #[test]
+    fn test_commit_transaction_rejects_stale_regular_section_after_system_tx() {
+        let chainspec = test_chainspec();
+        let mut db = InMemoryDB::default();
+        let mut executor = TestExecutorBuilder::default()
+            .with_parent_beacon_block_root(B256::ZERO)
+            .with_section(BlockSection::System {
+                seen_subblocks_signatures: false,
+            })
+            .build(&mut db, &chainspec);
+
+        let err = executor
+            .commit_transaction(create_precomputed_result(false, 21_000))
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "regular transaction can't follow system transaction"
+        );
+        assert!(executor.receipts().is_empty());
+    }
+
+    #[test]
+    fn test_commit_transaction_rejects_stale_duplicate_subblocks_metadata() {
+        let chainspec = test_chainspec();
+        let mut db = InMemoryDB::default();
+        let mut executor = TestExecutorBuilder::default()
+            .with_parent_beacon_block_root(B256::ZERO)
+            .with_section(BlockSection::System {
+                seen_subblocks_signatures: true,
+            })
+            .build(&mut db, &chainspec);
+
+        let err = executor
+            .commit_transaction(create_precomputed_result(true, 0))
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "duplicate subblocks metadata system transaction"
+        );
+        assert!(executor.receipts().is_empty());
     }
 
     #[test]
@@ -1716,7 +1824,8 @@ mod tests {
                     0,
                 ),
                 tx_type: TempoTxType::Legacy,
-                next_section: BlockSection::StartOfBlock,
+                tx_hash: B256::ZERO,
+                is_system_tx: false,
                 is_payment: false,
                 block_gas_used: 21_000,
                 validator_fee: U256::ZERO,
@@ -1827,6 +1936,7 @@ mod tests {
                     executor
                         .commit_transaction(TempoTxResult {
                             tx_type: TempoTxType::Legacy,
+                            tx_hash: B256::ZERO,
                             execution_context: if simulation {
                                 ExecutionContext::Simulation
                             } else {
@@ -1846,7 +1956,7 @@ mod tests {
                                 TempoTxType::Legacy,
                                 0,
                             ),
-                            next_section: BlockSection::GasIncentive,
+                            is_system_tx: false,
                             is_payment: false,
                             block_gas_used: 21_000,
                             validator_fee: U256::ZERO,
@@ -1879,6 +1989,7 @@ mod tests {
         let tx = create_legacy_tx();
         let output = TempoTxResult {
             tx_type: TempoTxType::Legacy,
+            tx_hash: B256::ZERO,
             execution_context: ExecutionContext::Transaction {
                 tx_hash: B256::ZERO,
             },
@@ -1894,7 +2005,7 @@ mod tests {
                 tx.tx_type(),
                 0,
             ),
-            next_section: BlockSection::NonShared,
+            is_system_tx: false,
             is_payment: false,
             block_gas_used: 21000,
             validator_fee: U256::ZERO,
@@ -1921,6 +2032,7 @@ mod tests {
         let tx1 = create_legacy_tx();
         let output1 = TempoTxResult {
             tx_type: TempoTxType::Legacy,
+            tx_hash: B256::ZERO,
             execution_context: ExecutionContext::Transaction {
                 tx_hash: B256::ZERO,
             },
@@ -1936,7 +2048,7 @@ mod tests {
                 tx1.tx_type(),
                 0,
             ),
-            next_section: BlockSection::NonShared,
+            is_system_tx: false,
             is_payment: false,
             block_gas_used: 21000,
             validator_fee: U256::ZERO,
@@ -1947,6 +2059,7 @@ mod tests {
         let tx2 = create_legacy_tx();
         let output2 = TempoTxResult {
             tx_type: TempoTxType::Legacy,
+            tx_hash: B256::ZERO,
             execution_context: ExecutionContext::Transaction {
                 tx_hash: B256::ZERO,
             },
@@ -1962,7 +2075,7 @@ mod tests {
                 tx2.tx_type(),
                 0,
             ),
-            next_section: BlockSection::NonShared,
+            is_system_tx: false,
             is_payment: false,
             block_gas_used: 50000,
             validator_fee: U256::ZERO,
@@ -1991,6 +2104,7 @@ mod tests {
         executor
             .commit_transaction(TempoTxResult {
                 tx_type: TempoTxType::Legacy,
+                tx_hash: B256::ZERO,
                 execution_context: ExecutionContext::Transaction {
                     tx_hash: B256::ZERO,
                 },
@@ -2006,7 +2120,7 @@ mod tests {
                     TempoTxType::Legacy,
                     0,
                 ),
-                next_section: BlockSection::NonShared,
+                is_system_tx: false,
                 is_payment: false,
                 block_gas_used: 21000,
                 validator_fee: U256::ZERO,
@@ -2034,6 +2148,7 @@ mod tests {
         let tx = create_legacy_tx();
         let output = TempoTxResult {
             tx_type: TempoTxType::Legacy,
+            tx_hash: B256::ZERO,
             execution_context: ExecutionContext::Transaction {
                 tx_hash: B256::ZERO,
             },
@@ -2049,7 +2164,7 @@ mod tests {
                 tx.tx_type(),
                 0,
             ),
-            next_section: BlockSection::NonShared,
+            is_system_tx: false,
             is_payment: false,
             block_gas_used: 50_000,
             validator_fee: U256::ZERO,
@@ -2082,6 +2197,7 @@ mod tests {
         let tx = create_legacy_tx();
         let output = TempoTxResult {
             tx_type: TempoTxType::Legacy,
+            tx_hash: B256::ZERO,
             execution_context: ExecutionContext::Transaction {
                 tx_hash: B256::ZERO,
             },
@@ -2098,7 +2214,7 @@ mod tests {
                 tx.tx_type(),
                 0,
             ),
-            next_section: BlockSection::NonShared,
+            is_system_tx: false,
             is_payment: false,
             block_gas_used: 200_000,
             validator_fee: U256::ZERO,
@@ -2127,6 +2243,7 @@ mod tests {
             .with_general_gas_limit(30_000_000)
             .with_parent_beacon_block_root(B256::ZERO)
             .with_amsterdam_eip8037_enabled(true)
+            .with_section(BlockSection::GasIncentive)
             .build(&mut db, &chainspec);
 
         executor.apply_pre_execution_changes().unwrap();
@@ -2134,6 +2251,7 @@ mod tests {
         let tx = create_legacy_tx();
         let output = TempoTxResult {
             tx_type: TempoTxType::Legacy,
+            tx_hash: B256::ZERO,
             execution_context: ExecutionContext::Transaction {
                 tx_hash: B256::ZERO,
             },
@@ -2150,7 +2268,7 @@ mod tests {
                 tx.tx_type(),
                 0,
             ),
-            next_section: BlockSection::GasIncentive,
+            is_system_tx: false,
             is_payment: false,
             block_gas_used: 200_000,
             validator_fee: U256::ZERO,
@@ -2566,6 +2684,7 @@ mod tests {
         executor
             .commit_transaction(TempoTxResult {
                 tx_type: TempoTxType::Legacy,
+                tx_hash: B256::ZERO,
                 execution_context: ExecutionContext::Transaction {
                     tx_hash: B256::ZERO,
                 },
@@ -2583,7 +2702,7 @@ mod tests {
                     TempoTxType::Legacy,
                     0,
                 ),
-                next_section: BlockSection::StartOfBlock,
+                is_system_tx: false,
                 is_payment: false,
                 block_gas_used: regular_gas,
                 validator_fee: U256::ZERO,
@@ -2617,6 +2736,7 @@ mod tests {
         executor
             .commit_transaction(TempoTxResult {
                 tx_type: TempoTxType::Legacy,
+                tx_hash: B256::ZERO,
                 execution_context: ExecutionContext::Transaction {
                     tx_hash: B256::ZERO,
                 },
@@ -2633,7 +2753,7 @@ mod tests {
                     TempoTxType::Legacy,
                     0,
                 ),
-                next_section: BlockSection::StartOfBlock,
+                is_system_tx: false,
                 is_payment: false,
                 block_gas_used: 100_000,
                 validator_fee: U256::ZERO,
@@ -2668,6 +2788,7 @@ mod tests {
         executor
             .commit_transaction(TempoTxResult {
                 tx_type: TempoTxType::Legacy,
+                tx_hash: B256::ZERO,
                 execution_context: ExecutionContext::Transaction {
                     tx_hash: B256::ZERO,
                 },
@@ -2684,7 +2805,7 @@ mod tests {
                     TempoTxType::Legacy,
                     0,
                 ),
-                next_section: BlockSection::StartOfBlock,
+                is_system_tx: false,
                 is_payment: false,
                 block_gas_used: cumulative,
                 validator_fee: U256::ZERO,
