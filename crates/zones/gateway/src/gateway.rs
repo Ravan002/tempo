@@ -2,6 +2,7 @@ use crate::{
     chain::{ChainVerifier, VerificationError, VerifiedCredential},
     clock,
     config::Config,
+    delivery,
     store::{LogRecord, Store},
     tls,
 };
@@ -148,6 +149,20 @@ impl Gateway {
                 }
             }
         });
+        let delivery_state = state.clone();
+        let mut delivery_stop = stop_rx.clone();
+        workers.spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = delivery_stop.changed() => return,
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                        if let Err(error) = delivery::tick(&delivery_state).await {
+                            tracing::warn!(error = %error, "delivery retry deferred");
+                        }
+                    }
+                }
+            }
+        });
         let health_state = state.clone();
         let mut health_stop = stop_rx.clone();
         workers.spawn(async move {
@@ -251,6 +266,16 @@ impl Gateway {
             .route("/rpc", post(http_rpc).get(ws_rpc))
             .route("/health/live", get(live))
             .route("/health/ready", get(ready))
+            .route("/indexer/register", post(delivery::register))
+            .route("/indexer/registrations/{id}/renew", post(delivery::renew))
+            .route(
+                "/indexer/registrations/{id}",
+                axum::routing::delete(delivery::remove),
+            )
+            .route(
+                "/indexer/{*path}",
+                get(crate::indexer::get).post(crate::indexer::query),
+            )
             .layer(DefaultBodyLimit::max(1 << 20))
             .layer(tower::limit::ConcurrencyLimitLayer::new(1_000))
             .with_state(state.clone());
@@ -1005,6 +1030,18 @@ fn registry_admin(registry: &Registry, principal: &Principal) -> bool {
     }
 }
 
+pub(crate) fn principal_address(principal: &Principal) -> Address {
+    match principal {
+        Principal::Account(a) | Principal::ZoneAdmin(a) => *a,
+        Principal::Client { address, .. } => *address,
+    }
+}
+pub(crate) fn principal_generation(principal: &Principal) -> u64 {
+    match principal {
+        Principal::Client { generation, .. } => *generation,
+        _ => 0,
+    }
+}
 pub(crate) async fn limited_response(response: reqwest::Response, limit: usize) -> Result<Vec<u8>> {
     ensure!(
         response.content_length().is_none_or(|n| n <= limit as u64),

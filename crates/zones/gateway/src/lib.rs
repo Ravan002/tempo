@@ -3,7 +3,10 @@ mod archive;
 pub mod chain;
 pub mod clock;
 pub mod config;
+mod delivery;
 mod gateway;
+mod indexer;
+pub mod indexer_boundary;
 pub mod store;
 mod tls;
 

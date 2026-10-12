@@ -1,0 +1,13 @@
+{
+  "listen": "127.0.0.1:8550",
+  "zone_chain_id": 42432,
+  "tidx_backend": "http://127.0.0.1:8080",
+  "tls": {
+    "certificate": "/run/zone-access/indexer-cert.pem",
+    "private_key": "/run/zone-access/indexer-key.pem",
+    "gateway_ca": "/run/zone-access/workload-ca.pem",
+    "gateway_certificate_hash": "0x1111111111111111111111111111111111111111111111111111111111111111"
+  },
+  "event_sql": "SELECT encode(hash, 'hex') AS event_id, num AS cursor, encode(hash, 'hex') AS payload FROM blocks",
+  "max_response_bytes": 10485760
+}

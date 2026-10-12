@@ -34,10 +34,17 @@ pub struct Config {
     pub rpc_backend: Url,
     pub backend_tls: TlsFiles,
     pub frontend_tls: Option<ServerTls>,
+    pub indexer_backend: Option<Url>,
+    #[serde(default)]
+    pub indexer_paths: Vec<String>,
+    #[serde(default)]
+    pub indexer_stream_paths: Vec<String>,
+    pub indexer_events_path: Option<String>,
     pub requests_per_second: u32,
     pub egress_bytes_per_second: u64,
     pub log_retention_seconds: u64,
     pub max_response_bytes: usize,
+    pub delivery_key_env: Option<String>,
 }
 
 impl Config {
@@ -77,7 +84,7 @@ impl Config {
             self.listen.ip().is_loopback() || self.frontend_tls.is_some(),
             "non-loopback listener requires frontend TLS"
         );
-        for url in std::iter::once(&self.rpc_backend) {
+        for url in std::iter::once(&self.rpc_backend).chain(self.indexer_backend.iter()) {
             ensure!(
                 url.scheme() == "https"
                     && url.username().is_empty()
@@ -87,6 +94,39 @@ impl Config {
                 "backend must use HTTPS workload authentication without URL credentials or query"
             );
         }
+        for path in self
+            .indexer_paths
+            .iter()
+            .chain(self.indexer_stream_paths.iter())
+            .chain(self.indexer_events_path.iter())
+        {
+            ensure!(
+                path.starts_with('/')
+                    && !path.starts_with("//")
+                    && !path.contains('%')
+                    && !path.contains("..")
+                    && !path.contains('?')
+                    && !path.contains('#')
+                    && !path.contains('\\')
+                    && path.len() <= 256,
+                "invalid Indexer route"
+            );
+        }
+        ensure!(
+            self.indexer_paths.len() + self.indexer_stream_paths.len() <= 64,
+            "too many Indexer routes"
+        );
+        ensure!(
+            self.indexer_backend.is_some()
+                || (self.indexer_paths.is_empty()
+                    && self.indexer_stream_paths.is_empty()
+                    && self.indexer_events_path.is_none()),
+            "Indexer routes require an upstream"
+        );
+        ensure!(
+            self.indexer_events_path.is_none() || self.delivery_key_env.is_some(),
+            "Indexer deliveries require an encryption key"
+        );
         Ok(())
     }
 }

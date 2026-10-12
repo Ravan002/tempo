@@ -22,6 +22,7 @@ enum Command {
     Migrate,
     Archive,
     VerifyHistory,
+    IndexerBoundary,
 }
 
 #[tokio::main]
@@ -31,6 +32,10 @@ async fn main() -> eyre::Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
     let args = Args::parse();
+    if matches!(args.command, Command::IndexerBoundary) {
+        let config = zone_gateway::indexer_boundary::BoundaryConfig::load(&args.config).await?;
+        return zone_gateway::indexer_boundary::IndexerBoundary::serve(config).await;
+    }
     let config = Config::load(&args.config).await?;
     match args.command {
         Command::Serve => {
@@ -46,5 +51,6 @@ async fn main() -> eyre::Result<()> {
         Command::Migrate => Gateway::migrate(config).await,
         Command::Archive => Gateway::archive(config).await,
         Command::VerifyHistory => Gateway::verify_history(config).await,
+        Command::IndexerBoundary => unreachable!("handled before gateway configuration"),
     }
 }

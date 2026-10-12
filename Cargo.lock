@@ -17165,6 +17165,7 @@ dependencies = [
 name = "zone-gateway"
 version = "1.16.0"
 dependencies = [
+ "aes-gcm",
  "alloy-primitives",
  "alloy-signer",
  "alloy-signer-local",
@@ -17177,6 +17178,7 @@ dependencies = [
  "hyper-util",
  "libc",
  "metrics",
+ "rand 0.10.2",
  "rcgen",
  "reqwest 0.13.3",
  "rustls",

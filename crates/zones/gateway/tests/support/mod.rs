@@ -363,10 +363,15 @@ impl Fixture {
                 key: key_path,
             },
             frontend_tls: None,
+            indexer_backend: None,
+            indexer_paths: vec![],
+            indexer_stream_paths: vec![],
+            indexer_events_path: None,
             requests_per_second: 1000,
             egress_bytes_per_second: 1024 * 1024,
             log_retention_seconds: 3600,
             max_response_bytes: 1024 * 1024,
+            delivery_key_env: None,
         };
         let store = Store::open(&database_url, domain, &archive_dir).await?;
         let http = reqwest::Client::builder()

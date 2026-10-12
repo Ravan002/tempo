@@ -1,0 +1,27 @@
+# Concrete TIDX configuration shape inspected at 473c2fc53160f18956848cd4694c2def5f7d11ee.
+[http]
+enabled = true
+port = 8080
+bind = "127.0.0.1"
+
+[prometheus]
+enabled = true
+port = 9090
+
+[[chains]]
+name = "zone7"
+chain_id = 42432
+rpc_url = "http://127.0.0.1:8545"
+backfill = true
+batch_size = 100
+concurrency = 4
+
+[chains.postgres]
+url = "postgres://zone_indexer_writer@127.0.0.1:5432/zone7"
+password_env = "ZONES_TIDX_WRITER_PASSWORD"
+api_url = "postgres://zone_indexer_reader@127.0.0.1:5432/zone7"
+api_password_env = "ZONES_TIDX_READER_PASSWORD"
+
+[chains.clickhouse]
+enabled = false
+url = "http://127.0.0.1:8123"

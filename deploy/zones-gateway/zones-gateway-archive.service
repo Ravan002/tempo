@@ -1,0 +1,23 @@
+[Unit]
+Description=Zone access archive publisher
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+User=zone-access
+Group=zone-access
+EnvironmentFile=/etc/zone-access/gateway.env
+ExecStart=/usr/local/bin/zones-gateway --config /etc/zone-access/config.json archive
+Restart=always
+RestartSec=2
+KillSignal=SIGINT
+TimeoutStopSec=15
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/zone-access-archive
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
