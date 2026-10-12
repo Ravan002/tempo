@@ -15,6 +15,7 @@ exclude = ["crates/nitro-attestation/fuzz"]
 members = [
   "bin/tempo",
   "bin/tempo-sidecar",
+  "bin/zones-gateway",
   "crates/zones/auth",
   "crates/zones/gateway",
   "crates/zones/rpc",
