@@ -241,8 +241,10 @@ jobs:
           REFRESH_BUILDER: ${{ github.event_name == 'schedule' }}
         run: |
           set -euo pipefail
-          # Include the pinned kernel source and CLI recipe in the cache identity.
-          key=$(cat docker/Dockerfile.prover-eif-builder docker/docker-bake.hcl | sha256sum | cut -d' ' -f1)
+          # Include every bootstrap input and the CLI recipe in the cache identity.
+          key=$(cat docker/Dockerfile.prover-eif-builder docker/docker-bake.hcl \
+            docker/Dockerfile.nitro-enclaves-bootstrap docker/nitro/kernel.patch \
+            docker/nitro/zones-hardening-x86_64.config | sha256sum | cut -d' ' -f1)
           ref="$REGISTRY/tempo-zone-prover-eif-builder:inputs-$key"
           echo "ref=$ref" >> "$GITHUB_OUTPUT"
           if [[ "$REFRESH_BUILDER" != 'true' ]] && docker pull --platform linux/amd64 "$ref"; then
@@ -375,6 +377,14 @@ jobs:
 
           docker run --rm \
             --platform linux/amd64 \
+            --entrypoint /bin/cp \
+            --volume "$PWD/$EIF_OUTPUT_DIR:/output" \
+            "$EIF_BUILDER_IMAGE" \
+            /usr/share/nitro_enclaves/components.sha384 \
+            /output/components.sha384
+
+          docker run --rm \
+            --platform linux/amd64 \
             --volume /var/run/docker.sock:/var/run/docker.sock \
             --volume "$PWD/$EIF_OUTPUT_DIR:/output" \
             "$EIF_BUILDER_IMAGE" \
@@ -413,6 +423,7 @@ jobs:
           name: tempo-zone-prover-measurements-${{ steps.shortsha.outputs.shortsha }}${{ inputs.defer_genesis && format('-{0}', github.run_attempt) || '' }}
           path: |
             target/tempo-zone-prover-eif/measurements.json
+            target/tempo-zone-prover-eif/components.sha384
             target/tempo-zone-prover-eif/identity.json
           if-no-files-found: error
 
