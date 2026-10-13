@@ -5,6 +5,7 @@
 
 mod attrs;
 mod budget;
+mod top_of_block;
 
 use alloy_primitives::Bytes;
 pub use attrs::TempoPayloadAttributes;
@@ -14,6 +15,9 @@ pub use budget::{
 use std::{
     sync::{Arc, OnceLock},
     time::Duration,
+};
+pub use top_of_block::{
+    TopOfBlockLane, TopOfBlockLimits, TopOfBlockSubmitError, TopOfBlockSubmitOutcome,
 };
 
 use alloy_eips::eip7685::Requests;
