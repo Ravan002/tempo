@@ -282,7 +282,7 @@ impl GenesisArgs {
         println!("Creating pathUSD through factory");
         create_path_usd_token(pathusd_admin, &addresses, self.pathusd_amount, &mut evm)?;
 
-        let (alpha_token_address, beta_token_address, theta_token_address) =
+        let (alpha_token_address, beta_token_address, theta_token_address, ousd_token_address) =
             if !self.no_extra_tokens {
                 println!("Initializing TIP20 tokens");
                 let alpha = create_and_mint_token(
@@ -337,10 +337,10 @@ impl GenesisArgs {
                     "OUSD was created at {ousd}, not {OUSD_ADDRESS}"
                 );
 
-                (Some(alpha), Some(beta), Some(theta))
+                (Some(alpha), Some(beta), Some(theta), Some(ousd))
             } else {
                 println!("Skipping extra token creation (--no-extra-tokens)");
-                (None, None, None)
+                (None, None, None, None)
             };
 
         if self.deployment_gas_token && self.deployment_gas_token_admin.is_none() {
@@ -443,13 +443,24 @@ impl GenesisArgs {
         }
 
         if !self.no_pairwise_liquidity {
-            if let (Some(alpha), Some(beta), Some(theta)) =
-                (alpha_token_address, beta_token_address, theta_token_address)
-            {
+            if let (Some(alpha), Some(beta), Some(theta), Some(ousd)) = (
+                alpha_token_address,
+                beta_token_address,
+                theta_token_address,
+                ousd_token_address,
+            ) {
                 println!("Minting pairwise FeeAMM liquidity");
                 mint_pairwise_liquidity(
                     alpha,
                     vec![PATH_USD_ADDRESS, beta, theta],
+                    U256::from(10u64.pow(10)),
+                    pathusd_admin,
+                    &mut evm,
+                );
+                // OUSD quotes pathUSD, so fees in OUSD need a direct pool against the pathUSD validator token.
+                mint_pairwise_liquidity(
+                    ousd,
+                    vec![PATH_USD_ADDRESS],
                     U256::from(10u64.pow(10)),
                     pathusd_admin,
                     &mut evm,
