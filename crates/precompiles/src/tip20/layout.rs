@@ -155,11 +155,6 @@ impl TIP20Token {
         Ok(Some(self.load_control()?).filter(TokenControl::is_packed))
     }
 
-    #[cfg(test)]
-    pub(crate) fn is_packed(&self) -> Result<bool> {
-        Ok(self.token_control()?.is_some())
-    }
-
     /// Writes the pause state, preserving the packed fields.
     pub(crate) fn store_paused(&mut self, paused: bool) -> Result<()> {
         match self.token_control()? {
