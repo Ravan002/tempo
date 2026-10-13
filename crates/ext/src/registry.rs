@@ -1,20 +1,26 @@
 //! Persistent registry of installed extensions (versions, update check timestamps).
 //!
-//! NOTE: load/save is not file-locked. Concurrent `tempo` invocations may
-//! lose a write (last-writer-wins). This is acceptable today because the
-//! data is limited to `checked_at` timestamps, `installed_version` strings
-//! and update notices — the worst outcome is a redundant update check or a
-//! dropped notice.
+//! Writers hold [`Registry::lock`] across load-modify-save, and across any
+//! install or removal whose result they record, so concurrent `tempo`
+//! invocations and background updates never interleave. Saves go through a
+//! unique temp file and an atomic rename, so readers never need the lock.
 
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     env, fs,
-    path::PathBuf,
+    io::Write,
+    path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 
 const UPDATE_CHECK_INTERVAL_SECS: u64 = 6 * 60 * 60; // 6 hours
+
+/// Exclusive advisory lock on the registry, released on drop.
+#[derive(Debug)]
+pub(crate) struct RegistryLock {
+    _file: Option<fs::File>,
+}
 
 /// On-disk state for all known extensions, keyed by extension name.
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -91,13 +97,43 @@ impl Registry {
                 return;
             }
         };
-        let tmp = path.with_extension("tmp");
-        if let Err(err) = fs::write(&tmp, format!("{json}\n")) {
-            tracing::warn!("registry write failed: {}: {err}", tmp.display());
-            return;
+        let dir = path.parent().unwrap_or(Path::new("."));
+        let result = tempfile::NamedTempFile::new_in(dir).and_then(|mut tmp| {
+            tmp.write_all(format!("{json}\n").as_bytes())?;
+            tmp.persist(&path).map_err(|err| err.error)?;
+            Ok(())
+        });
+        if let Err(err) = result {
+            tracing::warn!("registry write failed: {}: {err}", path.display());
         }
-        if let Err(err) = fs::rename(&tmp, &path) {
-            tracing::warn!("registry rename failed: {}: {err}", path.display());
+    }
+
+    /// Blocks until this process holds the registry lock. Runs unlocked
+    /// (with a warning) if the lock file cannot be opened or locked.
+    pub(crate) fn lock() -> RegistryLock {
+        let file = open_lock_file().filter(|file| match file.lock() {
+            Ok(()) => true,
+            Err(err) => {
+                tracing::warn!("registry lock failed: {err}");
+                false
+            }
+        });
+        RegistryLock { _file: file }
+    }
+
+    /// Like [`Self::lock`], but returns `None` instead of waiting when
+    /// another process holds the lock.
+    pub(crate) fn try_lock() -> Option<RegistryLock> {
+        let Some(file) = open_lock_file() else {
+            return Some(RegistryLock { _file: None });
+        };
+        match file.try_lock() {
+            Ok(()) => Some(RegistryLock { _file: Some(file) }),
+            Err(fs::TryLockError::WouldBlock) => None,
+            Err(fs::TryLockError::Error(err)) => {
+                tracing::warn!("registry lock failed: {err}");
+                Some(RegistryLock { _file: None })
+            }
         }
     }
 
@@ -129,11 +165,6 @@ impl Registry {
                 notice: None,
             },
         );
-    }
-
-    /// Returns `true` if the extension is pinned to a specific version.
-    pub(crate) fn is_pinned(&self, extension: &str) -> bool {
-        self.extensions.get(extension).is_some_and(|e| e.pinned)
     }
 
     /// Bumps the check timestamp without changing the recorded version.
@@ -175,6 +206,21 @@ impl Registry {
     pub(crate) fn take_notice(&mut self, extension: &str) -> Option<String> {
         self.extensions.get_mut(extension)?.notice.take()
     }
+}
+
+/// Opens (creating if needed) the lock file next to the registry.
+fn open_lock_file() -> Option<fs::File> {
+    let path = state_path()?.with_extension("lock");
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .inspect_err(|err| tracing::warn!("registry lock open failed: {}: {err}", path.display()))
+        .ok()
 }
 
 fn now_secs() -> u64 {
@@ -299,7 +345,7 @@ mod tests {
         reg.save();
         let loaded = Registry::load().unwrap();
         assert_eq!(loaded.extensions["wallet"].installed_version, "2.0.0");
-        assert!(loaded.is_pinned("wallet"));
+        assert!(loaded.extensions["wallet"].pinned);
         assert_eq!(loaded.extensions["wallet"].description, "Tempo wallet");
     }
 
@@ -384,29 +430,23 @@ mod tests {
     fn pinned_flag_recorded() {
         let mut reg = Registry::default();
         reg.record_check("wallet", "1.0.0", true, "");
-        assert!(reg.is_pinned("wallet"));
+        assert!(reg.extensions["wallet"].pinned);
     }
 
     #[test]
     fn not_pinned_by_default() {
         let mut reg = Registry::default();
         reg.record_check("wallet", "1.0.0", false, "");
-        assert!(!reg.is_pinned("wallet"));
-    }
-
-    #[test]
-    fn is_pinned_returns_false_for_unknown() {
-        let reg = Registry::default();
-        assert!(!reg.is_pinned("unknown"));
+        assert!(!reg.extensions["wallet"].pinned);
     }
 
     #[test]
     fn update_unpins() {
         let mut reg = Registry::default();
         reg.record_check("wallet", "1.0.0", true, "");
-        assert!(reg.is_pinned("wallet"));
+        assert!(reg.extensions["wallet"].pinned);
         reg.record_check("wallet", "2.0.0", false, "");
-        assert!(!reg.is_pinned("wallet"));
+        assert!(!reg.extensions["wallet"].pinned);
     }
 
     #[test]
@@ -415,7 +455,7 @@ mod tests {
         reg.record_check("wallet", "1.0.0", true, "");
         let json = serde_json::to_string(&reg).unwrap();
         let loaded: Registry = serde_json::from_str(&json).unwrap();
-        assert!(loaded.is_pinned("wallet"));
+        assert!(loaded.extensions["wallet"].pinned);
     }
 
     #[test]
@@ -430,6 +470,36 @@ mod tests {
         let json = r#"{"extensions":{"wallet":{"checked_at":0,"installed_version":"1.0.0","pinned":false}}}"#;
         let reg: Registry = serde_json::from_str(json).unwrap();
         assert_eq!(reg.extensions["wallet"].description, "");
+    }
+
+    #[test]
+    fn lock_excludes_other_holders() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let _home = TempHome::new();
+
+        let held = Registry::lock();
+        assert!(Registry::try_lock().is_none(), "lock is exclusive");
+        drop(held);
+
+        let held = Registry::try_lock().expect("lock is free after drop");
+        assert!(Registry::try_lock().is_none(), "try_lock is exclusive too");
+        drop(held);
+    }
+
+    #[test]
+    fn save_leaves_no_temp_files() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let home = TempHome::new();
+        let mut reg = Registry::default();
+        reg.record_check("wallet", "1.0.0", false, "");
+        reg.save();
+        reg.save();
+
+        let names: Vec<_> = fs::read_dir(home._tmp.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["extensions.json"]);
     }
 
     #[test]
@@ -465,6 +535,6 @@ mod tests {
     fn deserialize_without_pinned_defaults_false() {
         let json = r#"{"extensions":{"wallet":{"checked_at":0,"installed_version":"1.0.0"}}}"#;
         let reg: Registry = serde_json::from_str(json).unwrap();
-        assert!(!reg.is_pinned("wallet"));
+        assert!(!reg.extensions["wallet"].pinned);
     }
 }

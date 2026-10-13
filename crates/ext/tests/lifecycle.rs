@@ -1011,6 +1011,82 @@ fn auto_update_command_installs_or_reports() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn auto_update_yields_to_changes_made_during_check() {
+    use std::io::Write;
+
+    type Change = fn(&Fixture);
+    // (change made while the update is in flight, binary version, registry version)
+    let cases: [(Change, Option<&str>, Option<&str>); 4] = [
+        (|_| {}, Some("2.0.0"), Some("2.0.0")),
+        (
+            |fix| assert_eq!(fix.run(&["tempo", "remove", "testpkg"]).unwrap(), 0),
+            None,
+            None,
+        ),
+        (
+            |fix| fix.record_installed_version_inner("testpkg", "1.0.0", true),
+            Some("1.0.0"),
+            Some("1.0.0"),
+        ),
+        (
+            |fix| fix.record_installed_version("testpkg", "1.5.0"),
+            Some("1.0.0"),
+            Some("1.5.0"),
+        ),
+    ];
+    for (i, (change, binary_version, registry_version)) in cases.into_iter().enumerate() {
+        let _lock = lock();
+        let fix = Fixture::new();
+        fix.publish_extension("testpkg", "1.0.0");
+        fix.run(&["tempo", "add", "testpkg"]).unwrap();
+
+        // Serve the 2.0.0 manifest through a FIFO so the update blocks
+        // mid-check until the change has been made.
+        fix.publish_extension("testpkg", "2.0.0");
+        let manifest = fix.base_dir.join("extensions/tempo-testpkg/manifest.json");
+        let body = fs::read(&manifest).unwrap();
+        fs::remove_file(&manifest).unwrap();
+        let mkfifo = std::process::Command::new("mkfifo").arg(&manifest).status();
+        assert!(mkfifo.unwrap().success());
+
+        let update = std::thread::spawn(|| tempo_ext::run(["tempo", "__auto-update", "testpkg"]));
+        // Opening the write end waits until the update starts reading.
+        let mut fifo = fs::OpenOptions::new().write(true).open(&manifest).unwrap();
+        change(&fix);
+        fifo.write_all(&body).unwrap();
+        drop(fifo);
+        assert_eq!(update.join().unwrap().unwrap(), 0, "case {i}");
+
+        let binary = fs::read_to_string(fix.binary_path("testpkg")).ok();
+        let expected_binary =
+            binary_version.map(|v| format!("#!/bin/sh\necho tempo-testpkg {v}\n"));
+        assert_eq!(binary, expected_binary, "case {i}: binary");
+        assert_eq!(
+            fix.installed_version("testpkg").as_deref(),
+            registry_version,
+            "case {i}: registry"
+        );
+        assert_eq!(fix.notice("testpkg").is_some(), i == 0, "case {i}: notice");
+    }
+}
+
+#[test]
+fn auto_update_after_remove_is_noop() {
+    let _lock = lock();
+    let fix = Fixture::new();
+    fix.publish_extension("testpkg", "1.0.0");
+    fix.run(&["tempo", "add", "testpkg"]).unwrap();
+    fix.run(&["tempo", "remove", "testpkg"]).unwrap();
+
+    fix.publish_extension("testpkg", "2.0.0");
+    let code = fix.run(&["tempo", "__auto-update", "testpkg"]).unwrap();
+    assert_eq!(code, 0);
+    assert!(!fix.binary_path("testpkg").exists());
+    assert_eq!(fix.installed_version("testpkg"), None);
+}
+
 #[test]
 fn update_clears_pending_notice() {
     let _lock = lock();
