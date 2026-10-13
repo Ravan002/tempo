@@ -1582,8 +1582,28 @@ contract ZonePortalTest is BaseTest {
         assertTrue(portal.areDepositsActive(address(pathUSD)));
     }
 
-    function test_pause_blocksDepositsAndWithdrawalProcessingButAllowsBatchSubmission() public {
-        vm.prank(sequencer);
+    function test_pause_blocksSettlementAndPreservesWithdrawalUntilResumed(bool resumeEarly)
+        public
+    {
+        vm.fee(0);
+        uint128 amount = 250e6;
+        _fundCallbackWithdrawal(amount);
+        address[] memory signers = _activateSequencerSet(2);
+        Withdrawal memory withdrawal =
+            _withdrawal(address(pathUSD), alice, bob, amount, bytes32(0), 0, address(0), "");
+        QuorumBatch memory batch = _quorumBatch();
+        batch.withdrawalQueueHash = keccak256(abi.encode(withdrawal, bytes32(0)));
+        batch.depositQueueTransition.nextProcessedHash = portal.currentDepositQueueHash();
+        batch.depositQueueTransition.nextDepositNumber = portal.depositCount();
+        bytes[] memory signatures = _quorumSignatures(
+            _attestationDigestFor(portal, block.chainid, _attestationFor(batch)),
+            SIGNER_A_KEY,
+            SIGNER_B_KEY
+        );
+        uint256 bobBalanceBefore = pathUSD.balanceOf(bob);
+        uint256 portalBalanceBefore = pathUSD.balanceOf(address(portal));
+
+        vm.prank(signers[0]);
         portal.pause();
 
         assertTrue(portal.paused());
@@ -1594,33 +1614,40 @@ contract ZonePortalTest is BaseTest {
         vm.expectRevert(IZonePortal.PortalIsPaused.selector);
         portal.deposit(address(pathUSD), 1000e6, 0, _makeDepositPayload(), alice);
 
-        vm.prank(sequencer);
+        vm.prank(signers[0]);
         vm.expectRevert(IZonePortal.PortalIsPaused.selector);
         portal.processWithdrawals(new Withdrawal[](0), bytes32(0));
 
-        vm.roll(block.number + 1);
-        _submitBatch(
-            portal,
-            uint64(block.number - 1),
-            0,
-            BlockTransition({
-                prevBlockHash: portal.blockHash(), nextBlockHash: keccak256("paused-settlement")
-            }),
-            DepositQueueTransition({
-                prevProcessedHash: bytes32(0),
-                nextProcessedHash: bytes32(0),
-                prevDepositNumber: 0,
-                nextDepositNumber: 0
-            }),
-            bytes32(0),
-            "",
-            ""
-        );
-        assertEq(portal.withdrawalBatchIndex(), 1);
+        vm.expectRevert(IZonePortal.PortalIsPaused.selector);
+        _submitQuorumBatch(portal, signers[0], batch, signatures);
+        assertEq(portal.blockHash(), batch.blockTransition.prevBlockHash);
+        assertEq(portal.zoneHeight(), 0);
+        assertEq(portal.withdrawalBatchIndex(), 0);
+        assertEq(portal.withdrawalQueueHead(), portal.withdrawalQueueTail());
+        assertEq(portal.lastProcessedDepositNumber(), 0);
+        assertEq(pathUSD.balanceOf(bob), bobBalanceBefore);
+        assertEq(pathUSD.balanceOf(address(portal)), portalBalanceBefore);
 
-        vm.warp(block.timestamp + 30 days);
+        if (resumeEarly) {
+            vm.prank(admin);
+            portal.resume();
+        } else {
+            vm.warp(portal.pauseExpiry());
+        }
         assertFalse(portal.paused());
         assertTrue(portal.areDepositsActive(address(pathUSD)));
+
+        _submitQuorumBatch(portal, signers[0], batch, signatures);
+        assertEq(portal.blockHash(), batch.blockTransition.nextBlockHash);
+        assertEq(portal.zoneHeight(), batch.nextZoneHeight);
+        assertEq(portal.withdrawalBatchIndex(), 1);
+        assertEq(portal.lastProcessedDepositNumber(), portal.depositCount());
+
+        vm.prank(signers[0]);
+        portal.processWithdrawals(_singleWithdrawal(withdrawal), bytes32(0));
+        assertEq(portal.withdrawalQueueHead(), portal.withdrawalQueueTail());
+        assertEq(pathUSD.balanceOf(bob), bobBalanceBefore + amount);
+        assertEq(pathUSD.balanceOf(address(portal)), portalBalanceBefore - amount);
     }
 
     function test_pauseRoleCanPause() public {

@@ -98,7 +98,7 @@ pub fn t13_zone_factory_state(owner: Address) -> [InitialZoneFactoryAccount; 4] 
     ]
 }
 
-/// Returns the native ZoneFactory state with the T14 pause-gated refund runtime.
+/// Returns the native ZoneFactory state with the T14 pause-gated refund and settlement runtime.
 pub fn t14_zone_factory_state(owner: Address) -> [InitialZoneFactoryAccount; 4] {
     let [factory, mut portal, verifier, messenger] = t13_zone_factory_state(owner);
     portal.code = T14_ZONE_PORTAL_RUNTIME;

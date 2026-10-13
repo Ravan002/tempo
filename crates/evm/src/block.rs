@@ -488,8 +488,8 @@ where
         }
     }
 
-    /// Installs the pause-gated refund runtime at T14.
-    fn upgrade_zone_refunds_at_boundary(&mut self) -> Result<(), BlockExecutionError> {
+    /// Installs the pause-gated refund and settlement runtime at T14.
+    fn upgrade_zone_portal_at_boundary(&mut self) -> Result<(), BlockExecutionError> {
         let [_, portal, _, _] = t14_zone_factory_state(INITIAL_FACTORY_OWNER);
         self.install_zone_runtimes_at_boundary([portal])
     }
@@ -553,7 +553,7 @@ where
         let genesis_timestamp = spec.genesis().timestamp;
         if spec.is_t14_active_at_timestamp(timestamp) {
             if !spec.is_t14_active_at_timestamp(genesis_timestamp) {
-                self.upgrade_zone_refunds_at_boundary()?;
+                self.upgrade_zone_portal_at_boundary()?;
             }
         } else if spec.is_t13_active_at_timestamp(timestamp)
             && !spec.is_t13_active_at_timestamp(genesis_timestamp)
