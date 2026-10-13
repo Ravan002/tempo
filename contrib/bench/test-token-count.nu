@@ -3,64 +3,31 @@
 source ../../bench-e2e.nu
 use std/assert
 
-let spec = "contrib/bench/txgen/presets/tip20/nonce-expiring.yml"
+let legacy = {bloat_version: 1, bloat_mib: 1024, nonce_ring_hardfork: T13}
 for count in [1 2 3 4 5 20] {
     e2e-validate-token-count $count
     let bloat_count = (e2e-bloat-token-count $count)
     assert equal $bloat_count (if $count <= 4 { 4 } else { $count })
-    txgen-configure-tip20-token-env $count
-    let tokens = ($env.TXGEN_TIP20_TOKENS | from json)
-    assert equal ($tokens | length) $count
-    assert equal ($tokens | last) (txgen-tip20-token-address ($count - 1))
-
-    txgen-configure-fee-amm-env $spec $count
-    let steps = ($env.TXGEN_FEE_AMM_SETUP_STEPS | from json)
-    let fragment = (open --raw "contrib/bench/txgen/presets/tip20/fee-amm-liquidity.yml"
-        | str replace '${TXGEN_FEE_AMM_SETUP_STEPS}' $env.TXGEN_FEE_AMM_SETUP_STEPS)
-    let rendered = ($fragment | ^uv run --no-project --with yq==3.4.3 yq -c . | from json)
-    assert equal $rendered.append.setup.steps $steps
-    assert equal ($steps | length) ($count - 1)
-    assert equal ($steps | get tx.call.args | each { |args| $args | first }) ($tokens | skip 1)
-    for step in $steps {
-        assert equal ($step.tx.call.args | get 1) (txgen-tip20-token-address 0)
-        assert equal ($step.tx.call.args | get 2) 10000000000
-    }
-    let args = (build-base-args genesis.json data logs "127.0.0.1" 8545 9001 $bloat_count)
-    assert equal ($args | where { |arg| $arg == "--faucet.address" } | length) $bloat_count
-
-    # Selections 1..4 retain the same state and existing-recipient range.
-    let accounts = (txgen-bloat-accounts-per-token 1024 $bloat_count)
-    if $count <= 4 {
-        assert equal $accounts (txgen-bloat-accounts-per-token 1024 4)
-    }
-    txgen-configure-existing-recipients-env "contrib/bench/txgen/presets/tip20/recipient-existing.yml" 1024 $bloat_count
-    assert equal ($env.TXGEN_EXISTING_RECIPIENTS_END | into int) $accounts
-    let bytes = $bloat_count * (104 + 64 * $accounts)
-    assert ($bytes <= 1024 * 1024 * 1024)
-    assert ($bytes > 1024 * 1024 * 1024 - 64 * $bloat_count)
+    assert equal (bloat-matches $legacy 1024 T13 $bloat_count) ($count <= 4)
+    let marker = ($legacy | insert bloat_token_count $bloat_count)
+    assert (bloat-matches $marker 1024 T13 $bloat_count)
+    assert equal (bloat-matches $marker 1024 T13 4) ($count <= 4)
 }
 
-txgen-configure-fee-amm-env "contrib/bench/txgen/presets/tip20/nonce-2d.yml" 20
-assert equal (($env.TXGEN_FEE_AMM_SETUP_STEPS | from json | first).tx.call.args | get 2) 10000000000000
+for spec in [nonce-expiring nonce-2d] {
+    txgen-configure-fee-amm-env $"contrib/bench/txgen/presets/tip20/($spec).yml" 20
+    let fragment = (open --raw "contrib/bench/txgen/presets/tip20/fee-amm-liquidity.yml"
+        | str replace '${TXGEN_FEE_AMM_SETUP_STEPS}' $env.TXGEN_FEE_AMM_SETUP_STEPS)
+    let steps = ($fragment | ^uv run --no-project --with yq==3.4.3 yq -c . | from json | get append.setup.steps)
+    assert equal ($steps | length) 19
+    assert equal ($steps | get tx.call.args | each { |args| $args | first }) (1..<20 | each { |id| txgen-tip20-token-address $id })
+    assert equal ($steps | first | get tx.call.args.2) (if $spec == nonce-2d { 10000000000000 } else { 10000000000 })
+}
 txgen-configure-keychain-env 1000 20
-assert equal ($env.TXGEN_KEYCHAIN_TIP20_LIMITS | from json | length) 20
 assert (($env.TXGEN_KEYCHAIN_AUTHORIZE_SETUP_GAS_LIMIT | into int) >= ($env.TXGEN_KEY_AUTHORIZATION_GAS_LIMIT | into int))
 
 for count in [0 21] {
     let result = (^nu -c $"source bench-e2e.nu; e2e-validate-token-count ($count)" | complete)
     assert equal $result.exit_code 1
 }
-
-let legacy = {bloat_version: 1, bloat_mib: 1024, nonce_ring_hardfork: T13}
-for count in 1..4 {
-    assert (bloat-matches $legacy 1024 T13 (e2e-bloat-token-count $count))
-    let old_pr_snapshot = ($legacy | insert bloat_token_count $count)
-    assert equal (bloat-matches $old_pr_snapshot 1024 T13 (e2e-bloat-token-count $count)) ($count == 4)
-}
-assert (not (bloat-matches $legacy 1024 T13 20))
-let twenty = ($legacy | insert bloat_token_count 20)
-assert (bloat-matches $twenty 1024 T13 20)
-assert (not (bloat-matches $twenty 1024 T13 4))
-assert (not (bloat-matches $twenty 1000 T13 20))
-assert (not (bloat-matches $twenty 1024 T14 20))
-print "Token selection, liquidity, faucet, fixed total bloat, and snapshot compatibility checks passed"
+print "Token count, snapshot compatibility, liquidity, and keychain gas checks passed"

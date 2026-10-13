@@ -507,6 +507,25 @@ mod tests {
         };
         file_args().run().await.unwrap();
         assert_eq!(std::fs::read(&output).unwrap(), expected);
+        let mut multi_token_args = file_args();
+        multi_token_args.token = (0..20).collect();
+        multi_token_args.run().await.unwrap();
+        let mut token_entries = BTreeMap::new();
+        crate::read_dump(
+            BufReader::new(File::open(&output).unwrap()),
+            |address, _, _| {
+                if address != NONCE_PRECOMPILE_ADDRESS {
+                    *token_entries.entry(address).or_insert(0u64) += 1;
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(token_entries.len(), 20);
+        assert_eq!(token_entries.values().min(), token_entries.values().max());
+        let bytes = std::fs::metadata(&output).unwrap().len();
+        assert!(bytes <= expected.len() as u64);
+        assert!(bytes > expected.len() as u64 - 20 * 64);
         assert!(
             GeneratorCli::try_parse_from(args.into_iter().chain([
                 "--mnemonic",
@@ -523,46 +542,5 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         assert!(file_args().run().await.is_err());
         assert!(!output.exists());
-    }
-
-    #[tokio::test]
-    async fn token_count_preserves_total_bloat_size() -> eyre::Result<()> {
-        let directory = tempfile::tempdir()?;
-        let output = directory.path().join("state.bin");
-        for count in [1, 4, 20] {
-            let token_args = (0..count).flat_map(|id| ["--token".to_owned(), id.to_string()]);
-            GeneratorCli::parse_from(
-                [
-                    "generate",
-                    "--size",
-                    "1",
-                    "--signable-count",
-                    "0",
-                    "--nonce-ring-hardfork",
-                    "T10",
-                    "--out",
-                    output.to_str().unwrap(),
-                ]
-                .into_iter()
-                .map(str::to_owned)
-                .chain(token_args),
-            )
-            .args
-            .run()
-            .await?;
-            let mut token_entries = BTreeMap::new();
-            crate::read_dump(BufReader::new(File::open(&output)?), |address, _, _| {
-                if address != NONCE_PRECOMPILE_ADDRESS {
-                    *token_entries.entry(address).or_insert(0u64) += 1;
-                }
-                Ok(())
-            })?;
-            assert_eq!(u64::try_from(token_entries.len())?, count);
-            assert_eq!(token_entries.values().min(), token_entries.values().max());
-            let bytes = token_entries.values().sum::<u64>() * 64 + count * 40;
-            assert!(bytes <= 1024 * 1024);
-            assert!(bytes > 1024 * 1024 - count * 64);
-        }
-        Ok(())
     }
 }

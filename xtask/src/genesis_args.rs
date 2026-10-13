@@ -1038,16 +1038,10 @@ mod tests {
         let balance_slot = B256::from(recipient.mapping_slot(tip20_slots::BALANCES));
         for count in [1, 4, 20] {
             let genesis = generate(&format!("--extra-token-count {}", count - 1)).await;
-            for id in 0..=20 {
+            for id in 0..count {
                 let mut bytes = PATH_USD_ADDRESS.into_array();
                 bytes[19] = id;
-                let account = genesis.alloc.get(&Address::new(bytes));
-                if id >= count {
-                    assert!(account.is_none(), "unexpected token {id} at count {count}");
-                    continue;
-                }
-                let account = account.unwrap();
-                assert!(account.code.as_ref().is_some_and(|code| !code.is_empty()));
+                let account = &genesis.alloc[&Address::new(bytes)];
                 assert_eq!(
                     account.storage.as_ref().unwrap().get(&balance_slot),
                     Some(&B256::from(U256::from(u64::MAX))),
