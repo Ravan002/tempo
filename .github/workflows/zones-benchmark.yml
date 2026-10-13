@@ -669,9 +669,12 @@ jobs:
           set -euo pipefail
           cargo build --target-dir "$ZONES_BENCH_TARGET_DIR" \
             --locked --profile profiling \
-            -p tempo -p tempo-zone -p tempo-zone-prover-utils -p tempo-xtask \
-            --bin tempo --bin tempo-zone --bin tempo-zone-prover-utils \
+            -p tempo-zone -p tempo-zone-prover-utils -p tempo-xtask \
+            --bin tempo-zone --bin tempo-zone-prover-utils \
             --bin tempo-xtask --bin tempo-zone-xtask
+          # Build L1 alone so workspace peers do not unify extra features into it.
+          cargo build --target-dir "$ZONES_BENCH_TARGET_DIR" \
+            --locked --profile profiling -p tempo --bin tempo
           {
             echo "ZONE_BIN=$ZONES_BENCH_TARGET_DIR/profiling/tempo-zone"
             echo "SPF_BIN=$ZONES_BENCH_TARGET_DIR/profiling/tempo-zone-prover-utils"

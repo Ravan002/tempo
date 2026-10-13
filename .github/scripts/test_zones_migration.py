@@ -22,7 +22,8 @@ class SnapshotCacheTests(unittest.TestCase):
             git('config', 'user.name', 'Test')
             git('config', 'user.email', 'test@example.invalid')
             for name in ('Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml',
-                         'bin/tempo/main.rs', 'crates/evm/lib.rs', 'crates/zones/node/lib.rs'):
+                         'bin/tempo/main.rs', 'crates/evm/lib.rs', 'crates/zones/node/lib.rs',
+                         'xtask/src/genesis.rs', 'xtask/src/zones/mod.rs'):
                 path = repo / name
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text('initial\n')
@@ -37,6 +38,13 @@ class SnapshotCacheTests(unittest.TestCase):
             (repo / 'crates/zones/node/lib.rs').write_text('zones change\n')
             git('commit', '-qam', 'test: zones')
             self.assertEqual(cache_key(), initial)
+            (repo / 'xtask/src/zones/mod.rs').write_text('zones generator change\n')
+            git('commit', '-qam', 'test: zones generator')
+            self.assertEqual(cache_key(), initial)
+            (repo / 'xtask/src/genesis.rs').write_text('core generator change\n')
+            git('commit', '-qam', 'test: core generator')
+            self.assertNotEqual(cache_key(), initial)
+            initial = cache_key()
             (repo / 'crates/evm/lib.rs').write_text('core change\n')
             git('commit', '-qam', 'test: core')
             self.assertNotEqual(cache_key(), initial)
@@ -56,3 +64,14 @@ class ProverPathTests(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertTrue(any(fnmatch.fnmatchcase(path, pattern) for pattern in patterns))
         self.assertFalse(any(fnmatch.fnmatchcase('docs/README.md', pattern) for pattern in patterns))
+
+
+class DockerIgnoreTests(unittest.TestCase):
+    def test_all_dockerfiles_use_the_same_context_filter(self):
+        dockerfiles = sorted((ROOT / 'zones/docker').glob('Dockerfile*'))
+        dockerfiles = [path for path in dockerfiles if not path.name.endswith('.dockerignore')]
+        self.assertTrue(dockerfiles)
+        expected = dockerfiles[0].with_name(dockerfiles[0].name + '.dockerignore').read_bytes()
+        for dockerfile in dockerfiles:
+            with self.subTest(dockerfile=dockerfile.name):
+                self.assertEqual(dockerfile.with_name(dockerfile.name + '.dockerignore').read_bytes(), expected)

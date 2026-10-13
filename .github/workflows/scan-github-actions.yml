@@ -4,11 +4,15 @@ on:
   pull_request:
     paths:
       - ".github/**"
+      - "zones/docker/**"
+      - "zones/contrib/bench/l1-snapshot.sh"
   push:
     branches:
       - main
     paths:
       - ".github/**"
+      - "zones/docker/**"
+      - "zones/contrib/bench/l1-snapshot.sh"
   schedule:
     - cron: "17 9 * * 1"
   workflow_dispatch:

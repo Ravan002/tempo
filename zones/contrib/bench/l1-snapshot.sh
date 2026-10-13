@@ -281,6 +281,7 @@ l1_snapshot_tempo_source_hash() {
     {
         git -C "$TEMPO_ROOT" ls-tree HEAD -- Cargo.toml Cargo.lock rust-toolchain.toml bin/tempo
         git -C "$TEMPO_ROOT" ls-tree HEAD crates/ | awk '$4 != "crates/zones"'
+        git -C "$TEMPO_ROOT" ls-tree -r HEAD xtask/ | awk '$4 !~ /^xtask\/src\/zones\//'
     } | sha256sum | awk '{print $1}'
 }
 
