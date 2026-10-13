@@ -191,7 +191,7 @@ impl TIP20Token {
 
     /// Returns the current total supply.
     pub fn total_supply(&self) -> Result<U256> {
-        Ok(self.load_supply(self.token_control()?.is_some())?.total)
+        Ok(self.load_supply()?.total)
     }
 
     /// Returns the active quote token address used for pricing.
@@ -206,8 +206,7 @@ impl TIP20Token {
 
     /// Returns the maximum mintable supply.
     pub fn supply_cap(&self) -> Result<U256> {
-        let supply = self.load_supply(self.token_control()?.is_some())?;
-        self.supply_cap_of(&supply)
+        self.supply_cap_of(&self.load_supply()?)
     }
 
     /// Returns whether the token is currently paused.
@@ -229,13 +228,9 @@ impl TIP20Token {
     ///
     /// # Errors
     /// - `InvalidTransferPolicyId` — the token uses a generic TIP-403 policy
-    pub fn transfer_policy(&self) -> Result<ITIP20::transferPolicyReturn> {
+    pub fn transfer_policy(&self) -> Result<TokenPolicy> {
         match self.issuer_policy()? {
-            IssuerPolicy::TokenSpecific(policy) => Ok(ITIP20::transferPolicyReturn {
-                senderMode: policy.sender as u8,
-                recipientMode: policy.recipient as u8,
-                mintRecipientMode: policy.mint_recipient as u8,
-            }),
+            IssuerPolicy::TokenSpecific(policy) => Ok(policy),
             IssuerPolicy::Generic(_) => Err(TIP20Error::invalid_transfer_policy_id().into()),
         }
     }
@@ -391,7 +386,7 @@ impl TIP20Token {
         call: ITIP20::setSupplyCapCall,
     ) -> Result<()> {
         self.check_role(msg_sender, DEFAULT_ADMIN_ROLE)?;
-        let supply = self.load_supply(self.token_control()?.is_some())?;
+        let supply = self.load_supply()?;
         if call.newSupplyCap < supply.total {
             return Err(TIP20Error::invalid_supply_cap().into());
         }
@@ -737,8 +732,7 @@ impl TIP20Token {
         }
 
         // Check if the address is blocked from transferring (sender authorization)
-        let policy = self.issuer_policy()?;
-        if self.policy_allows(policy, owner, AuthRole::sender())? {
+        if self.is_authorized_as(owner, AuthRole::sender())? {
             // Only allow burning from addresses that are blocked from transferring
             return Err(TIP20Error::policy_forbids().into());
         }
@@ -798,7 +792,7 @@ impl TIP20Token {
     /// Reduces total supply by a burned `amount`, reverting with `InsufficientBalance` on
     /// underflow.
     fn decrease_total_supply(&mut self, amount: U256) -> Result<()> {
-        let supply = self.load_supply(self.token_control()?.is_some())?;
+        let supply = self.load_supply()?;
         let new_supply =
             supply
                 .total
@@ -1275,9 +1269,8 @@ impl TIP20Token {
         self.allowances[owner][spender].write(amount)
     }
 
-    /// Reverts with `ContractPaused` if the token is paused.
     pub fn check_not_paused(&self) -> Result<()> {
-        if self.load_control()?.is_paused() {
+        if self.paused()? {
             return Err(TIP20Error::contract_paused().into());
         }
         Ok(())
@@ -1303,10 +1296,7 @@ impl TIP20Token {
         let to = Recipient::resolve(to)?;
         self.check_not_paused()?;
         to.validate()?;
-        let policy = self.issuer_policy()?;
-        if !self.policy_allows_transfer(policy, from, to.target)? {
-            return Err(TIP20Error::policy_forbids().into());
-        }
+        self.ensure_transfer_authorized(from, to.target)?;
 
         if let Some(spender) = spender {
             self.consume_allowance(from, spender, amount)?;
@@ -1338,15 +1328,14 @@ impl TIP20Token {
         let to = Recipient::resolve(to)?;
         self.check_role(msg_sender, ISSUER_ROLE)?;
 
-        let supply = self.load_supply(self.token_control()?.is_some())?;
+        let supply = self.load_supply()?;
         if self.storage.spec().is_t3() {
             self.check_not_paused()?;
             to.validate()?;
         }
 
         // Authorize the resolved target using the role selected by the mint operation.
-        let policy = self.issuer_policy()?;
-        if !self.policy_allows(policy, to.target, recipient_role)? {
+        if !self.is_authorized_as(to.target, recipient_role)? {
             return Err(TIP20Error::policy_forbids().into());
         }
 
@@ -1363,22 +1352,14 @@ impl TIP20Token {
     /// [TIP-1015]: <https://docs.tempo.xyz/protocol/tips/tip-1015>
     pub fn is_transfer_authorized(&self, from: Address, to: Address) -> Result<bool> {
         let policy = self.issuer_policy()?;
-        self.policy_allows_transfer(policy, from, to)
-    }
 
-    /// Returns whether `policy` allows `from` as sender, then `to` as recipient.
-    fn policy_allows_transfer(
-        &self,
-        policy: IssuerPolicy,
-        from: Address,
-        to: Address,
-    ) -> Result<bool> {
-        let sender_auth = self.policy_allows(policy, from, AuthRole::sender())?;
         // (spec: +T2) short-circuit and skip recipient check if sender fails
+        let sender_auth = self.policy_allows(policy, from, AuthRole::sender())?;
         if self.storage.spec().is_t2() && !sender_auth {
             return Ok(false);
         }
-        Ok(self.policy_allows(policy, to, AuthRole::recipient())? && sender_auth)
+        let recipient_auth = self.policy_allows(policy, to, AuthRole::recipient())?;
+        Ok(sender_auth && recipient_auth)
     }
 
     /// Returns whether the resolved `policy` allows `user` in `role`. Callers resolve `policy` once
@@ -1552,21 +1533,20 @@ impl TIP20Token {
         self.check_not_paused()?;
         let destination = Recipient::resolve(to)?;
         destination.validate()?;
-        let policy = self.issuer_policy()?;
         if recovery_mode.is_reroute(to, receiver) {
             let policy_subject = recovery_mode.policy_subject(originator, receiver);
-            if !self.policy_allows_transfer(policy, policy_subject, destination.target)?
-                || TIP403Registry::new()
-                    .validate_receive_policy(self.address, policy_subject, destination.target)?
-                    .is_some()
+            self.ensure_transfer_authorized(policy_subject, destination.target)?;
+            if TIP403Registry::new()
+                .validate_receive_policy(self.address, policy_subject, destination.target)?
+                .is_some()
             {
                 return Err(TIP20Error::policy_forbids().into());
             }
             if let Some(addr) = recovery_mode.spending_account(recovery_auth) {
                 self.check_and_update_spending_limit(addr, amount)?;
             }
-        } else if !self.policy_allows(policy, destination.target, AuthRole::recipient())? {
-            return Err(TIP20Error::policy_forbids().into());
+        } else {
+            self.ensure_authorized_as(&[(destination.target, AuthRole::recipient())])?;
         }
 
         self._transfer(RECEIVE_POLICY_GUARD_ADDRESS, &destination, amount)?;

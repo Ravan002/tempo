@@ -2,12 +2,13 @@
 
 use crate::{
     Precompile, charge_input_cost, dispatch, mutate,
-    tip403_registry::{AuthRole, TIP403Registry},
+    storage::Handler,
+    tip403_registry::{AuthRole, PolicyMode, TIP403Registry},
     view,
 };
 use alloy::primitives::Address;
 use revm::precompile::PrecompileResult;
-use tempo_contracts::precompiles::ITIP403Registry;
+use tempo_contracts::precompiles::ITIP403Registry::{self, MembershipKind};
 
 impl Precompile for TIP403Registry {
     fn call(&mut self, calldata: &[u8], msg_sender: Address) -> PrecompileResult {
@@ -69,16 +70,34 @@ impl Precompile for TIP403Registry {
                     #[schedule(since = T2)]
                     createCompoundPolicy(call) => mutate(call, msg_sender, |sender, c| self.create_compound_policy(sender, c)),
                     #[schedule(since = T14)]
-                    tokenPolicy(call) => view(call, |c| self.token_policy(c.token).map(Into::into)),
+                    tokenPolicy(call) => view(call, |c| {
+                        let policy = self.token_policy(c.token)?;
+                        Ok(ITIP403Registry::tokenPolicyReturn {
+                            isSet: policy.is_set,
+                            senderMode: policy.sender,
+                            recipientMode: policy.recipient,
+                            mintRecipientMode: policy.mint_recipient,
+                        })
+                    }),
                     #[schedule(since = T14)]
                     tokenUserFlags(call) => view(call, |c| self.token_user_flags(c.token, c.account)),
                     #[schedule(since = T14)]
                     isTokenAuthorized(call) => view(call, |c| self.is_token_authorized(c.token, c.account, c.role)),
+                    // Unconfigured receivers report allow-all with originator recovery.
                     #[schedule(since = T14)]
-                    receiveConfig(call) => view(call, |c| self.receive_config(c.receiver)),
+                    receiveConfig(call) => view(call, |c| {
+                        let config = self.receive_config(c.receiver)?;
+                        Ok(ITIP403Registry::receiveConfigReturn {
+                            hasReceivePolicy: config.is_some(),
+                            tokenMode: config.map_or(PolicyMode::ALLOW, |cfg| cfg.token_mode),
+                            senderMode: config.map_or(PolicyMode::ALLOW, |cfg| cfg.sender_mode),
+                            recoveryAuthority: config
+                                .map_or(Address::ZERO, |cfg| cfg.recovery_authority(c.receiver)),
+                        })
+                    }),
                     #[schedule(since = T14)]
                     receiveSenderMembership(call) => view(call, |c| {
-                        self.receive_sender_membership(c.receiver, c.sender)
+                        self.receive_sender_members[c.receiver][c.sender].read()
                     }),
                     #[schedule(since = T14)]
                     setTokenPolicyModes(call) => mutate(call, msg_sender, |sender, c| {
@@ -96,19 +115,19 @@ impl Precompile for TIP403Registry {
                     setReceiveConfig(call) => mutate(call, msg_sender, |sender, c| self.set_receive_config(sender, c)),
                     #[schedule(since = T14)]
                     addReceiveTokens(call) => mutate(call, msg_sender, |sender, c| {
-                        self.modify_receive_tokens(sender, &c.tokens, true)
+                        self.modify_receive_list(sender, MembershipKind::RECEIVE_TOKEN, &c.tokens, true)
                     }),
                     #[schedule(since = T14)]
                     removeReceiveTokens(call) => mutate(call, msg_sender, |sender, c| {
-                        self.modify_receive_tokens(sender, &c.tokens, false)
+                        self.modify_receive_list(sender, MembershipKind::RECEIVE_TOKEN, &c.tokens, false)
                     }),
                     #[schedule(since = T14)]
                     addReceiveSenders(call) => mutate(call, msg_sender, |sender, c| {
-                        self.modify_receive_senders(sender, &c.senders, true)
+                        self.modify_receive_list(sender, MembershipKind::RECEIVE_SENDER, &c.senders, true)
                     }),
                     #[schedule(since = T14)]
                     removeReceiveSenders(call) => mutate(call, msg_sender, |sender, c| {
-                        self.modify_receive_senders(sender, &c.senders, false)
+                        self.modify_receive_list(sender, MembershipKind::RECEIVE_SENDER, &c.senders, false)
                     })
                 }
             }

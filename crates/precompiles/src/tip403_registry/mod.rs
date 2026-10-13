@@ -324,14 +324,12 @@ impl TIP403Registry {
             return Err(tempo_contracts::precompiles::TIP20Error::invalid_token().into());
         }
 
-        if self.storage.spec().is_t14() && self.token_policy(call.token)?.is_set {
-            return Ok(ITIP403Registry::tokenTransferPolicyIdReturn {
-                isSet: true,
-                policyId: TOKEN_POLICY_ID,
-            });
-        }
-
-        let registered_policy_id = self.registered_token_transfer_policy_id(call.token)?;
+        let registered_policy_id =
+            if self.storage.spec().is_t14() && self.token_policy(call.token)?.is_set {
+                Some(TOKEN_POLICY_ID)
+            } else {
+                self.registered_token_transfer_policy_id(call.token)?
+            };
         let is_set = registered_policy_id.is_some();
         let policy_id = match registered_policy_id {
             Some(policy_id) => policy_id,
@@ -602,7 +600,7 @@ impl TIP403Registry {
             return Err(TIP403RegistryError::virtual_address_not_allowed().into());
         }
         // (T14+) TIP-1145 receivers cannot switch back to policy IDs.
-        if self.storage.spec().is_t14() && self.load_receive_config(msg_sender)?.is_some() {
+        if self.storage.spec().is_t14() && self.receive_config(msg_sender)?.is_some() {
             return Err(TIP403RegistryError::receive_policy_ids_unsupported().into());
         }
 

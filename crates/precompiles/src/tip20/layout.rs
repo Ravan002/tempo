@@ -62,24 +62,18 @@ impl TokenControl {
     /// Rejects malformed words: unknown flags, nonzero legacy fields, invalid modes, non-canonical
     /// inline currencies, and quotes on pathUSD.
     fn validate(self, token: Address) -> Result<Self> {
-        let valid = self.flags & !(PAUSED_FLAG | PACKED_FLAG) == 0
-            && if !self.is_packed() {
-                self == Self {
-                    flags: self.flags,
-                    ..Default::default()
-                }
-            } else {
+        let valid = match self.flags & !PAUSED_FLAG {
+            0 => Self { flags: 0, ..self } == Self::default(),
+            PACKED_FLAG => {
                 TokenPolicy::from_modes_byte(self.modes).is_some()
                     && (self.currency.is_zero() || self.inline_currency().is_some())
-                    && (token != PATH_USD_ADDRESS
-                        || (self.quote_id == 0 && self.next_quote_id == 0))
-            };
-        if !valid {
-            return Err(TempoPrecompileError::Fatal(format!(
-                "invalid TIP-1145 control word for token {token}"
-            )));
-        }
-        Ok(self)
+                    && (token != PATH_USD_ADDRESS || (self.quote_id | self.next_quote_id) == 0)
+            }
+            _ => false,
+        };
+        valid.then_some(self).ok_or_else(|| {
+            TempoPrecompileError::Fatal(format!("invalid TIP-1145 control word for token {token}"))
+        })
     }
 
     pub(crate) fn is_paused(&self) -> bool {
@@ -101,8 +95,7 @@ impl TokenControl {
 
     /// Returns the cached issuer policy of a packed token.
     pub(crate) fn policy(&self) -> Option<TokenPolicy> {
-        self.is_packed()
-            .then(|| TokenPolicy::from_modes_byte(self.modes).expect("validated"))
+        TokenPolicy::from_modes_byte(self.modes).filter(|_| self.is_packed())
     }
 
     /// Decodes a nonzero inline currency, returning `None` for non-canonical encodings.
@@ -155,11 +148,6 @@ impl TIP20Token {
         Ok(Some(self.load_control()?).filter(TokenControl::is_packed))
     }
 
-    #[cfg(test)]
-    pub(crate) fn is_packed(&self) -> Result<bool> {
-        Ok(self.token_control()?.is_some())
-    }
-
     /// Writes the pause state, preserving the packed fields.
     pub(crate) fn store_paused(&mut self, paused: bool) -> Result<()> {
         match self.token_control()? {
@@ -182,9 +170,9 @@ impl TIP20Token {
 
     // ----- supply -----------------------------------------------------------------------------
 
-    /// Loads the total supply for the given layout.
-    pub(crate) fn load_supply(&self, packed: bool) -> Result<Supply> {
-        Ok(if packed {
+    /// Loads the total supply in the token's layout.
+    pub(crate) fn load_supply(&self) -> Result<Supply> {
+        Ok(if self.token_control()?.is_some() {
             let supply = self.supply_slot().read()?;
             Supply {
                 total: U256::from(supply.total_supply),
@@ -218,7 +206,7 @@ impl TIP20Token {
     /// Overwrites the total supply in either layout (test helper).
     #[cfg(test)]
     pub(crate) fn set_total_supply(&mut self, total: U256) -> Result<()> {
-        let supply = self.load_supply(self.is_packed()?)?;
+        let supply = self.load_supply()?;
         self.store_supply(Supply { total, ..supply })
     }
 
@@ -290,7 +278,7 @@ impl TIP20Token {
 
         let policy = TokenPolicy::ALLOW_ALL;
         let control = TokenControl::new(&policy, quote_id, quote_id, currency);
-        if control.inline_currency().is_none() {
+        if control.currency.is_zero() {
             self.currency.write(currency.to_string())?;
         }
         self.store_supply(Supply {
@@ -326,7 +314,7 @@ impl TIP20Token {
 
         let control =
             TokenControl::new(policy, quote_id, next_quote_id, &currency).with_paused(paused);
-        if control.inline_currency().is_some() {
+        if !control.currency.is_zero() {
             self.clear_word(slots::CURRENCY)?;
         }
         for slot in [
