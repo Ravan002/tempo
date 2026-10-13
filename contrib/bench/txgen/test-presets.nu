@@ -32,4 +32,21 @@ for preset in [tip20 tip20_existing_recipients mix dex mpp neobank-deposit neoba
 }
 # Nodes without TIP-1145 (failed `tokenPolicy` probe) keep the spec unchanged.
 assert equal (txgen-prepare-tip1145-activation $default.spec_path "http://127.0.0.1:1" 4) $default.spec_path
-print "Preset alias, transfer compatibility, state-bloat setup, and workload metadata checks passed"
+
+# The policy-heavy preset keeps the same payment and receiver checks on both layouts.
+let policy_spec = (txgen-resolve-bench-spec tip20-policy)
+assert equal $policy_spec.kind static
+assert equal (open $policy_spec.spec_path).merge.templates.tip20_transfer.fee_token (txgen-tip20-token-address 1)
+for packed in [false true] {
+    let policy = (txgen-tip20-policy-calls $packed 2 17)
+    assert equal ($policy.admin_calls | where function == changeTransferPolicyId | last).args [(if $packed { "0xffffffffffffffff" } else { "24" })]
+    assert equal $policy.receive_call.function (if $packed { "setReceiveConfig" } else { "setReceivePolicy" })
+    assert equal $policy.receive_call.args (if $packed { [3 3 "0x0000000000000000000000000000000000000000"] } else { [25 26 "0x0000000000000000000000000000000000000000"] })
+    if not $packed {
+        assert equal ($policy.admin_calls | where function == createCompoundPolicy | get args) [[17 18 19] [21 22 23]]
+        assert equal ($policy.admin_calls | where function == createPolicy | length) 8
+    } else {
+        assert equal ($policy.admin_calls | first).args [(txgen-tip20-token-address 0) 3 3 3]
+    }
+}
+print "Preset, policy setup, state-bloat, and workload metadata checks passed"
