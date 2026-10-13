@@ -32,14 +32,14 @@ ENV RUST_BACKTRACE=1 \
 RUN cargo fetch --locked
 
 # Every test binary in the workspace (as CI's test and e2e jobs build them), then the binaries, including
-# tempo-localnet for a dev node. A step that fails fails the build.
+# tempo-localnet for a dev node. Always --workspace: -p changes feature unification and rebuilds hundreds of crates.
+# A step that fails fails the build.
 RUN cargo nextest run --locked --workspace --lib --bins --tests --no-run \
-    && cargo build --locked --workspace --bins \
-    && cargo build --locked -p tempo --features localnet --bin tempo-localnet
+    && cargo build --locked --workspace --bins --features tempo/localnet
 
 # A cheap slice of the tests so the log shows the image works, without letting a failure abort the build.
-RUN timeout 600 cargo nextest run --locked -p tempo-precompiles -p tempo-transaction-pool -p tempo-primitives \
-      --lib --no-fail-fast \
+RUN timeout 600 cargo nextest run --locked --workspace --lib --no-fail-fast \
+      -E 'package(tempo-precompiles) | package(tempo-transaction-pool) | package(tempo-primitives)' \
     || echo "WARNING: cargo nextest reported failures"
 
 # Everything is fetched. From here on cargo must not try to reach a registry.

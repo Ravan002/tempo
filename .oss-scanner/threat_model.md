@@ -36,13 +36,15 @@ upstream).
 
 ## How to exercise it
 
-- Unit and integration tests: `cargo nextest run -p <package>` (all test binaries are prebuilt; build only the
-  package you change, the container has 2 CPUs). Precompile tests in `crates/precompiles` run against an in-memory
-  EVM and are the fastest way to prove a token or DEX bug.
+- All test binaries are prebuilt. Select tests with `cargo nextest run --workspace -E 'package(<name>)' [filter]`,
+  never `-p <name>`: `-p` changes feature unification and rebuilds hundreds of crates, and the container has 2 CPUs.
+  Precompile tests in `crates/precompiles` run against an in-memory EVM and are the fastest way to prove a token or
+  DEX bug.
 - Full-node tests: `crates/node/tests/it` and `crates/e2e` start real nodes in-process. They are heavy; run one test
-  at a time (`cargo nextest run -p tempo-e2e <name>`).
+  at a time (`cargo nextest run --workspace -E 'package(tempo-e2e)' <name>`).
 - A dev chain: `target/debug/tempo node --dev` serves RPC on `127.0.0.1:8545`; `target/debug/tempo-localnet` also
-  funds the dev accounts and seeds Fee AMM and DEX liquidity (see `docs/localnet.md`).
+  funds the dev accounts and seeds Fee AMM and DEX liquidity (see `docs/localnet.md`). Rebuild them with
+  `cargo build --workspace --bins --features tempo/localnet`.
 - Behaviour is gated by hardfork (`crates/hardfork`, `crates/chainspec`). Report against the fork active on mainnet
   unless the bug is in an unreleased fork's code path, and say which.
 - Zones tests that load Solidity artifacts from `crates/zones/contracts/out` fail here: building them needs a private
