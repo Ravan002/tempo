@@ -4,7 +4,7 @@ use alloy::{
     signers::{local::MnemonicBuilder, utils::secret_key_to_address},
 };
 use alloy_eips::eip2935::{HISTORY_STORAGE_ADDRESS, HISTORY_STORAGE_CODE};
-use alloy_primitives::{B256, Bytes};
+use alloy_primitives::{B256, Bytes, b256};
 use commonware_codec::Encode as _;
 use commonware_cryptography::{
     Signer as _,
@@ -142,7 +142,7 @@ pub(crate) struct GenesisArgs {
     #[arg(long, value_delimiter = ',')]
     validator_addresses: Vec<Address>,
 
-    /// Disable creating Alpha/Beta/ThetaUSD tokens.
+    /// Disable creating Alpha/Beta/ThetaUSD and OUSD tokens.
     #[arg(long)]
     no_extra_tokens: bool,
 
@@ -314,6 +314,22 @@ impl GenesisArgs {
                     SaltOrAddress::Address(address!("20C0000000000000000000000000000000000003")),
                     &mut evm,
                 )?;
+
+                let ousd = create_and_mint_token(
+                    "OUSD",
+                    "OpenUSD",
+                    "USD",
+                    PATH_USD_ADDRESS,
+                    pathusd_admin,
+                    &addresses,
+                    U256::from(u64::MAX),
+                    SaltOrAddress::SenderSalt(OUSD_CREATOR, OUSD_SALT),
+                    &mut evm,
+                )?;
+                eyre::ensure!(
+                    ousd == OUSD_ADDRESS,
+                    "OUSD was created at {ousd}, not {OUSD_ADDRESS}"
+                );
 
                 (Some(alpha), Some(beta), Some(theta))
             } else {
@@ -591,8 +607,17 @@ fn create_path_usd_token(
     })
 }
 
+/// OpenUSD's creator and salt on Tempo mainnet and testnet, which derive its address there.
+const OUSD_CREATOR: Address = address!("0x22c01F26b74c808C89bbBaBDC31A4f03bDD4A020");
+const OUSD_SALT: B256 = b256!("0xf33dc2a859c2e7b057c1b3c1d2c3dd002405b1afab213e14d51cf86bd941e73b");
+/// OpenUSD's address on Tempo mainnet and testnet.
+const OUSD_ADDRESS: Address = address!("0x20c0000000000000000000006a37DA5C996874BE");
+
 enum SaltOrAddress {
     Salt(B256),
+    /// A salt deployed as `sender` rather than the token's admin, so the token lands where `sender`
+    /// deployed it on another network.
+    SenderSalt(Address, B256),
     Address(Address),
 }
 
@@ -622,6 +647,19 @@ fn create_and_mint_token(
             SaltOrAddress::Salt(salt) => factory
                 .create_token(
                     admin,
+                    createTokenCall {
+                        name: name.into(),
+                        symbol: symbol.into(),
+                        currency: currency.into(),
+                        quoteToken: quote_token,
+                        salt,
+                        admin,
+                    },
+                )
+                .expect("Could not create token"),
+            SaltOrAddress::SenderSalt(sender, salt) => factory
+                .create_token(
+                    sender,
                     createTokenCall {
                         name: name.into(),
                         symbol: symbol.into(),
