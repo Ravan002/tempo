@@ -300,19 +300,43 @@ def --env txgen-configure-keychain-env [accounts: int, token_count: int] {
     $env.TXGEN_KEYCHAIN_ACCESS_KEYS_END = ($access_keys_end | into string)
     $env.TXGEN_KEYCHAIN_TIP20_LIMITS = (txgen-keychain-tip20-limits $token_count)
     $env.TXGEN_KEYCHAIN_TIP20_ALLOWED_CALLS = (txgen-keychain-tip20-allowed-calls $token_count)
-    $env.TXGEN_KEYCHAIN_AUTHORIZE_SETUP_GAS_LIMIT = ($TXGEN_HELPER_KEYCHAIN_AUTHORIZE_SETUP_GAS_LIMIT | into string)
+    $env.TXGEN_KEYCHAIN_AUTHORIZE_SETUP_GAS_LIMIT = ([$TXGEN_HELPER_KEYCHAIN_AUTHORIZE_SETUP_GAS_LIMIT (txgen-key-authorization-gas-limit $token_count | into int)] | math max | into string)
     $env.TXGEN_KEY_AUTHORIZATION_GAS_LIMIT = (txgen-key-authorization-gas-limit $token_count)
 }
 
 # 2D-nonce specs mint deeper FeeAMM liquidity, matching the removed
 # tip20_2d_nonces preset. `nonce_key:` only appears in 2D-nonce specs.
-def --env txgen-configure-fee-amm-env [spec_path: string] {
+def --env txgen-configure-fee-amm-env [spec_path: string, token_count: int = 4] {
     let amount = if (txgen-spec-effective-text $spec_path) =~ '(?m)^\s*nonce_key:\s*$' {
         $TXGEN_HELPER_FEE_AMM_2D_LIQUIDITY_AMOUNT
     } else {
         $TXGEN_HELPER_FEE_AMM_LIQUIDITY_AMOUNT
     }
     $env.TXGEN_FEE_AMM_LIQUIDITY_AMOUNT = ($amount | into string)
+    $env.TXGEN_FEE_AMM_SETUP_STEPS = (1..<$token_count | each { |id|
+        {
+            id: $"mint_token_($id)_pathusd_liquidity"
+            tx: {
+                type: tempo
+                from: {pool: users, select: {index: 0}}
+                gas_limit: 1000000
+                max_fee_per_gas: 100000000000
+                max_priority_fee_per_gas: 100000000000
+                fee_token: (txgen-tip20-token-address 0)
+                call: {
+                    to: "0xfeec000000000000000000000000000000000000"
+                    abi: FeeAMM
+                    function: mint
+                    args: [
+                        (txgen-tip20-token-address $id)
+                        (txgen-tip20-token-address 0)
+                        $amount
+                        "0xfeec000000000000000000000000000000000000"
+                    ]
+                }
+            }
+        }
+    } | to json -r)
 }
 def txgen-shell-quote [value: any] {
     let s = ($value | into string)
@@ -753,7 +777,7 @@ def txgen-run-preset-pipeline [
     txgen-configure-tip20-token-env $tx_token_count
     txgen-configure-keychain-env $accounts $tx_token_count
     txgen-configure-existing-recipients-env $spec_path $bloat_mib $bloat_token_count
-    txgen-configure-fee-amm-env $spec_path
+    txgen-configure-fee-amm-env $spec_path $tx_token_count
     let preset_name = ($spec_path | path basename | str replace --regex '\.yml$' '')
     let tx_count = [($tps * $duration) 1] | math max
     mut zone_metadata = []

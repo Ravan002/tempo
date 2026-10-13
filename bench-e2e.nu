@@ -279,7 +279,7 @@ def e2e-bloat-gib-to-mib [bloat: int] {
 }
 
 def e2e-validate-token-count [token_count: int] {
-    let available_token_count = ($TIP20_TOKEN_IDS | length)
+    let available_token_count = 20
     if $token_count <= 0 {
         print "Error: --token-count must be a positive integer"
         exit 1
@@ -1058,7 +1058,7 @@ def run-local-e2e-phase [run: record, ctx: record] {
 
     let a_rpc = "http://127.0.0.1:8545"
     let b_rpc = "http://127.0.0.1:8645"
-    let a_base_args = (build-base-args $genesis $ctx.a.datadir $a_log_dir "0.0.0.0" 8545 9001)
+    let a_base_args = (build-base-args $genesis $ctx.a.datadir $a_log_dir "0.0.0.0" 8545 9001 $ctx.genesis_token_count)
         | append ["--log.file.format" "json"]
         | append (build-e2e-consensus-args $ctx.a.node_dir $ctx.trusted_peers $ctx.a.consensus_port $ctx.a.ip)
         | append $local_reth_args
@@ -1067,7 +1067,7 @@ def run-local-e2e-phase [run: record, ctx: record] {
         | append (if $ctx.samply { ["--log.samply"] } else { [] })
         | append (if $ctx.tracy != "off" { ["--log.tracy" "--log.tracy.filter" $ctx.tracy_filter] } else { [] })
         | append (benchmark-otlp-args $ctx.tracing_otlp)
-    let b_base_args = (build-base-args $genesis $ctx.b.datadir $b_log_dir "0.0.0.0" 8645 9101)
+    let b_base_args = (build-base-args $genesis $ctx.b.datadir $b_log_dir "0.0.0.0" 8645 9101 $ctx.genesis_token_count)
         | append ["--log.file.format" "json"]
         | append (build-e2e-consensus-args $ctx.b.node_dir $ctx.trusted_peers $ctx.b.consensus_port $ctx.b.ip)
         | append $local_reth_args
@@ -1173,7 +1173,7 @@ def run-local-e2e-phase [run: record, ctx: record] {
                 --scenario $scenario
                 --bloat-mib $ctx.bloat
                 --tip20-token-count $ctx.token_count
-                --bloat-token-count ($TIP20_TOKEN_IDS | length)
+                --bloat-token-count $ctx.token_count
                 --initial-db-size-bytes $initial_db_size_bytes
                 --victoriametrics-url $ctx.victoriametrics_url
                 --clickhouse-url $phase_clickhouse_url
@@ -1366,7 +1366,7 @@ def "main e2e" [
     --accounts: int = 1000                              # Number of accounts
     --max-concurrent-requests: int = 500                # Max concurrent requests
     --bloat: int = $E2E_DEFAULT_BLOAT                   # State bloat snapshot size in GiB: 0, 1, 10, or 100
-    --token-count: int = 4                         # Number of TIP20 tokens to use in txgen presets
+    --token-count: int = 4                         # 1..20 TIP20 tokens sharing the total bloat size
     --gas-limit: string = $E2E_GAS_LIMIT                # Builder gas limit
     --general-gas-limit: string = $E2E_GENERAL_GAS_LIMIT # General (non-payment) gas limit override
     --force-bloat                                      # Regenerate and promote both local e2e snapshots
@@ -1446,6 +1446,8 @@ def "main e2e" [
     }
     let bloat_mib = (e2e-bloat-gib-to-mib $bloat)
     e2e-validate-token-count $token_count
+    # Static DEX and app presets still reference the four canonical genesis tokens.
+    let genesis_token_count = ([$token_count 4] | math max)
     if $init_only and not $force_bloat {
         print "Error: --init-only requires --force-bloat"
         exit 1
@@ -1519,8 +1521,8 @@ def "main e2e" [
 
     let snapshots_ready = (
         (e2e-snapshots-ready $a_db $b_db)
-        and (bloat-matches (read-bench-marker $a_db) $bloat_mib $snapshot_state_hardfork)
-        and (bloat-matches (read-bench-marker $b_db) $bloat_mib $snapshot_state_hardfork)
+        and (bloat-matches (read-bench-marker $a_db) $bloat_mib $snapshot_state_hardfork $token_count)
+        and (bloat-matches (read-bench-marker $b_db) $bloat_mib $snapshot_state_hardfork $token_count)
     )
     let should_init_snapshots = $force_bloat or (not $snapshots_ready)
     if (not $snapshots_ready) and (not $force_bloat) {
@@ -1551,7 +1553,7 @@ def "main e2e" [
         let tempo_bin = if $profile == "dev" { "./target/debug/tempo" } else { $"./target/($profile)/tempo" }
         let genesis_accounts = ([$accounts 3] | math max) + 1
         print $"Generating local e2e localnet config for validators: ($E2E_VALIDATORS)"
-        cargo run -p tempo-xtask --profile $profile -- generate-localnet -o $init_dir --accounts $genesis_accounts --validators $E2E_VALIDATORS --seed $E2E_SEED --force ...$gas_limit_args ...$general_gas_limit_args ...$snapshot_hardfork_args
+        cargo run -p tempo-xtask --profile $profile -- generate-localnet -o $init_dir --accounts $genesis_accounts --extra-token-count ($genesis_token_count - 1) --validators $E2E_VALIDATORS --seed $E2E_SEED --force ...$gas_limit_args ...$general_gas_limit_args ...$snapshot_hardfork_args
 
         let trusted_peers = (trusted-peers-from-localnet $init_dir)
         if $trusted_peers == "" {
@@ -1564,13 +1566,14 @@ def "main e2e" [
             bench-clean-datadir $b_db
             ensure-bloat-space $bloat_mib
             print $"Generating local e2e state bloat \(($bloat_mib) MiB\)..."
-            let token_args = ($TIP20_TOKEN_IDS | each { |id| ["--token" $"($id)"] } | flatten)
+            let token_args = (0..<$token_count | each { |id| ["--token" $"($id)"] } | flatten)
             cargo run -p tempo-xtask --profile $profile -- generate-state-bloat --size $bloat_mib --nonce-ring-hardfork $snapshot_state_hardfork --out $bloat_file ...$token_args
         }
 
         let marker = {
             bloat_mib: $bloat_mib
             bloat_version: $BLOAT_VERSION
+            bloat_token_count: $token_count
             nonce_ring_hardfork: $snapshot_state_hardfork
             bloat: $bloat
             accounts: $genesis_accounts
@@ -1722,6 +1725,7 @@ def "main e2e" [
         max_concurrent_requests: $max_concurrent_requests
         bloat: $bloat_mib
         token_count: $token_count
+        genesis_token_count: $genesis_token_count
         txgen: $txgen
         results_dir: $results_dir
         profile: $profile

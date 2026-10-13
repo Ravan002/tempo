@@ -450,8 +450,8 @@ jobs:
               core.setFailed(msg);
               return;
             }
-            if (Number(tokenCount) < 1 || Number(tokenCount) > 4) {
-              const msg = `❌ **Invalid bench command**\n\n\`token-count=${tokenCount}\` is not valid. Must be between 1 and 4, matching the TIP20 tokens available in state bloat.\n\n${usageStr}`;
+            if (Number(tokenCount) < 1 || Number(tokenCount) > 20) {
+              const msg = `❌ **Invalid bench command**\n\n\`token-count=${tokenCount}\` is not valid. Must be between 1 and 20, sharing the total state bloat size.\n\n${usageStr}`;
               await github.rest.issues.createComment({
                 owner: context.repo.owner,
                 repo: context.repo.repo,

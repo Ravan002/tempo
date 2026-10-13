@@ -70,7 +70,7 @@ on:
         required: false
         default: ""
       token-count:
-        description: Number of TIP20 tokens to use in txgen presets.
+        description: 1–20 TIP20 tokens sharing the total state bloat size.
         type: string
         required: true
         default: "4"
@@ -897,8 +897,8 @@ jobs:
             echo "::error::token-count must be a positive integer"
             exit 1
           fi
-          if [ "$BENCH_TOKEN_COUNT" -gt 4 ]; then
-            echo "::error::token-count must be <= 4, matching the TIP20 tokens available in state bloat"
+          if [ "$BENCH_TOKEN_COUNT" -gt 20 ]; then
+            echo "::error::token-count must be <= 20, sharing the total state bloat size"
             exit 1
           fi
           cmd=(nu bench-e2e.nu e2e)

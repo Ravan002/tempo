@@ -25,7 +25,7 @@ use rayon::prelude::*;
 use reth_evm::revm::context_interface::JournalTr as _;
 use std::{
     collections::BTreeMap,
-    iter::repeat_with,
+    iter::{once, repeat_with},
     net::SocketAddr,
     path::{Path, PathBuf},
 };
@@ -145,6 +145,10 @@ pub(crate) struct GenesisArgs {
     /// Disable creating Alpha/Beta/ThetaUSD tokens.
     #[arg(long)]
     no_extra_tokens: bool,
+
+    /// Number of additional USD tokens at reserved IDs 1..=19 (pathUSD is ID 0).
+    #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u8).range(0..20), conflicts_with = "no_extra_tokens")]
+    extra_token_count: u8,
 
     /// Enable creating deployment gas token.
     #[arg(long)]
@@ -276,50 +280,30 @@ impl GenesisArgs {
         println!("Creating pathUSD through factory");
         create_path_usd_token(pathusd_admin, &addresses, self.pathusd_amount, &mut evm)?;
 
-        let (alpha_token_address, beta_token_address, theta_token_address) =
-            if !self.no_extra_tokens {
-                println!("Initializing TIP20 tokens");
-                let alpha = create_and_mint_token(
-                    "AlphaUSD",
-                    "AlphaUSD",
-                    "USD",
-                    PATH_USD_ADDRESS,
-                    pathusd_admin,
-                    &addresses,
-                    U256::from(u64::MAX),
-                    SaltOrAddress::Address(address!("20C0000000000000000000000000000000000001")),
-                    &mut evm,
-                )?;
-
-                let beta = create_and_mint_token(
-                    "BetaUSD",
-                    "BetaUSD",
-                    "USD",
-                    PATH_USD_ADDRESS,
-                    pathusd_admin,
-                    &addresses,
-                    U256::from(u64::MAX),
-                    SaltOrAddress::Address(address!("20C0000000000000000000000000000000000002")),
-                    &mut evm,
-                )?;
-
-                let theta = create_and_mint_token(
-                    "ThetaUSD",
-                    "ThetaUSD",
-                    "USD",
-                    PATH_USD_ADDRESS,
-                    pathusd_admin,
-                    &addresses,
-                    U256::from(u64::MAX),
-                    SaltOrAddress::Address(address!("20C0000000000000000000000000000000000003")),
-                    &mut evm,
-                )?;
-
-                (Some(alpha), Some(beta), Some(theta))
-            } else {
-                println!("Skipping extra token creation (--no-extra-tokens)");
-                (None, None, None)
-            };
+        let extra_token_count = if self.no_extra_tokens {
+            0
+        } else {
+            self.extra_token_count
+        };
+        let mut extra_tokens = Vec::new();
+        for id in 1..=extra_token_count {
+            let name = ["AlphaUSD", "BetaUSD", "ThetaUSD"]
+                .get(usize::from(id - 1))
+                .map_or_else(|| format!("Token{id}USD"), |name| (*name).to_owned());
+            let mut bytes = PATH_USD_ADDRESS.into_array();
+            bytes[19] = id;
+            extra_tokens.push(create_and_mint_token(
+                &name,
+                &name,
+                "USD",
+                PATH_USD_ADDRESS,
+                pathusd_admin,
+                &addresses,
+                U256::from(u64::MAX),
+                SaltOrAddress::Address(Address::new(bytes)),
+                &mut evm,
+            )?);
+        }
 
         if self.deployment_gas_token && self.deployment_gas_token_admin.is_none() {
             eyre::bail!(
@@ -380,7 +364,7 @@ impl GenesisArgs {
         let default_user_fee_token = if let Some(address) = deployment_gas_token {
             address
         } else {
-            alpha_token_address.unwrap_or(PATH_USD_ADDRESS)
+            extra_tokens.first().copied().unwrap_or(PATH_USD_ADDRESS)
         };
 
         let default_validator_fee_token = if let Some(address) = deployment_gas_token {
@@ -421,13 +405,13 @@ impl GenesisArgs {
         }
 
         if !self.no_pairwise_liquidity {
-            if let (Some(alpha), Some(beta), Some(theta)) =
-                (alpha_token_address, beta_token_address, theta_token_address)
-            {
+            if let Some((&alpha, others)) = extra_tokens.split_first() {
                 println!("Minting pairwise FeeAMM liquidity");
                 mint_pairwise_liquidity(
                     alpha,
-                    vec![PATH_USD_ADDRESS, beta, theta],
+                    once(PATH_USD_ADDRESS)
+                        .chain(others.iter().copied())
+                        .collect(),
                     U256::from(10u64.pow(10)),
                     pathusd_admin,
                     &mut evm,
@@ -887,6 +871,7 @@ mod tests {
             ZONE_MESSENGER_RUNTIME, ZONE_PORTAL_RUNTIME, ZONE_VERIFIER_RUNTIME,
         },
     };
+    use tempo_precompiles::{storage::StorageKey, tip20::tip20_slots};
 
     #[derive(Debug, clap::Parser)]
     struct Cli {
@@ -1043,5 +1028,45 @@ mod tests {
         assert!(from_file.resolved_mnemonic().is_err());
         std::fs::remove_file(path).unwrap();
         assert!(from_file.validator_onchain_addresses().is_err());
+    }
+
+    #[tokio::test]
+    async fn configurable_tip20_genesis_funds_every_token() {
+        let mnemonic = parse("").unwrap().resolved_mnemonic().unwrap();
+        let signer = MnemonicBuilder::from_phrase_nth(&mnemonic, 1);
+        let recipient = secret_key_to_address(signer.credential());
+        let balance_slot = B256::from(recipient.mapping_slot(tip20_slots::BALANCES));
+        for count in [1, 4, 20] {
+            let genesis = generate(&format!("--extra-token-count {}", count - 1)).await;
+            for id in 0..=20 {
+                let mut bytes = PATH_USD_ADDRESS.into_array();
+                bytes[19] = id;
+                let account = genesis.alloc.get(&Address::new(bytes));
+                if id >= count {
+                    assert!(account.is_none(), "unexpected token {id} at count {count}");
+                    continue;
+                }
+                let account = account.unwrap();
+                assert!(account.code.as_ref().is_some_and(|code| !code.is_empty()));
+                assert_eq!(
+                    account.storage.as_ref().unwrap().get(&balance_slot),
+                    Some(&B256::from(U256::from(u64::MAX))),
+                    "token {id} at count {count}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn extra_token_count_preserves_defaults_and_rejects_invalid_counts() {
+        assert_eq!(parse("").unwrap().extra_token_count, 3);
+        assert!(parse("--no-extra-tokens").unwrap().no_extra_tokens);
+        for args in [
+            "--extra-token-count 20",
+            "--extra-token-count -1",
+            "--extra-token-count 1 --no-extra-tokens",
+        ] {
+            assert!(parse(args).is_err(), "{args}");
+        }
     }
 }

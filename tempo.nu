@@ -145,12 +145,13 @@ def find-tempo-pids [] {
 # 1. Run `tempo init` to create the database
 # 2. Generate state bloat binary file
 # 3. Run `tempo init-from-binary-dump` to load the bloat
-def bloat-matches [marker: any, size: int, hardfork: string] {
+def bloat-matches [marker: any, size: int, hardfork: string, token_count: int = 4] {
     (
         $marker != null
         and ($marker | get -o bloat_version | default 0) == $BLOAT_VERSION
         and ($marker | get -o bloat_mib | default (-1)) == $size
         and ($marker | get -o nonce_ring_hardfork | default "") == $hardfork
+        and ($marker | get -o bloat_token_count | default 4) == $token_count
     )
 }
 
@@ -1992,9 +1993,9 @@ def run-dev-node [accounts: int, epoch_length: int, genesis: string, samply: boo
 }
 
 # Build base node arguments shared between dev and consensus modes
-def build-base-args [genesis_path: string, datadir: string, log_dir: string, bind_ip: string, http_port: int, reth_metrics_port: int] {
+def build-base-args [genesis_path: string, datadir: string, log_dir: string, bind_ip: string, http_port: int, reth_metrics_port: int, token_count: int = 4] {
     let ipc_path = $"($datadir)/reth.ipc"
-    let faucet_token_args = ($TIP20_TOKEN_IDS | each { |id| ["--faucet.address" (txgen-tip20-token-address $id)] } | flatten)
+    let faucet_token_args = (0..<$token_count | each { |id| ["--faucet.address" (txgen-tip20-token-address $id)] } | flatten)
 
     [
         "node"
