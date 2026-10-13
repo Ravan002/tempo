@@ -306,7 +306,7 @@ async fn test_eth_estimate_gas(schedule: ForkSchedule) -> eyre::Result<()> {
         // TIP-1145 (T14): the packed supply word is already nonzero, so the first mint creates no
         // new slot for it.
         let expected_gas = if schedule.is_active(TempoHardfork::T14) {
-            293984
+            294185
         } else if schedule.is_active(TempoHardfork::T11) {
             547480
         } else if schedule.is_active(TempoHardfork::T8) {

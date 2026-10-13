@@ -23,8 +23,6 @@ use tempo_primitives::TempoAddressExt;
 const PAUSED_FLAG: u8 = 0b01;
 /// Control flag: the token uses the packed layout.
 const PACKED_FLAG: u8 = 0b10;
-/// Inline encoding of [`USD_CURRENCY`].
-const INLINE_USD: FixedBytes<14> = FixedBytes(*b"USD\0\0\0\0\0\0\0\0\0\0\0");
 
 /// Slot-12 control word. The legacy `bool paused` word decodes as `flags` 0 or 1 with every other
 /// field zero.
@@ -61,11 +59,6 @@ impl TokenControl {
         }
     }
 
-    /// Returns whether the currency lives in the external (slot 4) string.
-    fn has_external_currency(&self) -> bool {
-        self.currency.is_zero()
-    }
-
     /// Rejects malformed words: unknown flags, nonzero legacy fields, invalid modes, non-canonical
     /// inline currencies, and quotes on pathUSD.
     fn validate(self, token: Address) -> Result<Self> {
@@ -82,7 +75,9 @@ impl TokenControl {
                         || (self.quote_id == 0 && self.next_quote_id == 0))
             };
         if !valid {
-            return Err(invalid_state(token));
+            return Err(TempoPrecompileError::Fatal(format!(
+                "invalid TIP-1145 control word for token {token}"
+            )));
         }
         Ok(self)
     }
@@ -111,13 +106,11 @@ impl TokenControl {
     }
 
     /// Decodes a nonzero inline currency, returning `None` for non-canonical encodings.
-    fn inline_currency(&self) -> Option<&str> {
-        let len = self.currency.iter().rposition(|b| *b != 0)? + 1;
-        let bytes = &self.currency[..len];
-        if bytes.contains(&0) {
-            return None;
-        }
-        core::str::from_utf8(bytes).ok()
+    pub fn inline_currency(&self) -> Option<&str> {
+        let currency = core::str::from_utf8(&self.currency[..])
+            .ok()?
+            .trim_end_matches('\0');
+        (!currency.is_empty() && !currency.contains('\0')).then_some(currency)
     }
 }
 
@@ -133,11 +126,7 @@ struct PackedSupply {
 pub(crate) struct Supply {
     pub(crate) total: U256,
     /// Packed supply cap; `None` for the legacy layout, which stores it in slot 13.
-    cap: Option<U256>,
-}
-
-fn invalid_state(token: Address) -> TempoPrecompileError {
-    TempoPrecompileError::Fatal(format!("invalid TIP-1145 control word for token {token}"))
+    pub(crate) cap: Option<U256>,
 }
 
 impl TIP20Token {
@@ -159,7 +148,7 @@ impl TIP20Token {
 
     /// Probes the layout, returning the control word of packed tokens. Pre-T14 every token is
     /// legacy, so no storage is read.
-    pub(crate) fn token_control(&self) -> Result<Option<TokenControl>> {
+    pub fn token_control(&self) -> Result<Option<TokenControl>> {
         if !self.storage.spec().is_t14() {
             return Ok(None);
         }
@@ -182,9 +171,9 @@ impl TIP20Token {
     /// Synchronizes the cached issuer modes of packed tokens. Legacy tokens and unchanged modes
     /// receive no write.
     pub(crate) fn sync_policy_modes(&mut self, policy: &TokenPolicy) -> Result<()> {
+        let modes = policy.modes_byte();
         match self.token_control()? {
-            Some(control) if control.modes != policy.modes_byte() => {
-                let modes = policy.modes_byte();
+            Some(control) if control.modes != modes => {
                 self.control_slot().write(TokenControl { modes, ..control })
             }
             _ => Ok(()),
@@ -214,36 +203,23 @@ impl TIP20Token {
         supply.cap.map_or_else(|| self.supply_cap.read(), Ok)
     }
 
-    /// Writes a new total supply, preserving the packed cap.
-    ///
-    /// Callers must bound packed totals by the cap (≤ `u128::MAX`).
-    pub(crate) fn store_total_supply(&mut self, supply: &Supply, total: U256) -> Result<()> {
+    /// Writes supply in its layout: packed tokens store total and cap (both ≤ `u128::MAX`)
+    /// together, legacy tokens only the total, as their cap has its own slot.
+    pub(crate) fn store_supply(&mut self, supply: Supply) -> Result<()> {
         match supply.cap {
-            Some(cap) => self.store_packed_supply(total, cap),
-            None => self.total_supply.write(total),
+            Some(cap) => self.supply_slot().write(PackedSupply {
+                total_supply: supply.total.to(),
+                supply_cap: cap.to(),
+            }),
+            None => self.total_supply.write(supply.total),
         }
-    }
-
-    /// Writes a new supply cap (≤ `u128::MAX`), preserving the packed total.
-    pub(crate) fn store_supply_cap(&mut self, supply: &Supply, cap: U256) -> Result<()> {
-        match supply.cap {
-            Some(_) => self.store_packed_supply(supply.total, cap),
-            None => self.supply_cap.write(cap),
-        }
-    }
-
-    fn store_packed_supply(&mut self, total: U256, cap: U256) -> Result<()> {
-        self.supply_slot().write(PackedSupply {
-            total_supply: total.to(),
-            supply_cap: cap.to(),
-        })
     }
 
     /// Overwrites the total supply in either layout (test helper).
     #[cfg(test)]
     pub(crate) fn set_total_supply(&mut self, total: U256) -> Result<()> {
         let supply = self.load_supply(self.is_packed()?)?;
-        self.store_total_supply(&supply, total)
+        self.store_supply(Supply { total, ..supply })
     }
 
     // ----- quote tokens -----------------------------------------------------------------------
@@ -278,28 +254,13 @@ impl TIP20Token {
 
     // ----- currency ---------------------------------------------------------------------------
 
-    /// Returns the inline currency of packed tokens, if any.
-    pub fn load_currency(&self) -> Result<Option<String>> {
-        Ok(self
-            .token_control()?
-            .and_then(|control| control.inline_currency().map(str::to_string)))
-    }
-
-    /// Returns whether the currency is [`USD_CURRENCY`].
+    /// Returns whether the currency is [`USD_CURRENCY`]. Packed tokens skip the external read,
+    /// since `"USD"` always fits inline.
     pub fn is_usd(&self) -> Result<bool> {
-        match self.packed_is_usd()? {
-            Some(is_usd) => Ok(is_usd),
+        match self.token_control()? {
+            Some(control) => Ok(control.inline_currency() == Some(USD_CURRENCY)),
             None => Ok(self.currency.read()? == USD_CURRENCY),
         }
-    }
-
-    /// For packed tokens, returns whether the currency is [`USD_CURRENCY`] by comparing inline
-    /// bytes without an external read, since `"USD"` always fits inline. Returns `None` for
-    /// legacy tokens.
-    pub fn packed_is_usd(&self) -> Result<Option<bool>> {
-        Ok(self
-            .token_control()?
-            .map(|control| control.currency == INLINE_USD))
     }
 
     // ----- initialization and conversion ------------------------------------------------------
@@ -329,12 +290,15 @@ impl TIP20Token {
 
         let policy = TokenPolicy::ALLOW_ALL;
         let control = TokenControl::new(&policy, quote_id, quote_id, currency);
-        if control.has_external_currency() {
+        if control.inline_currency().is_none() {
             self.currency.write(currency.to_string())?;
         }
-        self.store_packed_supply(U256::ZERO, U128_MAX)?;
+        self.store_supply(Supply {
+            total: U256::ZERO,
+            cap: Some(U128_MAX),
+        })?;
         self.control_slot().write(control)?;
-        TIP403Registry::new().register_token_policy(self.address, policy)?;
+        TIP403Registry::new().write_token_policy(self.address, policy)?;
         Ok(true)
     }
 
@@ -362,7 +326,7 @@ impl TIP20Token {
 
         let control =
             TokenControl::new(policy, quote_id, next_quote_id, &currency).with_paused(paused);
-        if !control.has_external_currency() {
+        if control.inline_currency().is_some() {
             self.clear_word(slots::CURRENCY)?;
         }
         for slot in [
@@ -374,7 +338,10 @@ impl TIP20Token {
         }
         // A zero cap leaves the legacy supply word unchanged.
         if !cap.is_zero() {
-            self.store_packed_supply(total, cap)?;
+            self.store_supply(Supply {
+                total,
+                cap: Some(cap),
+            })?;
         }
         self.control_slot().write(control)
     }
@@ -454,7 +421,7 @@ mod tests {
     #[test]
     fn inline_currency_rules() {
         let inline = |currency| TokenControl::new(&TokenPolicy::ALLOW_ALL, 0, 0, currency);
-        assert_eq!(inline("USD").currency, INLINE_USD);
+        assert_eq!(inline("USD").inline_currency(), Some(USD_CURRENCY));
         for external in ["", "A\0B", "FIFTEEN_BYTES__"] {
             assert!(inline(external).currency.is_zero());
         }

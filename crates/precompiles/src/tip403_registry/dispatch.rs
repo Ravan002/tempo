@@ -69,11 +69,11 @@ impl Precompile for TIP403Registry {
                     #[schedule(since = T2)]
                     createCompoundPolicy(call) => mutate(call, msg_sender, |sender, c| self.create_compound_policy(sender, c)),
                     #[schedule(since = T14)]
-                    tokenPolicy(call) => view(call, |c| self.token_policy(c)),
+                    tokenPolicy(call) => view(call, |c| self.token_policy(c.token).map(Into::into)),
                     #[schedule(since = T14)]
-                    tokenUserFlags(call) => view(call, |c| self.token_user_flags(c)),
+                    tokenUserFlags(call) => view(call, |c| self.token_user_flags(c.token, c.account)),
                     #[schedule(since = T14)]
-                    isTokenAuthorized(call) => view(call, |c| self.is_token_authorized(c)),
+                    isTokenAuthorized(call) => view(call, |c| self.is_token_authorized(c.token, c.account, c.role)),
                     #[schedule(since = T14)]
                     receiveConfig(call) => view(call, |c| self.receive_config(c.receiver)),
                     #[schedule(since = T14)]
