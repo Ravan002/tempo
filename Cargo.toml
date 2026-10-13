@@ -155,7 +155,7 @@ debug = "none"
 panic = "abort"
 incremental = false
 
-# Preserve Zones' existing unwind behavior independently of Tempo's abort profile.
+# Zones SPF recovers invalid MPT proofs with catch_unwind, which requires unwinding.
 [profile.zones-reproducible]
 inherits = "reproducible"
 panic = "unwind"

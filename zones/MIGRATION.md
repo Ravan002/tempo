@@ -62,3 +62,8 @@ with the root workspace as context. Its `zones-reproducible` profile preserves
 Zones' unwind behavior while Tempo's `reproducible` profile keeps abort behavior.
 The workflows retain separate concurrency groups. Independent Linux rebuilds are
 still required to establish byte-for-byte reproducibility after the import.
+
+Automatic reproducible builds on `main` require `ZONES_REPRODUCIBLE_ENABLED=true`.
+Manual dispatch remains available for validating the root-context build before
+turning on automatic builds. The separate profile enables SPF's `catch_unwind`
+recovery for invalid MPT proofs.
