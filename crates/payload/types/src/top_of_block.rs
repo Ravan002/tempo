@@ -25,7 +25,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use alloy_consensus::{Transaction as _, transaction::TxHashRef as _};
+use alloy_consensus::Transaction as _;
 use alloy_primitives::{Address, B256, U256};
 use reth_primitives_traits::Recovered;
 use tempo_primitives::TempoTxEnvelope;
@@ -106,8 +106,8 @@ struct LaneRound {
     /// When this node opened the round and when the builder takes it; `None`
     /// while operators submit ahead of the round.
     opened: Option<(Instant, Instant)>,
-    /// The hashes the builder took, in prefix order; `None` until taken.
-    taken: Option<Vec<B256>>,
+    /// Whether the builder took the round.
+    taken: bool,
     slots: Vec<Slot>,
     slot_index: HashMap<(Address, U256), usize>,
     usage_by_operator: HashMap<B256, (usize, u64)>,
@@ -132,7 +132,7 @@ impl TopOfBlockLane {
         state.latest_opened = state.latest_opened.max(Some(key));
         state.rounds = state.rounds.split_off(&key);
         let round = state.rounds.entry(key).or_default();
-        if round.taken.is_some() {
+        if round.taken {
             // A rebuild of a round starts from an empty lane.
             *round = LaneRound::default();
         }
@@ -161,7 +161,7 @@ impl TopOfBlockLane {
             return Err(TopOfBlockSubmitError::NotOpen);
         }
         let round = state.rounds.entry(key).or_default();
-        if round.taken.is_some() {
+        if round.taken {
             return Err(TopOfBlockSubmitError::Closed);
         }
 
@@ -232,7 +232,7 @@ impl TopOfBlockLane {
         let deadline = match self.lock().rounds.get(&key) {
             Some(LaneRound {
                 opened: Some((_, deadline)),
-                taken: None,
+                taken: false,
                 ..
             }) => *deadline,
             _ => return Vec::new(),
@@ -243,7 +243,7 @@ impl TopOfBlockLane {
         let Some(round) = state
             .rounds
             .get_mut(&key)
-            .filter(|round| round.opened.is_some() && round.taken.is_none())
+            .filter(|round| round.opened.is_some() && !round.taken)
         else {
             return Vec::new();
         };
@@ -256,17 +256,8 @@ impl TopOfBlockLane {
             })
             .map(|submission| submission.tx)
             .collect();
-        round.taken = Some(txs.iter().map(|tx| *tx.tx_hash()).collect());
+        round.taken = true;
         txs
-    }
-
-    /// Returns the hashes the builder took for round `(epoch, view)`, in
-    /// prefix order.
-    pub fn taken(&self, epoch: u64, view: u64) -> Option<Vec<B256>> {
-        self.lock()
-            .rounds
-            .get(&(epoch, view))
-            .and_then(|round| round.taken.clone())
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, LaneState> {
@@ -345,10 +336,6 @@ mod tests {
                 (Address::repeat_byte(1), U256::from(7)),
                 (Address::repeat_byte(2), U256::from(1))
             ]
-        );
-        assert_eq!(
-            lane.taken(0, 7).unwrap(),
-            taken.iter().map(|tx| *tx.tx_hash()).collect::<Vec<_>>()
         );
     }
 
