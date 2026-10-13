@@ -1,8 +1,9 @@
 //! The privileged top-of-block lane.
 //!
 //! Consensus opens the lane for a round when this node starts proposing it.
-//! Authenticated top-of-block operators then submit signed transactions for
-//! that round until the lane's window elapses. The payload builder takes the
+//! Authenticated top-of-block operators submit signed transactions for that
+//! round until the lane's window elapses, also before the lane opens: they
+//! compute upcoming leaders from consensus certificates. The payload builder takes the
 //! lane after its start-of-block system work and executes the taken
 //! transactions before any transaction from the pool.
 //!
@@ -19,7 +20,7 @@
 //! timestamp is before the expiry.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -80,21 +81,32 @@ pub enum TopOfBlockSubmitError {
     Closed,
 }
 
+/// Maximum number of rounds that hold submissions before this node opens them.
+const MAX_PENDING_ROUNDS: usize = 4;
+
 /// Handle to the lane, shared by consensus and the payload builder.
 ///
 /// A default lane is never opened, so the builder takes nothing from it.
 #[derive(Debug, Clone, Default)]
 pub struct TopOfBlockLane {
-    inner: Arc<Mutex<Option<LaneRound>>>,
+    inner: Arc<Mutex<LaneState>>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
+struct LaneState {
+    /// Rounds by `(epoch, view)`: the round this node opened last, and rounds
+    /// that operators submitted to before this node opened them.
+    rounds: BTreeMap<(u64, u64), LaneRound>,
+    /// The latest round this node opened. Earlier rounds are discarded.
+    latest_opened: Option<(u64, u64)>,
+}
+
+#[derive(Debug, Default)]
 struct LaneRound {
-    epoch: u64,
-    view: u64,
-    opened_at: Instant,
-    deadline: Instant,
-    /// The hashes the builder took, in prefix order; `None` while open.
+    /// When this node opened the round and when the builder takes it; `None`
+    /// while operators submit ahead of the round.
+    opened: Option<(Instant, Instant)>,
+    /// The hashes the builder took, in prefix order; `None` until taken.
     taken: Option<Vec<B256>>,
     slots: Vec<Slot>,
     slot_index: HashMap<(Address, U256), usize>,
@@ -108,25 +120,30 @@ struct Slot {
 }
 
 impl TopOfBlockLane {
-    /// Opens the lane for `(epoch, view)`, discarding any previous round.
+    /// Opens the lane for `(epoch, view)`, keeping what operators already
+    /// submitted to this round and discarding earlier rounds.
     ///
     /// Submissions are accepted until the builder takes the lane. The builder
     /// waits for `window` after opening before it takes the lane.
     pub fn open(&self, epoch: u64, view: u64, window: Duration) {
         let now = Instant::now();
-        *self.lock() = Some(LaneRound {
-            epoch,
-            view,
-            opened_at: now,
-            deadline: now + window,
-            taken: None,
-            slots: Vec::new(),
-            slot_index: HashMap::new(),
-            usage_by_operator: HashMap::new(),
-        });
+        let mut state = self.lock();
+        let key = (epoch, view);
+        state.latest_opened = state.latest_opened.max(Some(key));
+        state.rounds = state.rounds.split_off(&key);
+        let round = state.rounds.entry(key).or_default();
+        if round.taken.is_some() {
+            // A rebuild of a round starts from an empty lane.
+            *round = LaneRound::default();
+        }
+        round.opened = Some((now, now + window));
     }
 
-    /// Adds `submissions` from `operator` to the open round `(epoch, view)`.
+    /// Adds `submissions` from `operator` to round `(epoch, view)`.
+    ///
+    /// Operators compute upcoming leaders from consensus certificates, so a
+    /// submission may arrive before this node opens the round. Such rounds are
+    /// kept until opened, up to a small number of rounds ahead.
     pub fn submit(
         &self,
         epoch: u64,
@@ -135,17 +152,24 @@ impl TopOfBlockLane {
         limits: TopOfBlockLimits,
         submissions: impl IntoIterator<Item = TopOfBlockSubmission>,
     ) -> Result<TopOfBlockSubmitOutcome, TopOfBlockSubmitError> {
-        let mut guard = self.lock();
-        let round = guard
-            .as_mut()
-            .filter(|round| round.epoch == epoch && round.view == view)
-            .ok_or(TopOfBlockSubmitError::NotOpen)?;
+        let mut state = self.lock();
+        let key = (epoch, view);
+        if state.latest_opened.is_some_and(|latest| key < latest) {
+            return Err(TopOfBlockSubmitError::NotOpen);
+        }
+        if !state.rounds.contains_key(&key) && state.rounds.len() >= MAX_PENDING_ROUNDS {
+            return Err(TopOfBlockSubmitError::NotOpen);
+        }
+        let round = state.rounds.entry(key).or_default();
         if round.taken.is_some() {
             return Err(TopOfBlockSubmitError::Closed);
         }
 
         let mut outcome = TopOfBlockSubmitOutcome {
-            since_open: round.opened_at.elapsed(),
+            since_open: round
+                .opened
+                .map(|(opened_at, _)| opened_at.elapsed())
+                .unwrap_or_default(),
             ..Default::default()
         };
         for submission in submissions {
@@ -197,25 +221,29 @@ impl TopOfBlockLane {
     /// round and returns its transactions in prefix order, without those
     /// expired at `block_timestamp_ms`.
     ///
-    /// Returns nothing if the lane is not open for this round.
+    /// Returns nothing if this node did not open the round.
     pub fn take(
         &self,
         epoch: u64,
         view: u64,
         block_timestamp_ms: u64,
     ) -> Vec<Recovered<TempoTxEnvelope>> {
-        let deadline = match self.lock().as_ref() {
-            Some(round) if round.epoch == epoch && round.view == view && round.taken.is_none() => {
-                round.deadline
-            }
+        let key = (epoch, view);
+        let deadline = match self.lock().rounds.get(&key) {
+            Some(LaneRound {
+                opened: Some((_, deadline)),
+                taken: None,
+                ..
+            }) => *deadline,
             _ => return Vec::new(),
         };
         std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
 
-        let mut guard = self.lock();
-        let Some(round) = guard
-            .as_mut()
-            .filter(|round| round.epoch == epoch && round.view == view && round.taken.is_none())
+        let mut state = self.lock();
+        let Some(round) = state
+            .rounds
+            .get_mut(&key)
+            .filter(|round| round.opened.is_some() && round.taken.is_none())
         else {
             return Vec::new();
         };
@@ -236,12 +264,12 @@ impl TopOfBlockLane {
     /// prefix order.
     pub fn taken(&self, epoch: u64, view: u64) -> Option<Vec<B256>> {
         self.lock()
-            .as_ref()
-            .filter(|round| round.epoch == epoch && round.view == view)
+            .rounds
+            .get(&(epoch, view))
             .and_then(|round| round.taken.clone())
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, Option<LaneRound>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, LaneState> {
         self.inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -341,15 +369,42 @@ mod tests {
     }
 
     #[test]
-    fn lane_only_accepts_its_round_until_taken() {
+    fn submissions_ahead_of_a_round_are_kept_until_it_opens() {
         let lane = TopOfBlockLane::default();
-        let (operator, other) = (B256::repeat_byte(1), B256::repeat_byte(2));
+        let operator = B256::repeat_byte(1);
+        lane.submit(0, 7, operator, LIMITS, [quote(1, 21_000, 1)])
+            .unwrap();
+        assert!(lane.take(0, 7, 0).is_empty(), "not opened by this node");
+        // Rounds further ahead are bounded.
+        for view in 8..=10 {
+            lane.submit(0, view, operator, LIMITS, [quote(1, 21_000, 1)])
+                .unwrap();
+        }
         assert_eq!(
-            lane.submit(0, 7, operator, LIMITS, [quote(1, 21_000, 1)]),
+            lane.submit(0, 11, operator, LIMITS, [quote(1, 21_000, 1)]),
             Err(TopOfBlockSubmitError::NotOpen)
         );
-        assert!(lane.take(0, 7, 0).is_empty());
 
+        lane.open(0, 7, Duration::ZERO);
+        lane.submit(0, 7, operator, LIMITS, [quote(2, 21_000, 1)])
+            .unwrap();
+        let taken = lane.take(0, 7, 0);
+        let makers: Vec<_> = taken.iter().map(|tx| tx.signer()).collect();
+        assert_eq!(makers, [Address::repeat_byte(1), Address::repeat_byte(2)]);
+
+        // Opening a later round discards earlier ones.
+        lane.open(0, 9, Duration::ZERO);
+        assert_eq!(
+            lane.submit(0, 8, operator, LIMITS, [quote(1, 21_000, 2)]),
+            Err(TopOfBlockSubmitError::NotOpen)
+        );
+        assert_eq!(lane.take(0, 9, 0).len(), 1);
+    }
+
+    #[test]
+    fn lane_accepts_its_round_until_taken() {
+        let lane = TopOfBlockLane::default();
+        let (operator, other) = (B256::repeat_byte(1), B256::repeat_byte(2));
         lane.open(0, 7, Duration::ZERO);
         assert_eq!(
             lane.submit(0, 6, operator, LIMITS, [quote(1, 21_000, 1)]),
