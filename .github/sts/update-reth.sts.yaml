@@ -2,7 +2,7 @@
 subject: repo:tempoxyz@211589300/tempo@994992847:environment:dependency-updates
 claim_pattern:
   workflow_ref: tempoxyz/tempo/\.github/workflows/update-reth\.yml@refs/heads/main
-  job_workflow_ref: tempoxyz/gh-actions/\.github/workflows/dependency-update\.yml@0e45d6a746fac3488057511b2c16b3cf548cfb42
+  job_workflow_ref: tempoxyz/gh-actions/\.github/workflows/dependency-update\.yml@6f27dbf672a2782168ef8aa2f9b87b3cef503cb9
 permissions:
   contents: write
   pull_requests: write
