@@ -7,5 +7,3 @@ biome.json linguist-language=JSON-with-Comments
 
 # Preserve archived patch context without treating it as source whitespace.
 *.patch -whitespace
-# Frozen evidence retains original bytes and source-snapshot whitespace.
-bench-results/** -text -whitespace linguist-generated=true

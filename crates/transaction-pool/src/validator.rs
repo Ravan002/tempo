@@ -201,7 +201,9 @@ where
         // The EVM checks `valid_before > block_timestamp` but the pool needs an extra
         // propagation buffer to prevent txs from expiring at peers with slightly newer tips.
         // A stalled canonical tip must not keep admitting transactions that
-        // have already expired in real time.
+        // have already expired in real time: the next block's timestamp will be
+        // at least wall-clock time. The tradeoff is that a node whose clock runs
+        // ahead rejects transactions within that skew of the buffer.
         let min_allowed = tip_timestamp
             .max(wall_clock_timestamp)
             .saturating_add(AA_VALID_BEFORE_MIN_SECS);
@@ -1458,6 +1460,67 @@ mod tests {
                 err.downcast_other_ref::<TempoPoolTransactionError>(),
                 Some(TempoPoolTransactionError::InvalidValidBefore(_))
             ));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_aa_valid_before_uses_wall_clock_when_tip_is_stale() {
+        let current_time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let stale_tip = current_time - 10 * AA_VALID_BEFORE_MIN_SECS - 600;
+
+        // Valid relative to the stale tip, but already expired in real time.
+        let tx_expired = create_aa_transaction(None, Some(current_time));
+        let validator = setup_validator(&tx_expired, stale_tip);
+        let outcome = validator
+            .validate_transaction(TransactionOrigin::External, tx_expired)
+            .await;
+        match outcome {
+            TransactionValidationOutcome::Invalid(_, ref err) => {
+                let Some(TempoPoolTransactionError::InvalidValidBefore(err)) =
+                    err.downcast_other_ref::<TempoPoolTransactionError>()
+                else {
+                    panic!("Expected InvalidValidBefore error, got: {err:?}");
+                };
+                assert!(err.min_allowed >= current_time + AA_VALID_BEFORE_MIN_SECS);
+            }
+            _ => panic!("Expected Invalid outcome with InvalidValidBefore error, got: {outcome:?}"),
+        }
+
+        // Far enough ahead of wall-clock time is still accepted.
+        let tx_valid =
+            create_aa_transaction(None, Some(current_time + AA_VALID_BEFORE_MIN_SECS + 10));
+        let validator = setup_validator(&tx_valid, stale_tip);
+        let outcome = validator
+            .validate_transaction(TransactionOrigin::External, tx_valid)
+            .await;
+        if let TransactionValidationOutcome::Invalid(_, ref err) = outcome {
+            assert!(!matches!(
+                err.downcast_other_ref::<TempoPoolTransactionError>(),
+                Some(TempoPoolTransactionError::InvalidValidBefore(_))
+            ));
+        }
+
+        // A tip ahead of wall-clock time still sets the floor.
+        let future_tip = current_time + 600;
+        let tx_behind_tip =
+            create_aa_transaction(None, Some(current_time + AA_VALID_BEFORE_MIN_SECS + 10));
+        let validator = setup_validator(&tx_behind_tip, future_tip);
+        let outcome = validator
+            .validate_transaction(TransactionOrigin::External, tx_behind_tip)
+            .await;
+        match outcome {
+            TransactionValidationOutcome::Invalid(_, ref err) => {
+                let Some(TempoPoolTransactionError::InvalidValidBefore(err)) =
+                    err.downcast_other_ref::<TempoPoolTransactionError>()
+                else {
+                    panic!("Expected InvalidValidBefore error, got: {err:?}");
+                };
+                assert_eq!(err.min_allowed, future_tip + AA_VALID_BEFORE_MIN_SECS);
+            }
+            _ => panic!("Expected Invalid outcome with InvalidValidBefore error, got: {outcome:?}"),
         }
     }
 

@@ -28,7 +28,7 @@ test('prewarming control resolves all four fresh cells with matching limits', ()
     assert.equal(c.options.node_memory, '20G');
     assert.equal(c.options.node_swap_limit, '0');
     assert.match(c.options.feature_env, /RETH_BYTECODE_PREFETCH=1/);
-    assert.match(c.options.feature_env, /TEMPO_BENCH_TX_TIMING=0/);
+    assert.doesNotMatch(c.options.feature_args, /--builder\.transaction-timing/);
     assert.equal(c.configuration.diagnostic_transaction_logging, false);
     assert.equal(c.options.feature_args, c.label.endsWith('-off') ? '--builder.disable-prewarming' : '');
   }
@@ -42,7 +42,8 @@ test('native prewarming control enables transaction diagnostics only on request'
   const cells = JSON.parse(execFileSync('nu', ['--no-config-file', 'bench-e2e.nu', 'state-access-prewarm-control',
     '--transaction-timing', '--dry-run'], {cwd: root, encoding: 'utf8'}));
   for (const cell of cells) {
-    assert.match(cell.options.feature_env, /TEMPO_BENCH_TX_TIMING=1/);
+    assert.match(cell.options.feature_args, /--builder\.transaction-timing/);
+    assert.equal(cell.options.feature_args.includes('--builder.disable-prewarming'), cell.label.endsWith('-off'));
     assert.equal(cell.configuration.diagnostic_transaction_logging, true);
   }
 });

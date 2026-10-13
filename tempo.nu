@@ -1289,19 +1289,36 @@ def generate-summary [
         let block_warmup_count = ([$summary_warmup_blocks ($sorted_blocks | length)] | math min)
         let block_trimmed = ($sorted_blocks | skip $block_warmup_count)
         let first_report_block_ms = ($sorted_blocks | first | get timestamp)
+        let samples_path = $"($results_dir)/report-($label).samples.ndjson"
+        let samples_gz_path = $"($samples_path).gz"
+        let raw_metric_samples = (do $load_metric_samples $samples_path $samples_gz_path)
+        # Anchor seconds-based warmup to the sender's own clock, as the state-access
+        # analyzers do. The phase start precedes setup and preflight by seconds.
+        let origin_sample = ($raw_metric_samples
+            | where { |sample| ($sample | get -o offset_ms | default null) != null and ($sample | get -o unix_ms | default null) != null }
+            | first 1)
         let phase_range_path = $"($results_dir)/phase-range-($label).json"
-        let phase_started_ms = if ($phase_range_path | path exists) {
+        let load_origin_ms = if ($origin_sample | length) > 0 {
+            let sample = ($origin_sample | first)
+            ($sample.unix_ms | into int) - ($sample.offset_ms | into int)
+        } else if ($phase_range_path | path exists) {
             open $phase_range_path | get started_ms | into int
         } else {
             $first_report_block_ms
         }
-        let warmup_cutoff_ms = $phase_started_ms + ($summary_warmup_seconds * 1000)
+        let warmup_cutoff_ms = $load_origin_ms + ($summary_warmup_seconds * 1000)
+        let load_end_ms = $load_origin_ms + ($duration * 1000)
+        # The measured window is exactly [warmup, duration) of the load; drain blocks are excluded.
         let blocks = if $summary_warmup_seconds > 0 {
-            $block_trimmed | where timestamp >= $warmup_cutoff_ms
+            $block_trimmed | where timestamp >= $warmup_cutoff_ms and timestamp < $load_end_ms
         } else {
             $block_trimmed
         }
-        let warmup_blocks = ($sorted_blocks | length) - ($blocks | length)
+        let warmup_blocks = if $summary_warmup_seconds > 0 {
+            $sorted_blocks | where timestamp < $warmup_cutoff_ms | length
+        } else {
+            $block_warmup_count
+        }
         if ($blocks | length) == 0 {
             print $"Warning: ($label) report has no summary blocks after excluding ($warmup_blocks) warmup blocks, skipping"
             continue
@@ -1317,14 +1334,12 @@ def generate-summary [
         let block_interval_blocks = if $warmup_blocks > 0 { $blocks | skip 1 } else { $blocks }
         let block_intervals = ($block_interval_blocks | where block_time_ms != null | get block_time_ms)
 
-        let samples_path = $"($results_dir)/report-($label).samples.ndjson"
-        let samples_gz_path = $"($samples_path).gz"
-        let raw_metric_samples = (do $load_metric_samples $samples_path $samples_gz_path)
         let metric_samples = if $warmup_blocks > 0 {
             $raw_metric_samples | where { |sample|
                 let offset_ms = ($sample | get -o offset_ms | default null)
                 if $offset_ms != null {
-                    ($offset_ms | into int) >= $summary_from_offset_ms
+                    let offset_ms = ($offset_ms | into int)
+                    $offset_ms >= $summary_from_offset_ms and ($summary_warmup_seconds == 0 or $offset_ms < $duration * 1000)
                 } else {
                     let unix_ms = ($sample | get -o unix_ms | default 0 | into int)
                     $unix_ms >= $summary_from_ms

@@ -26,7 +26,7 @@ dedicated fixtures once with `update-history-router.sh` after rebuilding the
 router artifact. This does not reimport the corpus.
 
 For cancellation-aware calibration, build the diagnostic binary and pass
-`--feature-env TEMPO_BENCH_TX_TIMING=1`. Timing logs include each builder attempt's
+`--feature-args --builder.transaction-timing`. Timing logs include each builder attempt's
 start, execution duration, elapsed build time, validity, and cancellation state.
 Logging is opt-in and does not change proposal deadlines or cancellation behavior.
 It adds overhead and should remain disabled for throughput measurements. Use the

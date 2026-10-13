@@ -16,15 +16,16 @@ function plans(args) {
   }
   const nu = process.env.NU_BIN || 'nu';
   const plan = JSON.parse(execFileSync(nu, ['--no-config-file', 'bench-e2e.nu',
-    'state-access-bloat-worst-case', '--sized-transactions', '--feature-env',
-    `TEMPO_BENCH_TX_TIMING=${args.includes('--transaction-timing') ? '1' : '0'}`,
+    'state-access-bloat-worst-case', '--sized-transactions',
     ...forwarded, '--dry-run'], {cwd: root, encoding: 'utf8'}));
+  const timing = args.includes('--transaction-timing');
   return ['sload', 'bytecode'].flatMap(id => [true, false].map(enabled => {
     const cell = structuredClone(plan);
     cell.label = `${id}-${enabled ? 'on' : 'off'}`;
-    cell.configuration.diagnostic_transaction_logging = args.includes('--transaction-timing');
+    cell.configuration.diagnostic_transaction_logging = timing;
     cell.configuration.cases = plan.configuration.cases.filter(c => c.id === id);
-    cell.options.feature_args = enabled ? '' : '--builder.disable-prewarming';
+    cell.options.feature_args = [enabled ? '' : '--builder.disable-prewarming',
+      timing ? '--builder.transaction-timing' : ''].filter(Boolean).join(' ');
     cell.configuration.prewarming = `builder ${enabled ? 'enabled' : 'disabled'}; engine unchanged`;
     return cell;
   }));

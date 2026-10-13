@@ -11,6 +11,8 @@ keywords = ["blockchain", "ethereum", "evm", "payments", "tempo"]
 publish = false
 
 [workspace]
+# Benchmark dependency checkouts are separate workspaces, never Tempo members.
+exclude = ["target"]
 members = [
   "bin/tempo",
   "bin/tempo-sidecar",

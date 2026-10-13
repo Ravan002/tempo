@@ -13,7 +13,7 @@ function definition(name) {
   return source.slice(start, source.indexOf('\n}\n', start) + 3);
 }
 
-test('local nodes inherit regular log files, preserve both streams, and require explicit timing opt-in', () => {
+test('local nodes inherit regular log files, preserve both streams, and apply only per-side env', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tempo-node-logging-'));
   try {
     const results = path.join(dir, 'results with spaces');
@@ -23,7 +23,7 @@ test('local nodes inherit regular log files, preserve both streams, and require 
 const fs = require('node:fs');
 fs.writeFileSync(process.argv[2], JSON.stringify({
   stdoutIsFile: fs.fstatSync(1).isFile(), stderrIsFile: fs.fstatSync(2).isFile(),
-  timing: process.env.TEMPO_BENCH_TX_TIMING,
+  marker: process.env.LOG_TEST_MARKER ?? null,
 }));
 fs.writeFileSync(1, 'stdout\\n'.repeat(30000));
 fs.writeFileSync(2, 'stderr\\n'.repeat(30000));
@@ -47,18 +47,18 @@ if not (job list | is-empty) { error make {msg: "node logging jobs did not finis
 `;
     const cases = ['baseline-1', 'feature-1'].flatMap(phase => ['a', 'b'].map(role => ({
       phase, role, metadata: path.join(dir, `${phase}-${role}.json`),
-      env: phase === 'feature-1' ? 'TEMPO_BENCH_TX_TIMING=1 ' : '',
+      env: phase === 'feature-1' ? 'LOG_TEST_MARKER=1 ' : '',
     })));
     const result = spawnSync('nu', ['--no-config-file', '-c', program], {
       cwd: root, encoding: 'utf8', timeout: 10000,
-      env: {...process.env, TEMPO_BENCH_TX_TIMING: '1', LOG_TEST_CASES: JSON.stringify(cases),
+      env: {...process.env, LOG_TEST_CASES: JSON.stringify(cases),
         LOG_TEST_NODE: node, LOG_TEST_RESULTS: results},
     });
     assert.equal(result.status, 0, result.stderr || String(result.error));
     assert.doesNotMatch(result.stdout, /stdout\n|stderr\n/);
     for (const c of cases) {
       assert.deepEqual(JSON.parse(fs.readFileSync(c.metadata)), {
-        stdoutIsFile: true, stderrIsFile: true, timing: c.phase === 'feature-1' ? '1' : '0',
+        stdoutIsFile: true, stderrIsFile: true, marker: c.phase === 'feature-1' ? '1' : null,
       });
       assert.equal(fs.readFileSync(path.join(results, `node-${c.phase}-${c.role}.log`), 'utf8'),
         'stdout\n'.repeat(30000) + 'stderr\n'.repeat(30000));

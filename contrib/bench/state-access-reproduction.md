@@ -94,8 +94,8 @@ case's results directory. The runner prints the paths; use `tail -f` to follow
 them separately. Structured JSON logs remain under `logs-<phase>-<role>/dev/`
 for the analyzers. No line-by-line console relay runs in the node output path.
 Per-transaction timing diagnostics default to off, including in the prewarming
-control. To collect them explicitly, pass `--feature-env TEMPO_BENCH_TX_TIMING=1`
-(and the matching `--baseline-env` for a comparison), or
+control. To collect them explicitly, pass `--feature-args --builder.transaction-timing`
+(and the matching `--baseline-args` for a comparison), or
 `--transaction-timing` to `state-access-prewarm-control`. Diagnostic logging adds
 overhead; compare capacity runs with diagnostics disabled. Without it, the
 latency analyzer's transaction-attempt distributions are empty; block, chain,
@@ -119,13 +119,13 @@ dedicated access-list prefetcher.
   read-only runner verifies the populated range, uses direct I/O, refuses active
   benchmark scopes, and holds the shared lock. Analyze with
   `node bench-results/ssd-read-bandwidth-20260927/analyze.cjs NEW_DIRECTORY`.
-- [Ethereum opcode prevalence](../../bench-results/mainnet-bytecode-opcodes-20260927/README.md)
-  and [code deduplication](../../bench-results/bytecode-dedup-20260927/README.md)
+- [Ethereum opcode prevalence](https://github.com/tempoxyz/tempo/blob/feat/payments-bloat-worst-case-results/bench-results/mainnet-bytecode-opcodes-20260927/README.md)
+  and [code deduplication](https://github.com/tempoxyz/tempo/blob/feat/payments-bloat-worst-case-results/bench-results/bytecode-dedup-20260927/README.md)
   preserve source provenance, analyzers and download checksums.
-- [Gas calibration](../../bench-results/gas-calibration-20260928/README.md)
+- [Gas calibration](https://github.com/tempoxyz/tempo/blob/feat/payments-bloat-worst-case-results/bench-results/gas-calibration-20260928/README.md)
   separates measured rates from estimates and backlog-limited writes.
 
-Compact evidence is indexed in [bench-results](../../bench-results/README.md).
+Compact evidence is indexed in [bench-results](https://github.com/tempoxyz/tempo/blob/feat/payments-bloat-worst-case-results/bench-results/README.md).
 The following reanalyses use only checked-in inputs and need no database:
 
 ```sh

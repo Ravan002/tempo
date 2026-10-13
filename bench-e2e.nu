@@ -196,13 +196,19 @@ def validate-schelk-state [a_state_path: string, b_state_path: string] {
     }
 }
 
-def bench-restore-at [state_path: string, mount_point: string, datadir: string] {
+# Only the pre-initialization restore may find no snapshot; every later restore
+# must fail rather than reuse a mutated datadir.
+def bench-restore-at [state_path: string, mount_point: string, datadir: string, --allow-missing] {
     if (has-schelk) {
         run-bench-schelk "restore" $state_path $mount_point
     } else {
         if not ($"($datadir).virgin" | path exists) {
-            print $"No virgin snapshot exists yet for ($datadir); initialization will create it."
-            return
+            if $allow_missing {
+                print $"No virgin snapshot exists yet for ($datadir); initialization will create it."
+                return
+            }
+            print $"Error: virgin snapshot missing for ($datadir); refusing to run on an unrestored datadir"
+            exit 1
         }
         print $"Restoring snapshot from ($datadir).virgin..."
         let target = ($datadir | path expand)
@@ -700,8 +706,7 @@ def start-e2e-local-node [
     let pinned_cmd = taskset-command [$tempo_bin ...$args] $cpus
     let node_cmd = wrap-samply $pinned_cmd $samply $full_samply_args
     let node_cmd_str = ($node_cmd | str join " ")
-    # Timing diagnostics are opt-in through the explicit per-side environment.
-    let script = $"TEMPO_BENCH_TX_TIMING=0 ($env_prefix)($otel_attrs)($tracy_env_prefix)($node_cmd_str) 2>&1"
+    let script = $"($env_prefix)($otel_attrs)($tracy_env_prefix)($node_cmd_str) 2>&1"
     let unit_phase = ($phase | str replace -a "_" "-" | str replace -a "." "-")
     let runner = (systemd-scope-command $"tempo-e2e-($role)-($unit_phase)" $cpus $memory $swap $script)
     print $"Starting local e2e validator ($role) for ($phase): ($runner | str join ' ')"
@@ -1310,11 +1315,11 @@ def run-local-e2e-phase [run: record, ctx: record] {
     let submit_rpc_url = if $ctx.isolated_roles { $a_rpc } else { [$a_rpc $b_rpc] | str join "," }
     let observe_state_paths = ($ctx | get -o observe_state_paths | default false)
     let observer_stop = $"($ctx.results_dir)/state-path-observer-($phase).stop"
-    if $phase_exit == 0 and $observe_state_paths {
+    let observer_job = if $phase_exit == 0 and $observe_state_paths {
         job spawn {
             ^node contrib/bench/state-path-observer.cjs watch --tempo $ctx.regenesis_tempo --a-datadir $ctx.a.datadir --b-datadir $ctx.b.datadir --phase $phase --seconds (($ctx.duration + 600) | into string) --stop $observer_stop --output $"($ctx.results_dir)/state-path-observer-($phase).jsonl"
-        } | ignore
-    }
+        }
+    } else { null }
 
     if $phase_exit == 0 {
         let phase_started_ms = ((date now | into int) / 1_000_000 | into int)
@@ -1393,6 +1398,17 @@ def run-local-e2e-phase [run: record, ctx: record] {
         if $env.LAST_EXIT_CODE != 0 { $phase_exit = 1 }
     }
     if $observe_state_paths { "stop" | save -f $observer_stop }
+    # The watcher reads both datadirs; it must exit before nodes stop and the next restore.
+    if $observer_job != null {
+        for _ in 0..<600 {
+            if ($observer_job not-in (job list | get id)) { break }
+            sleep 100ms
+        }
+        if ($observer_job in (job list | get id)) {
+            print "  Warning: state-path observer did not exit within 60s of its stop file; killing it"
+            job kill $observer_job
+        }
+    }
 
     if $tracy_capture_started {
         print "  Stopping validators before tracy-capture so Tracy can record graceful node shutdown..."
@@ -1783,8 +1799,8 @@ def "main e2e" [
     validate-schelk-state $E2E_A_STATE_PATH $E2E_B_STATE_PATH
     cleanup-local-e2e-processes
 
-    bench-restore-at $E2E_A_STATE_PATH $E2E_A_MOUNT $a_db
-    bench-restore-at $E2E_B_STATE_PATH $E2E_B_MOUNT $b_db
+    bench-restore-at --allow-missing $E2E_A_STATE_PATH $E2E_A_MOUNT $a_db
+    bench-restore-at --allow-missing $E2E_B_STATE_PATH $E2E_B_MOUNT $b_db
 
     let snapshots_ready = (e2e-snapshots-ready $a_db $b_db $isolated_roles)
     let should_init_snapshots = $force_bloat or (not $snapshots_ready)
@@ -2199,8 +2215,10 @@ def run-state-access-suite [plan_path: string] {
     if not ($checkpoint_tool | path exists) {
         error make {msg: "Build the read_finish_checkpoint example or set STATE_PATH_CHECKPOINT_TOOL before running this suite"}
     }
-    for side in [a b] {
-        let db = $"/reth-bench-($side)/tempo_e2e_($plan.configuration.fixture_requirements.bloat_mib)mb_state_access_isolated_roles_history_paths.virgin/db"
+    let fixture = $plan.configuration.fixture_requirements
+    for mount in [$E2E_A_MOUNT $E2E_B_MOUNT] {
+        # Must match the datadir naming in `main e2e` for --state-access-bloat --isolated-roles.
+        let db = $"($mount)/tempo_e2e_($fixture.bloat_mib)mb_state_access_isolated_roles_($fixture.snapshot_suffix).virgin/db"
         let checked = (run-external $checkpoint_tool $db | complete)
         if $checked.exit_code != 0 { error make {msg: $checked.stderr} }
         if ($checked.stdout | from json).block_number != 0 { error make {msg: "Prepared fixture is not at genesis"} }

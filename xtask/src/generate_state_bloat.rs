@@ -205,11 +205,13 @@ impl GenerateStateBloat {
             let chunk_indices: Vec<_> = chunk.collect();
             let chunk_len = chunk_indices.len();
 
-            // Derive addresses and compute slot bytes for this chunk only
-            let slot_bytes: Vec<[u8; 32]> = chunk_indices
+            // Derive addresses and compute slot bytes for this chunk only. Distinct
+            // keccak-signable ranges are derived per token below instead.
+            let shared_indices: &[usize] = if keccak_signable { &[] } else { &chunk_indices };
+            let slot_bytes: Vec<[u8; 32]> = shared_indices
                 .par_iter()
                 .map(|i| {
-                    let addr = if any_keccak_signable {
+                    let addr = if keccak_signable_shared {
                         derive_address_keccak_signable(&seed, *i as u64)
                     } else if *i < actual_signable {
                         let child = parent_key

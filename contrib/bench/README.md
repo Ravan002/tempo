@@ -17,7 +17,10 @@ archived binaries. It also indexes the supporting diagnostics and saved evidence
 - [Transaction-size controls](sload-size-isolation.md) and
   [latency calibration](state-access-latency.md): bounded transaction sizes,
   cancellation-aware wall time, and controlled prewarming comparisons.
-- [Completed results](../../bench-results/README.md): reports, structured data,
-  write-persistence diagnosis, and artifact provenance.
+- [Completed results](https://github.com/tempoxyz/tempo/blob/feat/payments-bloat-worst-case-results/bench-results/README.md): reports, structured data,
+  write-persistence diagnosis, and artifact provenance. Archived evidence lives on
+  the `feat/payments-bloat-worst-case-results` branch, not in this tree; paths
+  such as `bench-results/<run>` in these docs refer to that branch (or to new local
+  runs, which the harness writes to the ignored `bench-results/` directory).
 - [Benchmark dependency patches](patches/README.md): pinned txgen access-list
   support and the experimental Reth changes used by the recorded binaries.

@@ -200,12 +200,10 @@ impl ExecutionLayer for Arc<TempoFullNode> {
         &self,
         payload_id: PayloadId,
     ) -> impl Future<Output = Option<eyre::Result<TempoBuiltPayload>>> + Send + 'static {
-        // Register resolution eagerly so dropping even an unpolled future cancels the job.
-        let resolution = self
-            .payload_builder_handle
-            .resolve_kind(payload_id, PayloadKind::WaitForPending);
+        let builder = self.payload_builder_handle.clone();
         async move {
-            resolution
+            builder
+                .resolve_kind(payload_id, PayloadKind::WaitForPending)
                 .await
                 .map(|resolved| resolved.map_err(Into::into))
         }

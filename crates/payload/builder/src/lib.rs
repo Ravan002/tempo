@@ -171,6 +171,9 @@ pub struct TempoPayloadBuilderConfig {
     /// above `1.0` stop transaction execution earlier to leave room for
     /// `builder_finish`, which validators also repeat.
     pub build_time_multiplier: f64,
+    /// Whether to log the start and end of every pool transaction execution
+    /// attempt, including work later discarded by cancellation.
+    pub transaction_timing: bool,
 }
 
 impl TempoPayloadBuilderConfig {
@@ -509,9 +512,7 @@ where
             .record(pool_fetch_start.elapsed());
 
         let execution_start = Instant::now();
-        // Opt-in bench diagnostics include work discarded by proposal cancellation.
-        let time_transaction_attempts =
-            std::env::var("TEMPO_BENCH_TX_TIMING").is_ok_and(|value| value == "1");
+        let time_transaction_attempts = self.config.transaction_timing;
         let _block_fill_span = debug_span!(target: "payload_builder", "block_fill").entered();
         let mut skipped_oversized_block = false;
         let mut invalid_pool_transaction_execution_attempts = 0u64;
@@ -526,11 +527,7 @@ where
         let block_build_stop_reason = loop {
             check_cancel!();
 
-            if self
-                .config
-                .max_transactions
-                .is_some_and(|limit| pool_transactions_included as usize >= limit)
-            {
+            if transaction_limit_reached(self.config.max_transactions, pool_transactions_included) {
                 break BlockBuildStopReason::TransactionLimit;
             }
 
@@ -1217,6 +1214,11 @@ where
     }
 }
 
+/// Returns whether `included` pool transactions exhaust the optional per-payload limit.
+fn transaction_limit_reached(max_transactions: Option<usize>, included: u64) -> bool {
+    max_transactions.is_some_and(|limit| included >= limit as u64)
+}
+
 struct BalTaskHandle {
     msg_tx: mpsc::Sender<BalMessage>,
     bal_rx: mpsc::Receiver<(Bytes, B256)>,
@@ -1322,6 +1324,15 @@ pub(crate) struct RootsTaskResult {
 mod tests {
     use super::*;
     use alloy_primitives::Bytes;
+
+    #[test]
+    fn transaction_limit_counts_included_pool_transactions() {
+        assert!(!transaction_limit_reached(None, u64::MAX));
+        assert!(transaction_limit_reached(Some(0), 0));
+        assert!(!transaction_limit_reached(Some(900), 899));
+        assert!(transaction_limit_reached(Some(900), 900));
+        assert!(transaction_limit_reached(Some(900), 901));
+    }
 
     #[test]
     fn test_extra_data_flow_in_attributes() {

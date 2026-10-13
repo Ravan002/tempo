@@ -111,18 +111,22 @@ impl BestTransactionsPrewarming {
             let prewarm = ctx.prewarm.clone();
             scope.spawn(move |_| {
                 pool.broadcast(pool.current_num_threads(), |_| {
-                    if prewarm.is_stopped() {
-                        return;
-                    }
-                    let evm = prewarm.evm_for_ctx();
-                    if prewarm.is_stopped() {
-                        return;
-                    }
                     PREWARM_EVM.with_borrow_mut(|slot| {
-                        *slot = Some(ThreadPrewarmEvm {
-                            generation: prewarm.generation,
-                            evm,
-                        });
+                        // A prewarm job may already have initialized this thread lazily.
+                        if prewarm.is_stopped()
+                            || slot
+                                .as_ref()
+                                .is_some_and(|state| state.generation == prewarm.generation)
+                        {
+                            return;
+                        }
+                        let evm = prewarm.evm_for_ctx();
+                        if !prewarm.is_stopped() {
+                            *slot = Some(ThreadPrewarmEvm {
+                                generation: prewarm.generation,
+                                evm,
+                            });
+                        }
                     });
                 });
             });

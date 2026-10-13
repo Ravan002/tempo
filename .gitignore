@@ -8,7 +8,7 @@ scripts/data
 coverage/
 
 # Benchmarking artifacts
-# Selected reports under bench-results are explicitly tracked; raw runs stay local.
+# Local benchmark runs; archived evidence lives on the results branch.
 /bench-results/
 /minio/
 /tmp.*
