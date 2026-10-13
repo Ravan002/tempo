@@ -19,6 +19,8 @@
 //!    `active == true`.
 //! 2. The dealers and players as per the last DKG outcome.
 //!
+//! Configured top-of-block operators are added to the secondary peers.
+//!
 //! Because DKG ceremonies can fail, it happens that the DKG outcome contains
 //! validators that contain `active == false` in the contract. Therefore, the
 //! actor reads all entries in the contract to look up the egress and ingress
@@ -30,8 +32,9 @@ use std::sync::Arc;
 
 use commonware_consensus::types::{FixedEpocher, Height};
 use commonware_cryptography::ed25519::PublicKey;
-use commonware_p2p::AddressableManager;
+use commonware_p2p::{Address, AddressableManager};
 use commonware_runtime::{Clock, Metrics, Spawner};
+use commonware_utils::ordered;
 use futures::channel::mpsc;
 use reth_provider::{BlockIdReader as _, HeaderProvider as _};
 use tempo_node::TempoFullNode;
@@ -58,6 +61,9 @@ pub(crate) struct Config<TOracle, TExecutionNode> {
     /// Execution-layer-derived reads must not advance beyond this tip until
     /// marshal reports a newer finalized tip.
     pub(crate) finalized_tip: (Height, Digest),
+    /// Top-of-block operators, tracked as secondary peers so that they can
+    /// connect to this node. Validators never dial secondary peers.
+    pub(crate) top_of_block_operators: ordered::Map<PublicKey, Address>,
 }
 
 /// Initializes the actor and registers its first peers from available execution
