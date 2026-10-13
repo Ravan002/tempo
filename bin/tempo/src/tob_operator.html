@@ -50,7 +50,7 @@
 <main>
   <section class="stats">
     <div class="stat"><div class="v" id="genRate">–</div><div class="k">maker quotes signed / s (replaceable per maker)</div></div>
-    <div class="stat"><div class="v" id="streamRate">–</div><div class="k">quotes delivered to leaders / s (flush when the leader is known, then stream until it builds)</div></div>
+    <div class="stat"><div class="v" id="streamRate">–</div><div class="k">quotes delivered to leaders / s (flush when the leader is known, then stream until its lane closes)</div></div>
     <div class="stat"><div class="v" id="pubRate">–</div><div class="k">public high-tip txs / s (mempool)</div></div>
     <div class="stat"><div class="v" id="verified">–</div><div class="k">blocks with lane txs at index 0 (verified via another validator's RPC)</div></div>
   </section>
@@ -62,10 +62,10 @@
     <h2 style="margin-top:22px">How a round works</h2>
     <ol class="how">
       <li>The VRF picks the leader of view <i>v</i> from the certificate of view <i>v</i>−1. Validators broadcast that certificate to the operator too, so the operator verifies it and computes the leader itself, as early as the validators do. No validator announces anything.</li>
-      <li>The operator immediately flushes the latest quote of every maker to that leader over the authenticated top-of-block channel, then streams each new quote the moment it is signed, until the leader reports its block. The leader keeps submissions that arrive before its round starts.</li>
+      <li>The operator immediately flushes the latest quote of every maker to that leader over the authenticated top-of-block channel, then streams each new quote the moment it is signed, until the leader acks <span class="mono">Closed</span>. The leader keeps submissions that arrive before its round starts.</li>
       <li>A newer quote from a maker replaces its older one at the leader, keeping the maker's slot. Validators that do not lead receive nothing.</li>
       <li>After its start-of-block system work, the builder executes the lane first, then fills from the pool. Public transactions pay a far higher tip (<span id="tips"></span>) and still come after.</li>
-      <li>The dashboard reads every block back from a <i>different</i> validator's RPC and checks that the lane transactions are the block's first transactions.</li>
+      <li>The operator reads the lane transactions from the proposed block the leader broadcasts, then reads the block back from a <i>different</i> validator's RPC and checks that they are its first transactions.</li>
     </ol>
   </section>
 

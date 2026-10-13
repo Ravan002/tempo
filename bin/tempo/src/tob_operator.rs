@@ -135,7 +135,7 @@ struct ValidatorView {
 struct RoundView {
     epoch: u64,
     view: u64,
-    /// Height of the built block; known once the leader reports it.
+    /// Height of the proposed block; known once the leader broadcasts it.
     height: Option<u64>,
     leader: usize,
     /// Unix ms when the operator computed the leader from a certificate.
@@ -397,6 +397,7 @@ async fn run(
     let OperatorChannels {
         top_of_block: (mut sender, mut receiver),
         mut certificates,
+        mut proposals,
     } = top_of_block::start_operator_network(
         &context,
         OperatorNetwork {
@@ -479,6 +480,9 @@ async fn run(
     // Recently signed quotes, to map included hashes back to makers.
     let mut signed: HashMap<B256, (usize, u64)> = HashMap::new();
     let mut signed_order: VecDeque<B256> = VecDeque::new();
+    // Recently streamed hashes, to find the lane prefix of proposed blocks.
+    let mut streamed: HashSet<B256> = HashSet::new();
+    let mut streamed_order: VecDeque<B256> = VecDeque::new();
 
     println!(
         "operator up: {} makers at {} tx/s, public flow {} tx/s, dashboard on http://{}",
@@ -538,6 +542,57 @@ async fn run(
                 });
             }
 
+            message = proposals.recv() => {
+                let (peer, bytes) = message.map_err(|error| eyre::eyre!("{error}"))?;
+                let Some(block) = top_of_block::decode_proposal(bytes) else { continue };
+                let Some(context) = block.header().consensus_context else { continue };
+                // Only the proposer's own broadcast; others may forward it later.
+                if context.proposer.to_inner() != peer {
+                    continue;
+                }
+                let Some(&leader) = index_of.get(&peer) else { continue };
+                let (epoch, view) = (context.epoch, context.view);
+                let txs = &block.body().transactions;
+                // The lane executes first, so its transactions are the
+                // block's leading transactions that the operator streamed.
+                let top_of_block: Vec<B256> = txs
+                    .iter()
+                    .map(|tx| *tx.tx_hash())
+                    .take_while(|hash| streamed.contains(hash))
+                    .collect();
+                let included: HashSet<_> = top_of_block.iter().copied().collect();
+                latest.retain(|_, latest| !included.contains(&latest.hash));
+                for hash in &top_of_block {
+                    let Some(&(maker, nonce)) = signed.get(hash) else { continue };
+                    let state = &makers[maker];
+                    if state.nonce.fetch_max(nonce + 1, Ordering::Relaxed) <= nonce {
+                        state.bumped_at_ms.store(unix_ms(), Ordering::Relaxed);
+                    }
+                }
+                if let Some(target) = target.as_mut().filter(|target| (target.epoch, target.view) == (epoch, view)) {
+                    target.closed = true;
+                }
+                let proposed = Proposed {
+                    epoch,
+                    view,
+                    height: block.header().inner.number,
+                    block_hash: block.hash(),
+                    top_of_block,
+                };
+                let mut dashboard = dashboard.lock();
+                let Some(round) = find_round(&mut dashboard, epoch, view) else { continue };
+                if round.built.as_ref().is_some_and(|built| built.block_hash == proposed.block_hash) {
+                    continue;
+                }
+                round.height = Some(proposed.height);
+                round.built = Some(BuiltView {
+                    block_hash: proposed.block_hash,
+                    tx_count: txs.len() as u32,
+                    top_of_block: proposed.top_of_block.clone(),
+                });
+                let _ = verify_tx.send((leader, proposed));
+            }
+
             Some((epoch, loaded)) = leaders_rx.recv() => {
                 loading.remove(&epoch);
                 match loaded {
@@ -582,30 +637,6 @@ async fn run(
                             }
                         }
                     }
-                    Message::Built(built) => {
-                        let included: HashSet<_> = built.top_of_block.iter().copied().collect();
-                        latest.retain(|_, latest| !included.contains(&latest.hash));
-                        for hash in &built.top_of_block {
-                            let Some(&(maker, nonce)) = signed.get(hash) else { continue };
-                            let state = &makers[maker];
-                            if state.nonce.fetch_max(nonce + 1, Ordering::Relaxed) <= nonce {
-                                state.bumped_at_ms.store(unix_ms(), Ordering::Relaxed);
-                            }
-                        }
-                        if let Some(target) = target.as_mut().filter(|target| (target.epoch, target.view) == (built.epoch, built.view)) {
-                            target.closed = true;
-                        }
-                        let mut dashboard = dashboard.lock();
-                        if let Some(round) = find_round(&mut dashboard, built.epoch, built.view) {
-                            round.height = Some(built.height);
-                            round.built = Some(BuiltView {
-                                block_hash: built.block_hash,
-                                tx_count: built.tx_count,
-                                top_of_block: built.top_of_block.clone(),
-                            });
-                        }
-                        let _ = verify_tx.send((leader, built));
-                    }
                     Message::Submit(_) => {}
                 }
             }
@@ -643,6 +674,9 @@ async fn run(
                         last_seq.insert(slot, seq);
                         let entry = Latest { hash, raw, seq, expires_at_ms };
                         txs.push(entry.submit_tx());
+                        if streamed.insert(hash) {
+                            streamed_order.push_back(hash);
+                        }
                         latest.insert(slot, entry);
                         Ok(Accepted {
                             hash,
@@ -660,6 +694,11 @@ async fn run(
                 while signed_order.len() > 50_000 {
                     if let Some(hash) = signed_order.pop_front() {
                         signed.remove(&hash);
+                    }
+                }
+                while streamed_order.len() > 50_000 {
+                    if let Some(hash) = streamed_order.pop_front() {
+                        streamed.remove(&hash);
                     }
                 }
                 let mut streamed = 0;
@@ -879,10 +918,19 @@ async fn public_flow(
     }
 }
 
-/// Checks each built proposal against a different validator's view of the chain.
+/// A block proposed by a leader, read from the consensus broadcast.
+struct Proposed {
+    epoch: u64,
+    view: u64,
+    height: u64,
+    block_hash: B256,
+    top_of_block: Vec<B256>,
+}
+
+/// Checks each proposal against a different validator's view of the chain.
 async fn verify_blocks(
     providers: Vec<RootProvider>,
-    mut built_rx: tokio::sync::mpsc::UnboundedReceiver<(usize, top_of_block::wire::Built)>,
+    mut built_rx: tokio::sync::mpsc::UnboundedReceiver<(usize, Proposed)>,
     dashboard: Arc<Mutex<Dashboard>>,
     public_hashes: Arc<Mutex<HashSet<B256>>>,
 ) {
