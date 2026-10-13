@@ -11,7 +11,7 @@ use commonware_cryptography::ed25519::PublicKey;
 use commonware_p2p::{Receiver, Recipients, Sender};
 use commonware_runtime::{Clock, ContextCell, Handle, Spawner, spawn_cell};
 use futures::{StreamExt as _, channel::mpsc};
-use tempo_payload_types::{TopOfBlockLane, TopOfBlockSubmitError};
+use tempo_payload_types::{TopOfBlockLane, TopOfBlockSubmission, TopOfBlockSubmitError};
 use tempo_primitives::TempoTxEnvelope;
 use tracing::{debug, warn};
 
@@ -156,13 +156,13 @@ impl<TContext: Clock + Spawner> Actor<TContext> {
         let Submit {
             epoch,
             view,
-            seq,
+            id,
             txs,
         } = submit;
         let mut ack = Ack {
             epoch,
             view,
-            seq,
+            id,
             status: AckStatus::Ok,
             accepted: 0,
             replaced: 0,
@@ -177,12 +177,16 @@ impl<TContext: Clock + Spawner> Actor<TContext> {
 
         let submitted = txs.len();
         let txs: Vec<_> = txs
-            .iter()
-            .filter_map(|bytes| {
-                TempoTxEnvelope::decode_2718_exact(bytes)
-                    .ok()?
-                    .try_into_recovered()
-                    .ok()
+            .into_iter()
+            .filter_map(|submitted| {
+                Some(TopOfBlockSubmission {
+                    tx: TempoTxEnvelope::decode_2718_exact(&submitted.tx)
+                        .ok()?
+                        .try_into_recovered()
+                        .ok()?,
+                    seq: submitted.seq,
+                    expires_at_ms: submitted.expires_at_ms,
+                })
             })
             .collect();
         let malformed = (submitted - txs.len()) as u32;
@@ -203,7 +207,7 @@ impl<TContext: Clock + Spawner> Actor<TContext> {
                     %operator,
                     epoch,
                     view,
-                    seq,
+                    id,
                     accepted = ack.accepted,
                     replaced = ack.replaced,
                     rejected = ack.rejected,

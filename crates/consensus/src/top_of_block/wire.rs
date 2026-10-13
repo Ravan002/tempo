@@ -38,17 +38,28 @@ pub struct Leader {
 }
 
 /// Signed transactions for the lane of round `(epoch, view)`.
-///
-/// Each transaction replaces the previous transaction of its signer in the
-/// round.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Submit {
     pub epoch: u64,
     pub view: u64,
-    /// Operator-chosen sequence number echoed in the [`Ack`].
+    /// Operator-chosen identifier echoed in the [`Ack`].
+    pub id: u64,
+    pub txs: Vec<SubmitTx>,
+}
+
+/// One transaction in a [`Submit`].
+///
+/// It replaces the transaction in its slot (signer and nonce key) only if
+/// `seq` is higher than the slot's.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SubmitTx {
+    /// EIP-2718 encoded transaction.
+    pub tx: Bytes,
+    /// Replacement sequence within the transaction's slot.
     pub seq: u64,
-    /// EIP-2718 encoded transactions.
-    pub txs: Vec<Bytes>,
+    /// Unix time in milliseconds at which the transaction expires; zero never
+    /// expires. The leader drops it unless the block's timestamp is earlier.
+    pub expires_at_ms: u64,
 }
 
 /// The outcome of a [`Submit`].
@@ -70,12 +81,14 @@ pub enum AckStatus {
 pub struct Ack {
     pub epoch: u64,
     pub view: u64,
-    pub seq: u64,
+    /// The [`Submit::id`] this acknowledges.
+    pub id: u64,
     pub status: AckStatus,
     pub accepted: u32,
     pub replaced: u32,
     /// Transactions dropped because they did not decode or recover, exceeded
-    /// the operator's limits, or belong to a maker held by another operator.
+    /// the operator's limits, belong to a slot held by another operator, or
+    /// did not raise their slot's sequence.
     pub rejected: u32,
     /// Time between opening the lane and receiving the submission.
     pub since_open_us: u64,
@@ -122,19 +135,29 @@ impl Write for Message {
             Self::Submit(Submit {
                 epoch,
                 view,
-                seq,
+                id,
                 txs,
             }) => {
                 1u8.write(buf);
                 epoch.write(buf);
                 view.write(buf);
-                seq.write(buf);
-                txs.write(buf);
+                id.write(buf);
+                txs.len().write(buf);
+                for SubmitTx {
+                    tx,
+                    seq,
+                    expires_at_ms,
+                } in txs
+                {
+                    tx.write(buf);
+                    seq.write(buf);
+                    expires_at_ms.write(buf);
+                }
             }
             Self::Ack(Ack {
                 epoch,
                 view,
-                seq,
+                id,
                 status,
                 accepted,
                 replaced,
@@ -144,7 +167,7 @@ impl Write for Message {
                 2u8.write(buf);
                 epoch.write(buf);
                 view.write(buf);
-                seq.write(buf);
+                id.write(buf);
                 (*status as u8).write(buf);
                 accepted.write(buf);
                 replaced.write(buf);
@@ -178,7 +201,15 @@ impl EncodeSize for Message {
     fn encode_size(&self) -> usize {
         1 + match self {
             Self::Leader(_) => 8 * 4 + 32,
-            Self::Submit(submit) => 8 * 3 + submit.txs.encode_size(),
+            Self::Submit(submit) => {
+                8 * 3
+                    + submit.txs.len().encode_size()
+                    + submit
+                        .txs
+                        .iter()
+                        .map(|tx| tx.tx.encode_size() + 8 * 2)
+                        .sum::<usize>()
+            }
             Self::Ack(_) => 8 * 4 + 1 + 4 * 3,
             Self::Built(built) => {
                 8 * 3
@@ -203,22 +234,31 @@ impl Read for Message {
                 parent: read_b256(buf)?,
                 window_ms: u64::read(buf)?,
             })),
-            1 => Ok(Self::Submit(Submit {
-                epoch: u64::read(buf)?,
-                view: u64::read(buf)?,
-                seq: u64::read(buf)?,
-                txs: Vec::<Bytes>::read_cfg(
-                    buf,
-                    &(
-                        RangeCfg::from(..=MAX_TXS_PER_SUBMIT),
-                        RangeCfg::from(..=MAX_TX_BYTES),
-                    ),
-                )?,
-            })),
+            1 => {
+                let epoch = u64::read(buf)?;
+                let view = u64::read(buf)?;
+                let id = u64::read(buf)?;
+                let len = usize::read_cfg(buf, &RangeCfg::from(..=MAX_TXS_PER_SUBMIT))?;
+                let txs = (0..len)
+                    .map(|_| {
+                        Ok(SubmitTx {
+                            tx: Bytes::read_cfg(buf, &RangeCfg::from(..=MAX_TX_BYTES))?,
+                            seq: u64::read(buf)?,
+                            expires_at_ms: u64::read(buf)?,
+                        })
+                    })
+                    .collect::<Result<_, Error>>()?;
+                Ok(Self::Submit(Submit {
+                    epoch,
+                    view,
+                    id,
+                    txs,
+                }))
+            }
             2 => Ok(Self::Ack(Ack {
                 epoch: u64::read(buf)?,
                 view: u64::read(buf)?,
-                seq: u64::read(buf)?,
+                id: u64::read(buf)?,
                 status: match u8::read(buf)? {
                     0 => AckStatus::Ok,
                     1 => AckStatus::NotOpen,
@@ -272,13 +312,24 @@ mod tests {
             Message::Submit(Submit {
                 epoch: 1,
                 view: 2,
-                seq: 3,
-                txs: vec![Bytes::from_static(b"a"), Bytes::from_static(b"bc")],
+                id: 3,
+                txs: vec![
+                    SubmitTx {
+                        tx: Bytes::from_static(b"a"),
+                        seq: 4,
+                        expires_at_ms: 0,
+                    },
+                    SubmitTx {
+                        tx: Bytes::from_static(b"bc"),
+                        seq: 5,
+                        expires_at_ms: 6,
+                    },
+                ],
             }),
             Message::Ack(Ack {
                 epoch: 1,
                 view: 2,
-                seq: 3,
+                id: 3,
                 status: AckStatus::Closed,
                 accepted: 4,
                 replaced: 5,
