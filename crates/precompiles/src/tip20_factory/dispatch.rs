@@ -20,12 +20,6 @@ impl Precompile for TIP20Factory {
                     createToken_1(call) => mutate(call, msg_sender, |sender, c| self.create_token_with_logo(sender, c)),
                     isTIP20(call) => view(call, |c| self.is_tip20(c.token)),
                     getTokenAddress(call) => view(call, |c| self.get_token_address(c)),
-                    #[schedule(since = T14)]
-                    tokenStorageVersion(call) => view(call, |c| {
-                        self.token_storage_version(c.token).map(|version| version as u8)
-                    }),
-                    #[schedule(since = T14)]
-                    migrateTokenStorage(call) => mutate(call, msg_sender, |_, c| self.migrate_token_storage(&c.tokens)),
                 }
             },
         )
@@ -50,8 +44,8 @@ mod tests {
 
     #[test]
     fn tip20_factory_test_selector_coverage() {
-        // Use T14 so the T5-gated `createTokenWithLogo` and TIP-1145 selectors are active.
-        let mut storage = HashMapStorageProvider::new_with_spec(1, TempoHardfork::T14);
+        // Use T5 hardfork so T5-gated `createTokenWithLogo` selector is active.
+        let mut storage = HashMapStorageProvider::new_with_spec(1, TempoHardfork::T5);
 
         StorageCtx::enter(&mut storage, || {
             let mut factory = TIP20Factory::new();

@@ -3,21 +3,17 @@
 
 use super::*;
 use crate::{
-    PATH_USD_ADDRESS, TIP20_FACTORY_ADDRESS, TIP403_REGISTRY_ADDRESS,
+    PATH_USD_ADDRESS, TIP403_REGISTRY_ADDRESS,
     error::TempoPrecompileError,
     receive_policy_guard::{BLOCKED_RECEIPT_VERSION, IReceivePolicyGuard, InboundKind},
     storage::{StorageCtx, StorageKey, hashmap::HashMapStorageProvider},
     test_util::TIP20Setup,
-    tip20_factory::{TIP20FactoryError, TIP20FactoryEvent},
     tip403_registry::{
         MINT_RECIPIENT_FLAG, RECEIVE_CONFIG_KIND, RECEIVE_TOKEN_FLAG, RECIPIENT_FLAG,
         REJECT_ALL_POLICY_ID, SENDER_FLAG, tip403_registry_slots,
     },
 };
-use alloy::{
-    primitives::{IntoLogData, LogData},
-    sol_types::SolEvent,
-};
+use alloy::{primitives::LogData, sol_types::SolEvent};
 use tempo_contracts::precompiles::ITIP403Registry::{
     AuthRole as Role, BlockedReason, MembershipKind, PolicyMode,
 };
@@ -102,10 +98,6 @@ fn new_tokens_use_packed_layout_and_allow_all_policy() -> eyre::Result<()> {
         let address = token.address;
 
         assert!(token.is_packed()?);
-        assert_eq!(
-            TIP20Factory::new().token_storage_version(address)?,
-            StorageVersion::Packed
-        );
         assert_eq!(token.transfer_policy_id()?, TOKEN_POLICY_ID);
         assert_eq!(
             token.transfer_policy()?,
@@ -690,7 +682,7 @@ fn legacy_token(admin: Address, blocked: Address) -> Result<(TIP20Token, u64)> {
 }
 
 #[test]
-fn legacy_tokens_activate_then_convert() -> eyre::Result<()> {
+fn activation_converts_legacy_tokens() -> eyre::Result<()> {
     let mut storage = t14();
     let admin = Address::random();
     let (alice, blocked) = (Address::random(), Address::random());
@@ -708,22 +700,22 @@ fn legacy_tokens_activate_then_convert() -> eyre::Result<()> {
 
         // Preparing modes and memberships does not activate them.
         set_modes(admin, address, MODE_ALLOW, MODE_BLACKLIST, MODE_ALLOW)?;
-        assert_eq!(
-            word(address, slots::PAUSED),
-            U256::ZERO,
-            "legacy tokens get no cache"
-        );
+        assert_eq!(word(address, slots::PAUSED), U256::ZERO);
         assert_eq!(token.transfer_policy_id()?, policy_id);
         assert_eq!(
             token.transfer_policy().unwrap_err(),
             TIP20Error::invalid_transfer_policy_id().into()
         );
 
-        // Conversion skips tokens without an active token-specific policy.
-        let mut factory = TIP20Factory::new();
-        assert_eq!(factory.migrate_token_storage(&[address])?, U256::ZERO);
-
-        // Activation preserves the prepared policy; lists start empty, so `blocked` passes.
+        // Activation registers the prepared policy and packs storage, preserving logical values.
+        let before = (
+            token.currency()?,
+            token.quote_token()?,
+            token.next_quote_token()?,
+            token.total_supply()?,
+            token.supply_cap()?,
+            token.paused()?,
+        );
         TIP403Registry::new().clear_emitted_events();
         token.change_transfer_policy_id(
             admin,
@@ -743,6 +735,28 @@ fn legacy_tokens_activate_then_convert() -> eyre::Result<()> {
                 .encode_log_data()
             ]
         );
+        assert!(token.is_packed()?);
+        assert_eq!(
+            before,
+            (
+                token.currency()?,
+                token.quote_token()?,
+                token.next_quote_token()?,
+                token.total_supply()?,
+                token.supply_cap()?,
+                token.paused()?,
+            )
+        );
+        for slot in [
+            slots::CURRENCY,
+            slots::QUOTE_TOKEN,
+            slots::NEXT_QUOTE_TOKEN,
+            slots::SUPPLY_CAP,
+        ] {
+            assert_eq!(word(address, slot), U256::ZERO);
+        }
+
+        // Lists start empty, so `blocked` passes until it is listed.
         assert_eq!(token.transfer_policy_id()?, TOKEN_POLICY_ID);
         assert!(transfer(&mut token, alice, blocked, 1)?);
         add_members(admin, address, &[blocked], Role::RECIPIENT)?;
@@ -772,6 +786,12 @@ fn legacy_tokens_activate_then_convert() -> eyre::Result<()> {
             TIP403RegistryError::token_policy_ids_unsupported().into()
         );
 
+        // Activation clears the obsolete generic binding.
+        assert_eq!(
+            TIP403Registry::new().registered_token_transfer_policy_id(address)?,
+            None
+        );
+
         // Legacy binding migration skips token-specific tokens.
         assert_eq!(
             TIP403Registry::new().migrate_transfer_policy_ids(
@@ -782,54 +802,7 @@ fn legacy_tokens_activate_then_convert() -> eyre::Result<()> {
             U256::ZERO
         );
 
-        // Convert, preserving logical values exactly.
-        let before = (
-            token.currency()?,
-            token.quote_token()?,
-            token.next_quote_token()?,
-            token.total_supply()?,
-            token.supply_cap()?,
-            token.paused()?,
-        );
-        let invalid = Address::random();
-        assert_eq!(
-            factory.migrate_token_storage(&[invalid, address, address, PATH_USD_ADDRESS])?,
-            U256::ONE
-        );
-        assert!(token.is_packed()?);
-        assert_eq!(
-            factory.token_storage_version(address)?,
-            StorageVersion::Packed
-        );
-        assert_eq!(
-            before,
-            (
-                token.currency()?,
-                token.quote_token()?,
-                token.next_quote_token()?,
-                token.total_supply()?,
-                token.supply_cap()?,
-                token.paused()?,
-            )
-        );
-        for slot in [
-            slots::CURRENCY,
-            slots::QUOTE_TOKEN,
-            slots::NEXT_QUOTE_TOKEN,
-            slots::SUPPLY_CAP,
-        ] {
-            assert_eq!(word(address, slot), U256::ZERO);
-        }
-        assert_eq!(
-            StorageCtx.get_events(TIP20_FACTORY_ADDRESS).last(),
-            Some(&TIP20FactoryEvent::token_storage_migrated(address, 1).into_log_data())
-        );
-
-        // Packed tokens read cached modes and stay in sync with the registry.
-        assert_eq!(
-            transfer(&mut token, alice, blocked, 1).unwrap_err(),
-            forbids()
-        );
+        // Mode changes stay in sync with the packed cache.
         set_modes(admin, address, MODE_ALLOW, MODE_ALLOW, MODE_ALLOW)?;
         assert!(transfer(&mut token, alice, blocked, 1)?);
         assert_eq!(
@@ -841,42 +814,79 @@ fn legacy_tokens_activate_then_convert() -> eyre::Result<()> {
 }
 
 #[test]
-fn conversion_rejects_invalid_source_state() -> eyre::Result<()> {
+fn activation_rejects_unpackable_tokens_and_malformed_words() -> eyre::Result<()> {
     let mut storage = t14();
     let admin = Address::random();
 
     StorageCtx::enter(&mut storage, || {
-        let (mut token, _) = legacy_token(admin, Address::random())?;
+        let (mut token, policy_id) = legacy_token(admin, Address::random())?;
         let address = token.address;
-        token.change_transfer_policy_id(
-            admin,
-            ITIP20::changeTransferPolicyIdCall {
-                newPolicyId: TOKEN_POLICY_ID,
-            },
-        )?;
 
-        // A non-pathUSD null quote cannot be represented.
+        // A non-pathUSD null quote cannot be packed, so activation reverts atomically.
         StorageCtx.sstore(address, slots::QUOTE_TOKEN, U256::ZERO)?;
+        let activate = ITIP20::changeTransferPolicyIdCall {
+            newPolicyId: TOKEN_POLICY_ID,
+        };
         assert_eq!(
-            TIP20Factory::new()
-                .migrate_token_storage(&[address])
+            token
+                .change_transfer_policy_id(admin, activate)
                 .unwrap_err(),
-            TIP20FactoryError::invalid_storage_migration_state(address).into()
+            TIP20Error::invalid_quote_token().into()
         );
+        assert_eq!(token.transfer_policy_id()?, policy_id);
 
         // Malformed control words revert reads.
         StorageCtx.sstore(address, slots::PAUSED, U256::from(4))?;
-        assert_eq!(
+        assert!(matches!(
             token.paused().unwrap_err(),
-            TIP20FactoryError::invalid_storage_migration_state(address).into()
-        );
-        let not_a_token = Address::repeat_byte(0x11);
-        assert_eq!(
-            TIP20Factory::new()
-                .token_storage_version(not_a_token)
-                .unwrap_err(),
-            TIP20FactoryError::invalid_storage_migration_token(not_a_token).into()
-        );
+            TempoPrecompileError::Fatal(_)
+        ));
+        Ok(())
+    })
+}
+
+#[test]
+fn registry_mirrors_resolve_token_specific_policies() -> eyre::Result<()> {
+    let mut storage = t14();
+    let admin = Address::random();
+    let (alice, bob) = (Address::random(), Address::random());
+
+    StorageCtx::enter(&mut storage, || {
+        // A legacy-layout mirror (as zones create) without a registry binding.
+        TIP20Setup::path_usd(admin).apply()?;
+        let address = Address::new_tip20(0x1145);
+        let mut token = TIP20Token::from_address(address)?;
+        token.initialize_with_layout(
+            admin,
+            "Mirror",
+            "MIR",
+            "USD",
+            PATH_USD_ADDRESS,
+            admin,
+            false,
+        )?;
+        token.grant_role_internal(admin, ISSUER_ROLE)?;
+        token.resolve_policy_from_registry()?;
+        let mut registry = TIP403Registry::new();
+        registry.token_transfer_policies[address].delete()?;
+        assert!(!token.is_packed()?);
+
+        // No active token-specific policy: reject all.
+        assert_eq!(mint(&mut token, admin, alice, 10).unwrap_err(), forbids());
+
+        // The mirrored registry policy applies, including its lists.
+        registry.register_token_policy(
+            address,
+            TokenPolicy {
+                recipient: MODE_WHITELIST,
+                ..TokenPolicy::ALLOW_ALL
+            },
+        )?;
+        mint(&mut token, admin, alice, 10)?;
+        assert_eq!(transfer(&mut token, alice, bob, 1).unwrap_err(), forbids());
+        registry.token_user_flags[address][bob].write(RECIPIENT_FLAG)?;
+        assert!(transfer(&mut token, alice, bob, 1)?);
+        assert_eq!(token.transfer_policy_id()?, TOKEN_POLICY_ID);
         Ok(())
     })
 }

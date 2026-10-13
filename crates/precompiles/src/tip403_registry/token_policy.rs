@@ -209,10 +209,23 @@ impl TIP403Registry {
         )
     }
 
-    /// Activates the prepared policy of an existing token.
-    pub(crate) fn activate_token_policy(&mut self, token: Address) -> Result<()> {
-        let prepared = self.token_policies[token].read()?;
-        self.register_token_policy(token, prepared)
+    /// Returns the prepared policy of `token`, marked active.
+    pub(crate) fn prepared_token_policy(&self, token: Address) -> Result<TokenPolicy> {
+        Ok(TokenPolicy {
+            is_set: true,
+            ..self.token_policies[token].read()?
+        })
+    }
+
+    /// Activates `policy` for an existing token. Clears the obsolete generic binding, so registry
+    /// mirrors resolve the token-specific policy.
+    pub(crate) fn activate_token_policy(
+        &mut self,
+        token: Address,
+        policy: TokenPolicy,
+    ) -> Result<()> {
+        self.token_transfer_policies[token].delete()?;
+        self.register_token_policy(token, policy)
     }
 
     fn write_token_policy(&mut self, token: Address, policy: TokenPolicy) -> Result<()> {

@@ -7,12 +7,12 @@
 //!
 //! [TIP-1145]: <https://docs.tempo.xyz/protocol/tips/tip-1145>
 
-use super::{TIP20Token, U128_MAX, USD_CURRENCY, slots};
+use super::{TIP20Error, TIP20Token, U128_MAX, USD_CURRENCY, slots};
 use crate::{
     PATH_USD_ADDRESS,
     error::{Result, TempoPrecompileError},
     storage::{Handler, Slot},
-    tip20_factory::{TIP20Factory, TIP20FactoryError},
+    tip20_factory::TIP20Factory,
     tip403_registry::{TIP403Registry, TokenPolicy},
 };
 use alloy::primitives::{Address, FixedBytes, U256};
@@ -25,16 +25,6 @@ const PAUSED_FLAG: u8 = 0b01;
 const PACKED_FLAG: u8 = 0b10;
 /// Inline encoding of [`USD_CURRENCY`].
 const INLINE_USD: FixedBytes<14> = FixedBytes(*b"USD\0\0\0\0\0\0\0\0\0\0\0");
-
-/// TIP-20 storage layout version, as reported by `TIP20Factory.tokenStorageVersion`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum StorageVersion {
-    /// Original TIP-20 layout.
-    Legacy = 0,
-    /// TIP-1145 packed control and supply.
-    Packed = 1,
-}
 
 /// Slot-12 control word. The legacy `bool paused` word decodes as `flags` 0 or 1 with every other
 /// field zero.
@@ -120,14 +110,6 @@ impl TokenControl {
             .then(|| TokenPolicy::from_modes_byte(self.modes).expect("validated"))
     }
 
-    pub(crate) fn version(&self) -> StorageVersion {
-        if self.is_packed() {
-            StorageVersion::Packed
-        } else {
-            StorageVersion::Legacy
-        }
-    }
-
     /// Decodes a nonzero inline currency, returning `None` for non-canonical encodings.
     fn inline_currency(&self) -> Option<&str> {
         let len = self.currency.iter().rposition(|b| *b != 0)? + 1;
@@ -155,7 +137,7 @@ pub(crate) struct Supply {
 }
 
 fn invalid_state(token: Address) -> TempoPrecompileError {
-    TIP20FactoryError::invalid_storage_migration_state(token).into()
+    TempoPrecompileError::Fatal(format!("invalid TIP-1145 control word for token {token}"))
 }
 
 impl TIP20Token {
@@ -187,11 +169,6 @@ impl TIP20Token {
     #[cfg(test)]
     pub(crate) fn is_packed(&self) -> Result<bool> {
         Ok(self.token_control()?.is_some())
-    }
-
-    /// Returns the actual storage layout version.
-    pub(crate) fn storage_version(&self) -> Result<StorageVersion> {
-        Ok(self.load_control()?.version())
     }
 
     /// Writes the pause state, preserving the packed fields.
@@ -372,27 +349,26 @@ impl TIP20Token {
         Ok(true)
     }
 
-    /// Converts a legacy token with an active token-specific policy to the packed layout.
+    /// Converts a legacy token to the packed layout when it activates its token-specific policy.
     ///
     /// Reads every source field first, then clears obsolete words and writes supply before the
     /// control word, skipping unchanged writes. Logical values are preserved exactly.
     ///
     /// # Errors
-    /// - `InvalidStorageMigrationState` — a quote is null or undeployed, or supply exceeds 128 bits
+    /// - `InvalidQuoteToken` — a quote is null (non-pathUSD) or undeployed
+    /// - `SupplyCapExceeded` — supply or cap exceeds 128 bits
     pub(crate) fn convert_to_packed(&mut self, paused: bool, policy: &TokenPolicy) -> Result<()> {
-        let invalid = || invalid_state(self.address);
-
         let currency = self.currency.read()?;
         let quote_id = self
             .packable_quote_id(self.quote_token.read()?)?
-            .ok_or_else(invalid)?;
+            .ok_or_else(TIP20Error::invalid_quote_token)?;
         let next_quote_id = self
             .packable_quote_id(self.next_quote_token.read()?)?
-            .ok_or_else(invalid)?;
+            .ok_or_else(TIP20Error::invalid_quote_token)?;
         let total = self.total_supply.read()?;
         let cap = self.supply_cap.read()?;
         if total > U128_MAX || cap > U128_MAX {
-            return Err(invalid());
+            return Err(TIP20Error::supply_cap_exceeded().into());
         }
 
         let control =
@@ -447,10 +423,7 @@ mod tests {
         for paused in [false, true] {
             let legacy = TokenControl::default().with_paused(paused);
             assert_eq!(roundtrip(legacy), U256::from(u8::from(paused)));
-            assert_eq!(
-                legacy.validate(token).unwrap().version(),
-                StorageVersion::Legacy
-            );
+            assert!(!legacy.validate(token).unwrap().is_packed());
         }
 
         let control = TokenControl::new(&TokenPolicy::ALLOW_ALL, 1, 2, "USD").with_paused(true);

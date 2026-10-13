@@ -13,8 +13,6 @@ pub mod layout;
 pub mod rewards;
 pub mod roles;
 
-pub use layout::StorageVersion;
-
 pub use tempo_contracts::precompiles::{
     IRolesAuth, ITIP20, RolesAuthError, RolesAuthEvent, TIP20Error, TIP20Event, USD_CURRENCY,
 };
@@ -37,8 +35,8 @@ use crate::{
     },
     tip20_factory::TIP20Factory,
     tip403_registry::{
-        ALLOW_ALL_POLICY_ID, AuthRole, ITIP403Registry, TIP403Registry, TIP403RegistryError,
-        TOKEN_POLICY_ID, TokenPolicy,
+        ALLOW_ALL_POLICY_ID, AuthRole, ITIP403Registry, REJECT_ALL_POLICY_ID, TIP403Registry,
+        TIP403RegistryError, TOKEN_POLICY_ID, TokenPolicy,
     },
 };
 use alloy::{
@@ -242,23 +240,24 @@ impl TIP20Token {
 
     /// Resolves the active issuer policy. `control` may carry the already-loaded control word.
     ///
-    /// Packed tokens read their cached modes; (T14+) unconverted tokens check the registry for a
-    /// token-specific policy before falling back to the generic policy ID.
+    /// Token-specific policies always use the packed layout, so packed tokens read their cached
+    /// modes and legacy tokens use their generic policy ID. Registry-mirroring tokens (see
+    /// [`Self::resolve_policy_from_registry`]) resolve [`TOKEN_POLICY_ID`] through the registry.
     pub(crate) fn issuer_policy(&self, control: Option<&TokenControl>) -> Result<IssuerPolicy> {
-        if !self.storage.spec().is_t14() {
-            return self.generic_transfer_policy_id().map(IssuerPolicy::Generic);
-        }
         let cached = match control {
             Some(control) => control.policy(),
             None => self.token_control()?.and_then(|control| control.policy()),
         };
-        match cached {
-            Some(policy) => Ok(IssuerPolicy::TokenSpecific(policy)),
-            None => match TIP403Registry::new().active_token_policy(self.address)? {
-                Some(policy) => Ok(IssuerPolicy::TokenSpecific(policy)),
-                None => self.generic_transfer_policy_id().map(IssuerPolicy::Generic),
-            },
+        if let Some(policy) = cached {
+            return Ok(IssuerPolicy::TokenSpecific(policy));
         }
+        Ok(match self.generic_transfer_policy_id()? {
+            TOKEN_POLICY_ID => match TIP403Registry::new().active_token_policy(self.address)? {
+                Some(policy) => IssuerPolicy::TokenSpecific(policy),
+                None => IssuerPolicy::Generic(REJECT_ALL_POLICY_ID),
+            },
+            policy_id => IssuerPolicy::Generic(policy_id),
+        })
     }
 
     /// Returns the generic TIP-403 policy ID bound to this token.
@@ -281,6 +280,15 @@ impl TIP20Token {
     /// Clears the legacy TIP-20 policy slot after its value has moved to TIP-403.
     pub(crate) fn delete_legacy_transfer_policy_id(&mut self) -> Result<()> {
         self.transfer_policy_id.delete()
+    }
+
+    /// Makes a legacy token mirror an external registry: without a registry binding, its policy
+    /// resolves from the registry's token-specific policy, or rejects all if none is active.
+    ///
+    /// For environments whose TIP-403 state mirrors another chain (e.g. zones), where tokens keep
+    /// the legacy layout because a packed mode cache could not be synchronized.
+    pub fn resolve_policy_from_registry(&mut self) -> Result<()> {
+        self.transfer_policy_id.write(TOKEN_POLICY_ID)
     }
 
     /// Returns the PAUSE_ROLE constant
@@ -343,13 +351,16 @@ impl TIP20Token {
         self.check_role(msg_sender, DEFAULT_ADMIN_ROLE)?;
 
         // (T14+) TIP-1145 activation: the reserved ID permanently selects the prepared
-        // token-specific policy. Afterwards, generic policy IDs are unsupported.
+        // token-specific policy and converts the token to the packed layout. Afterwards, generic
+        // policy IDs are unsupported.
         if self.storage.spec().is_t14() {
-            let mut registry = TIP403Registry::new();
-            let is_token_specific = registry.active_token_policy(self.address)?.is_some();
+            let control = self.load_control()?;
             if call.newPolicyId == TOKEN_POLICY_ID {
-                if !is_token_specific {
-                    registry.activate_token_policy(self.address)?;
+                if !control.is_packed() {
+                    let mut registry = TIP403Registry::new();
+                    let policy = registry.prepared_token_policy(self.address)?;
+                    self.convert_to_packed(control.is_paused(), &policy)?;
+                    registry.activate_token_policy(self.address, policy)?;
                     self.emit_event(TIP20Event::transfer_policy_update(
                         msg_sender,
                         TOKEN_POLICY_ID,
@@ -357,7 +368,7 @@ impl TIP20Token {
                 }
                 return Ok(());
             }
-            if is_token_specific {
+            if control.is_packed() {
                 return Err(TIP403RegistryError::token_policy_ids_unsupported().into());
             }
         }
@@ -733,7 +744,7 @@ impl TIP20Token {
 
         // Check if the address is blocked from transferring (sender authorization)
         let policy = self.issuer_policy(control.as_ref())?;
-        if self.policy_allows(policy, owner, AuthRole::sender())? {
+        if self.policy_allows(&TIP403Registry::new(), policy, owner, AuthRole::sender())? {
             // Only allow burning from addresses that are blocked from transferring
             return Err(TIP20Error::policy_forbids().into());
         }
@@ -1354,7 +1365,7 @@ impl TIP20Token {
 
         // Authorize the resolved target using the role selected by the mint operation.
         let policy = self.issuer_policy(control.as_ref())?;
-        if !self.policy_allows(policy, to.target, recipient_role)? {
+        if !self.policy_allows(&TIP403Registry::new(), policy, to.target, recipient_role)? {
             return Err(TIP20Error::policy_forbids().into());
         }
 
@@ -1381,18 +1392,24 @@ impl TIP20Token {
         from: Address,
         to: Address,
     ) -> Result<bool> {
-        let sender_auth = self.policy_allows(policy, from, AuthRole::sender())?;
+        let registry = TIP403Registry::new();
+        let sender_auth = self.policy_allows(&registry, policy, from, AuthRole::sender())?;
         // (spec: +T2) short-circuit and skip recipient check if sender fails
         if self.storage.spec().is_t2() && !sender_auth {
             return Ok(false);
         }
-        Ok(self.policy_allows(policy, to, AuthRole::recipient())? && sender_auth)
+        Ok(self.policy_allows(&registry, policy, to, AuthRole::recipient())? && sender_auth)
     }
 
     /// Returns whether the resolved `policy` allows `user` in `role`. Callers resolve `policy` once
-    /// via [`Self::issuer_policy`], so repeated checks don't re-read the policy selection.
-    fn policy_allows(&self, policy: IssuerPolicy, user: Address, role: AuthRole) -> Result<bool> {
-        let registry = TIP403Registry::new();
+    /// via [`Self::issuer_policy`] and share one `registry` handle across repeated checks.
+    fn policy_allows(
+        &self,
+        registry: &TIP403Registry,
+        policy: IssuerPolicy,
+        user: Address,
+        role: AuthRole,
+    ) -> Result<bool> {
         match policy {
             IssuerPolicy::Generic(policy_id) => registry.is_authorized_as(policy_id, user, role),
             IssuerPolicy::TokenSpecific(policy) => {
@@ -1403,7 +1420,12 @@ impl TIP20Token {
 
     /// Returns whether `user` is authorized for `role` by the token's active issuer policy.
     pub fn is_authorized_as(&self, user: Address, role: AuthRole) -> Result<bool> {
-        self.policy_allows(self.issuer_policy(None)?, user, role)
+        self.policy_allows(
+            &TIP403Registry::new(),
+            self.issuer_policy(None)?,
+            user,
+            role,
+        )
     }
 
     /// Ensures the transfer is authorized by the token's [`TIP403Registry`] policy.
@@ -1443,8 +1465,9 @@ impl TIP20Token {
     /// - `PolicyForbids` — a user is not authorized for the requested role by the active transfer policy
     pub fn ensure_authorized_as(&self, user_auth: &[(Address, AuthRole)]) -> Result<()> {
         let policy = self.issuer_policy(None)?;
+        let registry = TIP403Registry::new();
         for &(user, role) in user_auth {
-            if !self.policy_allows(policy, user, role)? {
+            if !self.policy_allows(&registry, policy, user, role)? {
                 return Err(TIP20Error::policy_forbids().into());
             }
         }
@@ -1573,7 +1596,12 @@ impl TIP20Token {
             if let Some(addr) = recovery_mode.spending_account(recovery_auth) {
                 self.check_and_update_spending_limit(addr, amount)?;
             }
-        } else if !self.policy_allows(policy, destination.target, AuthRole::recipient())? {
+        } else if !self.policy_allows(
+            &TIP403Registry::new(),
+            policy,
+            destination.target,
+            AuthRole::recipient(),
+        )? {
             return Err(TIP20Error::policy_forbids().into());
         }
 

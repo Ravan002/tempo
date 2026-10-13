@@ -12,11 +12,10 @@ use tempo_precompiles_macros::contract;
 use crate::{
     PATH_USD_ADDRESS, TIP20_FACTORY_ADDRESS,
     error::{Result, TempoPrecompileError},
-    tip20::{StorageVersion, TIP20Error, TIP20Token, USD_CURRENCY},
-    tip403_registry::TIP403Registry,
+    tip20::{TIP20Error, TIP20Token, USD_CURRENCY},
 };
 use alloy::{
-    primitives::{Address, B256, U256, keccak256},
+    primitives::{Address, B256, keccak256},
     sol_types::SolValue,
 };
 use tempo_primitives::TempoAddressExt;
@@ -242,53 +241,6 @@ impl TIP20Factory {
         ))?;
 
         Ok(address)
-    }
-
-    /// Returns the actual TIP-1145 storage layout version of a deployed TIP-20.
-    ///
-    /// # Errors
-    /// - `InvalidStorageMigrationToken` — `token` lacks the TIP-20 prefix or has no code
-    /// - `InvalidStorageMigrationState` — the control word is malformed
-    pub fn token_storage_version(&self, token: Address) -> Result<StorageVersion> {
-        if !self.is_tip20(token)? {
-            return Err(TIP20FactoryError::invalid_storage_migration_token(token).into());
-        }
-        TIP20Token::from_address(token)?.storage_version()
-    }
-
-    /// Permissionlessly converts legacy tokens with an active token-specific policy to the
-    /// packed layout, in calldata order. Invalid addresses, packed tokens, and tokens without
-    /// token-specific policies are skipped. Returns the number of converted tokens.
-    ///
-    /// # Errors
-    /// - `InvalidStorageMigrationState` — an eligible token has invalid source state; the whole
-    ///   batch reverts
-    pub fn migrate_token_storage(&mut self, tokens: &[Address]) -> Result<U256> {
-        let registry = TIP403Registry::new();
-        let mut migrated = U256::ZERO;
-
-        for &token in tokens {
-            if !self.is_tip20(token)? {
-                continue;
-            }
-            let mut tip20 = TIP20Token::from_address(token)?;
-            let control = tip20.load_control()?;
-            if control.is_packed() {
-                continue;
-            }
-            let Some(policy) = registry.active_token_policy(token)? else {
-                continue;
-            };
-
-            tip20.convert_to_packed(control.is_paused(), &policy)?;
-            self.emit_event(TIP20FactoryEvent::token_storage_migrated(
-                token,
-                StorageVersion::Packed as u8,
-            ))?;
-            migrated += U256::ONE;
-        }
-
-        Ok(migrated)
     }
 }
 
