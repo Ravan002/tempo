@@ -7,11 +7,15 @@ use alloy_eips::BlockNumberOrTag;
 use eyre::WrapErr;
 use futures::{StreamExt, future::join_all, stream};
 use reth_e2e_test_utils::{receipt::PendingTransactionExt, wait::poll_until, wallet::test_signer};
-use std::env;
-use tempo_chainspec::constants::gas::{
-    TEMPO_T1_BASE_FEE, TEMPO_T7_BASE_FEE_FLOOR, tempo_t7_next_block_base_fee,
+use reth_rpc_eth_api::helpers::LoadFee;
+use std::{env, sync::Arc};
+use tempo_chainspec::{
+    TempoChainSpec,
+    constants::gas::{TEMPO_T1_BASE_FEE, TEMPO_T7_BASE_FEE_FLOOR, tempo_t7_next_block_base_fee},
 };
 use tempo_precompiles::{PATH_USD_ADDRESS, tip20::ITIP20};
+
+use crate::utils::tempo_test_setup;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_base_fee() -> eyre::Result<()> {
@@ -312,4 +316,27 @@ async fn test_t7_floor_transaction_queued_through_base_fee_spike() -> eyre::Resu
         parent_gas = block.gas_used();
     }
     panic!("base fee did not decay to the floor");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn gas_oracle_keeps_zero_tip_defaults() -> eyre::Result<()> {
+    let chain_spec = TempoChainSpec::from_genesis(serde_json::from_str(include_str!(
+        "../assets/test-genesis.json"
+    ))?);
+    let (node, _wallet) = tempo_test_setup(1, Arc::new(chain_spec))
+        .with_rpc_modifier(|mut rpc| {
+            // Model an SDK default that excludes zero- and one-wei tips.
+            rpc.gas_price_oracle.ignore_price = 2;
+            rpc
+        })
+        .build_single()
+        .await?;
+    let config = node.rpc.inner.eth_api().gas_oracle().config();
+    assert_eq!(config.ignore_price, Some(U256::ZERO));
+    assert_eq!(config.default_suggested_fee, Some(U256::ZERO));
+
+    let provider = ProviderBuilder::new().connect_http(node.rpc_url());
+    assert_eq!(provider.get_max_priority_fee_per_gas().await?, 0);
+
+    Ok(())
 }
