@@ -40,7 +40,7 @@ The original alias is retained separately as `requested_preset`; workload catego
 metadata describes the mix without changing historical transfer-only labels.
 
 `tip20-policy` isolates the successful policy-heavy payment case: pathUSD transfers
-to configured receivers in a disjoint account pool, paid in AlphaUSD through the FeeAMM, with expiring nonces.
+to configured receivers in a disjoint account pool, paid in AlphaUSD through the FeeAMM, with protocol nonces.
 It requires at least two selected tokens. Setup installs distinct blacklist leaves
 under a separate compound issuer policy per token and both receiver filters on legacy nodes; TIP-1145
 nodes use equivalent token-specific and receiver blacklist modes. Empty blacklists
