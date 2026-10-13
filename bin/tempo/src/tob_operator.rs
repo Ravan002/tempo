@@ -8,8 +8,8 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     net::SocketAddr,
     sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
+        Arc, OnceLock,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant, SystemTime},
 };
@@ -39,6 +39,9 @@ const BOOK: Address = address!("0x000000000000000000000000000000000000b00c");
 /// Stop streaming to a leader this long before its lane closes.
 const CUTOFF_MARGIN: Duration = Duration::from_millis(5);
 const ROUNDS_KEPT: usize = 40;
+const SUBMISSIONS_KEPT: usize = 50;
+/// A dashboard account is reused after its submission lands or after this long.
+const SUBMISSION_PENDING_MS: u64 = 15_000;
 
 #[derive(Debug, Parser)]
 #[command(name = "tempo-tob-operator", about = "Demo top-of-block operator")]
@@ -80,9 +83,16 @@ struct Args {
     /// Mnemonic index of the first maker account.
     #[arg(long, default_value_t = 10)]
     maker_offset: u32,
-    /// Mnemonic index of the first public-flow account.
-    #[arg(long, default_value_t = 200)]
+    /// Mnemonic index of the first public-flow account. Generated devnets fund
+    /// only the first 50 accounts.
+    #[arg(long, default_value_t = 30)]
     public_offset: u32,
+    /// Mnemonic index of the first account the dashboard's submit button signs with.
+    #[arg(long, default_value_t = 40)]
+    demo_offset: u32,
+    /// Number of dashboard accounts. Each holds one pending submission at a time.
+    #[arg(long, default_value_t = 8)]
+    demo_accounts: u32,
     /// Must be at least the validators' `--consensus.max-message-size-bytes`.
     #[arg(long, default_value_t = 16 * 1024 * 1024)]
     max_message_size: u32,
@@ -172,6 +182,33 @@ struct Verification {
     public_positions: Vec<usize>,
 }
 
+/// A transaction submitted from the dashboard or through `tempo_sendTobTransaction`.
+#[derive(Clone, Debug, Serialize)]
+struct SubmissionView {
+    hash: B256,
+    from: Address,
+    /// `dashboard` or `rpc`.
+    source: &'static str,
+    submitted_at_ms: u64,
+    /// Height of the proposal whose lane took the transaction.
+    proposed_height: Option<u64>,
+    inclusion: Option<Inclusion>,
+}
+
+/// Where a submitted transaction landed in a finalized block.
+#[derive(Clone, Debug, Serialize)]
+struct Inclusion {
+    block_number: u64,
+    block_hash: B256,
+    index: usize,
+    tx_count: usize,
+    /// Number of leading transactions of the block that came from the lane.
+    lane_len: usize,
+    /// Index of the first public high-tip transaction, if the block has one.
+    first_public: Option<usize>,
+    included_at_ms: u64,
+}
+
 #[derive(Default, Serialize)]
 struct Dashboard {
     operator: String,
@@ -189,6 +226,8 @@ struct Dashboard {
     streamed: u64,
     public_sent: u64,
     public_failed: u64,
+    /// Newest first.
+    submissions: VecDeque<SubmissionView>,
 }
 
 /// A maker's account. Its quotes are signed on its own thread; all quotes of
@@ -207,6 +246,9 @@ struct Quote {
     slot: (Address, U256),
     /// Maker index and nonce of quotes signed here, to track their nonces.
     maker: Option<(usize, u64)>,
+    /// Sent from the dashboard's submit button. Held for the next leader so it
+    /// opens that block instead of joining a lane that is already filling.
+    from_dashboard: bool,
     hash: B256,
     raw: Bytes,
     /// Replacement sequence within the slot; `None` takes the next one.
@@ -222,6 +264,8 @@ struct Latest {
     raw: Bytes,
     seq: u64,
     expires_at_ms: u64,
+    /// Submitted rather than signed by a maker; flushed to the leader first.
+    submitted: bool,
 }
 
 impl Latest {
@@ -251,6 +295,16 @@ struct Accepted {
     streamed_to: Option<usize>,
 }
 
+/// What the dashboard's handlers need once the operator is connected to the chain.
+struct Backend {
+    provider: RootProvider,
+    template: TxTemplate,
+    /// Accounts the dashboard's submit button signs with.
+    demo: Vec<PrivateKeySigner>,
+    next_demo: AtomicUsize,
+    public_hashes: Arc<Mutex<HashSet<B256>>>,
+}
+
 struct Target {
     leader: usize,
     epoch: u64,
@@ -277,10 +331,12 @@ async fn run(
         ..Default::default()
     }));
     let (quotes_tx, mut quotes_rx) = tokio::sync::mpsc::unbounded_channel::<Quote>();
+    let backend = Arc::new(OnceLock::<Backend>::new());
     tokio::spawn(serve_dashboard(
         args.http,
         dashboard.clone(),
         quotes_tx.clone(),
+        backend.clone(),
     ));
 
     let providers: Vec<RootProvider> = args
@@ -341,6 +397,19 @@ async fn run(
             .collect();
     }
     let public_hashes = Arc::new(Mutex::new(HashSet::<B256>::new()));
+    let _ = backend.set(Backend {
+        provider: providers[0].clone(),
+        template: TxTemplate {
+            chain_id,
+            max_fee,
+            maker_tip,
+        },
+        demo: (0..args.demo_accounts)
+            .map(|i| MnemonicBuilder::from_phrase_nth(&args.mnemonic, args.demo_offset + i))
+            .collect(),
+        next_demo: AtomicUsize::new(0),
+        public_hashes: public_hashes.clone(),
+    });
 
     let index_of: HashMap<_, _> = validators
         .iter()
@@ -401,6 +470,7 @@ async fn run(
                     .send(Quote {
                         slot: (maker.signer.address(), U256::ZERO),
                         maker: Some((index, nonce)),
+                        from_dashboard: false,
                         hash,
                         raw,
                         seq: None,
@@ -452,7 +522,11 @@ async fn run(
                         // Flush the latest transaction of every slot at once.
                         let now_ms = unix_ms();
                         latest.retain(|_, latest| !latest.expired(now_ms));
-                        let txs: Vec<_> = latest.values().map(Latest::submit_tx).collect();
+                        // The leader orders slots by arrival, so submitted
+                        // transactions go first and open the block.
+                        let mut flush: Vec<_> = latest.values().collect();
+                        flush.sort_by_key(|latest| !latest.submitted);
+                        let txs: Vec<_> = flush.into_iter().map(Latest::submit_tx).collect();
                         if !txs.is_empty() {
                             request_id += 1;
                             in_flight.insert(request_id, now);
@@ -507,6 +581,11 @@ async fn run(
                             }
                         }
                         let mut dashboard = dashboard.lock();
+                        for submission in &mut dashboard.submissions {
+                            if included.contains(&submission.hash) {
+                                submission.proposed_height = Some(built.height);
+                            }
+                        }
                         if let Some(round) = find_round(&mut dashboard, built.epoch, built.view) {
                             round.built = Some(BuiltView {
                                 block_hash: built.block_hash,
@@ -526,15 +605,19 @@ async fn run(
                     fresh.push(quote);
                 }
                 let generated = fresh.iter().filter(|quote| quote.maker.is_some()).count() as u64;
-                let received = fresh.len() as u64 - generated;
+                let received = fresh
+                    .iter()
+                    .filter(|quote| quote.maker.is_none() && !quote.from_dashboard)
+                    .count() as u64;
                 let lane = target
                     .as_ref()
                     .filter(|target| Instant::now() < target.cutoff)
                     .map(|target| target.leader);
                 let now_ms = unix_ms();
                 let mut txs = Vec::with_capacity(fresh.len());
+                let mut submissions = Vec::new();
                 for quote in fresh {
-                    let Quote { slot, maker, hash, raw, seq, expires_at_ms, reply } = quote;
+                    let Quote { slot, maker, from_dashboard, hash, raw, seq, expires_at_ms, reply } = quote;
                     // Quotes signed before a nonce bump are already stale.
                     if let Some((maker, nonce)) = maker {
                         if nonce < makers[maker].nonce.load(Ordering::Relaxed) {
@@ -551,16 +634,28 @@ async fn run(
                         Err("transaction already expired".to_string())
                     } else {
                         last_seq.insert(slot, seq);
-                        let entry = Latest { hash, raw, seq, expires_at_ms };
-                        txs.push(entry.submit_tx());
+                        let entry = Latest { hash, raw, seq, expires_at_ms, submitted: maker.is_none() };
+                        if !from_dashboard {
+                            txs.push(entry.submit_tx());
+                        }
                         latest.insert(slot, entry);
+                        if maker.is_none() {
+                            submissions.push(SubmissionView {
+                                hash,
+                                from: slot.0,
+                                source: if from_dashboard { "dashboard" } else { "rpc" },
+                                submitted_at_ms: now_ms,
+                                proposed_height: None,
+                                inclusion: None,
+                            });
+                        }
                         Ok(Accepted {
                             hash,
                             maker: slot.0,
                             nonce_key: slot.1,
                             seq,
                             expires_at: expires_at_ms,
-                            streamed_to: lane,
+                            streamed_to: lane.filter(|_| !from_dashboard),
                         })
                     };
                     if let Some(reply) = reply {
@@ -587,6 +682,10 @@ async fn run(
                 dashboard.generated += generated;
                 dashboard.rpc_received += received;
                 dashboard.streamed += streamed;
+                for submission in submissions {
+                    dashboard.submissions.push_front(submission);
+                }
+                dashboard.submissions.truncate(SUBMISSIONS_KEPT);
                 if let Some(current) = dashboard.current.as_mut() {
                     current.sent += streamed;
                 }
@@ -841,7 +940,7 @@ async fn verify_blocks(
                     }
                 })
                 .collect();
-            let public_positions = layout
+            let public_positions: Vec<_> = layout
                 .char_indices()
                 .filter(|(_, kind)| *kind == 'p')
                 .map(|(i, _)| i)
@@ -850,8 +949,28 @@ async fn verify_blocks(
             let prefix_ok = canonical
                 && txs.len() >= built.top_of_block.len()
                 && txs[..built.top_of_block.len()] == built.top_of_block[..];
+            let lane_len = txs.iter().take_while(|tx| top.contains(tx)).count();
+            let first_public = public_positions.first().copied();
             let mut dashboard = dashboard.lock();
             let dashboard = &mut *dashboard;
+            if canonical {
+                for submission in &mut dashboard.submissions {
+                    if submission.inclusion.is_some() {
+                        continue;
+                    }
+                    if let Some(index) = txs.iter().position(|tx| *tx == submission.hash) {
+                        submission.inclusion = Some(Inclusion {
+                            block_number: built.height,
+                            block_hash: built.block_hash,
+                            index,
+                            tx_count: txs.len(),
+                            lane_len,
+                            first_public,
+                            included_at_ms: unix_ms(),
+                        });
+                    }
+                }
+            }
             if let Some(round) = dashboard
                 .current
                 .iter_mut()
@@ -875,26 +994,65 @@ async fn serve_dashboard(
     address: SocketAddr,
     dashboard: Arc<Mutex<Dashboard>>,
     quotes: tokio::sync::mpsc::UnboundedSender<Quote>,
+    backend: Arc<OnceLock<Backend>>,
 ) -> eyre::Result<()> {
-    use axum::{Json, Router, response::Html, routing::get};
+    use axum::{
+        Json, Router,
+        extract::Path,
+        http::StatusCode,
+        response::Html,
+        routing::{get, post},
+    };
+    fn connected(backend: &OnceLock<Backend>) -> Result<&Backend, (StatusCode, String)> {
+        backend.get().ok_or((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "operator is still connecting to the validators".to_string(),
+        ))
+    }
     let app = Router::new()
         .route(
             "/",
-            get(|| async { Html(include_str!("tob_operator.html")) }).post(
+            get(|| async { Html(include_str!("tob_operator.html")) }).post({
+                let quotes = quotes.clone();
                 move |Json(request): Json<serde_json::Value>| {
                     let quotes = quotes.clone();
                     async move { Json(rpc(request, &quotes).await) }
-                },
-            ),
+                }
+            }),
         )
         .route(
             "/state",
-            get(move || {
+            get({
                 let dashboard = dashboard.clone();
-                async move {
-                    let dashboard = dashboard.lock();
-                    Json(serde_json::to_value(&*dashboard).unwrap_or_default())
+                move || {
+                    let dashboard = dashboard.clone();
+                    async move {
+                        let dashboard = dashboard.lock();
+                        Json(serde_json::to_value(&*dashboard).unwrap_or_default())
+                    }
                 }
+            }),
+        )
+        .route(
+            "/submit",
+            post({
+                let (backend, dashboard) = (backend.clone(), dashboard.clone());
+                move |Json(request): Json<serde_json::Value>| async move {
+                    let note = request["note"].as_str().unwrap_or_default();
+                    submit_from_dashboard(connected(&backend)?, &dashboard, &quotes, note)
+                        .await
+                        .map(Json)
+                        .map_err(|error| (StatusCode::BAD_REQUEST, error))
+                }
+            }),
+        )
+        .route(
+            "/block/{number}",
+            get(move |Path(number): Path<u64>| async move {
+                block_view(connected(&backend)?, &dashboard, number)
+                    .await
+                    .map(Json)
+                    .map_err(|error| (StatusCode::NOT_FOUND, error))
             }),
         );
     let listener = tokio::net::TcpListener::bind(address)
@@ -902,6 +1060,181 @@ async fn serve_dashboard(
         .wrap_err_with(|| format!("failed binding dashboard to {address}"))?;
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// Signs a zero-tip transaction from a dashboard account and queues it for the
+/// top of the next block.
+async fn submit_from_dashboard(
+    backend: &Backend,
+    dashboard: &Mutex<Dashboard>,
+    quotes: &tokio::sync::mpsc::UnboundedSender<Quote>,
+    note: &str,
+) -> Result<serde_json::Value, String> {
+    // An account holds a single lane slot, so pick one with nothing pending.
+    let busy: HashSet<Address> = dashboard
+        .lock()
+        .submissions
+        .iter()
+        .filter(|submission| {
+            submission.inclusion.is_none()
+                && unix_ms().saturating_sub(submission.submitted_at_ms) < SUBMISSION_PENDING_MS
+        })
+        .map(|submission| submission.from)
+        .collect();
+    let start = backend.next_demo.fetch_add(1, Ordering::Relaxed);
+    let signer = (0..backend.demo.len())
+        .map(|i| &backend.demo[(start + i) % backend.demo.len()])
+        .find(|signer| !busy.contains(&signer.address()))
+        .ok_or("every dashboard account has a pending submission, try again in a moment")?;
+    let nonce = backend
+        .provider
+        .get_transaction_count(signer.address())
+        .await
+        .map_err(|error| error.to_string())?;
+    let note = if note.is_empty() {
+        "hello from the top-of-block dashboard"
+    } else {
+        note
+    };
+    let TxTemplate {
+        chain_id,
+        max_fee,
+        maker_tip,
+    } = backend.template;
+    let tx = TxEip1559 {
+        chain_id,
+        nonce,
+        gas_limit: 300_000,
+        max_fee_per_gas: max_fee,
+        max_priority_fee_per_gas: maker_tip,
+        to: TxKind::Call(BOOK),
+        value: U256::ZERO,
+        input: Bytes::copy_from_slice(&note.as_bytes()[..note.len().min(256)]),
+        access_list: Default::default(),
+    };
+    let (hash, raw) = sign(signer, tx).map_err(|error| error.to_string())?;
+    let (reply, accepted) = tokio::sync::oneshot::channel();
+    quotes
+        .send(Quote {
+            slot: (signer.address(), U256::ZERO),
+            maker: None,
+            from_dashboard: true,
+            hash,
+            raw,
+            seq: None,
+            expires_at_ms: 0,
+            reply: Some(reply),
+        })
+        .map_err(|_| "operator is shutting down")?;
+    accepted
+        .await
+        .map_err(|_| "operator dropped the request")??;
+    Ok(serde_json::json!({ "hash": hash, "from": signer.address(), "nonce": nonce }))
+}
+
+/// A block with every transaction labelled by where it came from.
+async fn block_view(
+    backend: &Backend,
+    dashboard: &Mutex<Dashboard>,
+    number: u64,
+) -> Result<serde_json::Value, String> {
+    let tag = format!("{number:#x}");
+    let block: serde_json::Value = backend
+        .provider
+        .raw_request::<_, Option<serde_json::Value>>("eth_getBlockByNumber".into(), (&tag, true))
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("block {number} not found"))?;
+    let receipts: Vec<serde_json::Value> = backend
+        .provider
+        .raw_request::<_, Option<Vec<serde_json::Value>>>("eth_getBlockReceipts".into(), (&tag,))
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let hash: Option<B256> = block["hash"].as_str().and_then(|hash| hash.parse().ok());
+
+    // The operator knows the lane of recent rounds, and of blocks that hold a
+    // submission.
+    let (lane, lane_len, leader, submitted) = {
+        let dashboard = dashboard.lock();
+        let round = dashboard
+            .current
+            .iter()
+            .chain(&dashboard.rounds)
+            .find(|round| round.built.as_ref().map(|built| built.block_hash) == hash);
+        let lane: HashSet<B256> = round
+            .and_then(|round| round.built.as_ref())
+            .map(|built| built.top_of_block.iter().copied().collect())
+            .unwrap_or_default();
+        let lane_len = dashboard
+            .submissions
+            .iter()
+            .filter_map(|submission| submission.inclusion.as_ref())
+            .find(|inclusion| Some(inclusion.block_hash) == hash)
+            .map(|inclusion| inclusion.lane_len)
+            .unwrap_or_default();
+        let submitted: HashMap<B256, &'static str> = dashboard
+            .submissions
+            .iter()
+            .map(|submission| (submission.hash, submission.source))
+            .collect();
+        (lane, lane_len, round.map(|round| round.leader), submitted)
+    };
+    let public = backend.public_hashes.lock();
+    let quantity = |value: &serde_json::Value| {
+        value
+            .as_str()
+            .and_then(|value| u64::from_str_radix(value.trim_start_matches("0x"), 16).ok())
+    };
+    let txs: Vec<serde_json::Value> = block["transactions"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .enumerate()
+        .map(|(index, tx)| {
+            let tx_hash: Option<B256> = tx["hash"].as_str().and_then(|hash| hash.parse().ok());
+            let kind = match tx_hash {
+                Some(tx_hash) if submitted.contains_key(&tx_hash) => submitted[&tx_hash],
+                Some(tx_hash) if lane.contains(&tx_hash) || index < lane_len => "lane",
+                Some(tx_hash) if public.contains(&tx_hash) => "public",
+                _ => "other",
+            };
+            let input = tx["input"]
+                .as_str()
+                .and_then(|input| alloy_primitives::hex::decode(input).ok())
+                .and_then(|input| String::from_utf8(input).ok())
+                .filter(|text| !text.is_empty() && text.chars().all(|c| !c.is_control()));
+            let receipt = receipts.get(index);
+            serde_json::json!({
+                "index": index,
+                "hash": tx["hash"],
+                "from": tx["from"],
+                "to": tx["to"],
+                "nonce": quantity(&tx["nonce"]),
+                "tip": quantity(&tx["maxPriorityFeePerGas"]).or_else(|| quantity(&tx["gasPrice"])),
+                "kind": kind,
+                "note": input,
+                "status": receipt.and_then(|receipt| quantity(&receipt["status"])),
+                "gas_used": receipt.and_then(|receipt| quantity(&receipt["gasUsed"])),
+            })
+        })
+        .collect();
+    Ok(serde_json::json!({
+        "number": number,
+        "hash": block["hash"],
+        "parent_hash": block["parentHash"],
+        "timestamp": quantity(&block["timestamp"]),
+        "timestamp_ms": quantity(&block["timestampMillis"]),
+        "miner": block["miner"],
+        "gas_used": quantity(&block["gasUsed"]),
+        "gas_limit": quantity(&block["gasLimit"]),
+        "base_fee": quantity(&block["baseFeePerGas"]),
+        "leader": leader,
+        "lane_known": !lane.is_empty() || lane_len > 0,
+        "transactions": txs,
+    }))
 }
 
 /// Handles one JSON-RPC 2.0 request.
@@ -955,6 +1288,7 @@ async fn rpc(
     let quote = Quote {
         slot: tempo_payload_types::top_of_block_slot(&tx),
         maker: None,
+        from_dashboard: false,
         hash: *tx.tx_hash(),
         raw: raw.into(),
         seq,

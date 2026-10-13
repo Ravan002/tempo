@@ -40,6 +40,33 @@
   #current div .v { font-size: 16px; font-weight: 600; }
   .how { margin: 0; padding-left: 18px; color: var(--muted); font-size: 13px; }
   .how li { margin-bottom: 6px; }
+  .wide { grid-column: 1 / -1; }
+  .s { background: var(--mine); }
+  :root { --mine: #ff5fd2; }
+  a { color: var(--public); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  input, textarea { background: var(--bg); color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 7px 10px; font: inherit; }
+  #note { width: 360px; }
+  textarea { width: 100%; height: 64px; margin: 8px 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+  button { background: var(--mine); color: #1a0716; border: 0; border-radius: 6px; padding: 8px 14px; font: inherit; font-weight: 650; cursor: pointer; }
+  button.secondary { background: var(--line); color: var(--text); }
+  button:disabled { opacity: .5; cursor: default; }
+  details { margin-top: 10px; color: var(--muted); }
+  details summary { cursor: pointer; font-size: 13px; }
+  #sendMsg { margin-top: 8px; min-height: 20px; font-size: 13px; }
+  #summary { margin: 10px 0 4px; font-size: 13px; }
+  .badge { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 12px; font-weight: 650; background: #12361c; color: var(--ok); }
+  .modal { position: fixed; inset: 0; background: rgba(1, 4, 9, .78); display: flex; align-items: flex-start; justify-content: center; padding: 36px 20px; overflow: auto; z-index: 10; }
+  .modal.hidden { display: none; }
+  .modal .panel { width: min(1180px, 100%); }
+  .explorer-head { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; }
+  .explorer-head h3 { margin: 0; font-size: 20px; }
+  .banner { margin: 12px 0; padding: 10px 14px; border-radius: 8px; border: 1px solid var(--mine); background: #2b0f25; font-size: 14px; }
+  .meta { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px 14px; margin: 12px 0; }
+  .meta .k { color: var(--muted); font-size: 12px; }
+  tr.mine td { background: #2b0f25; }
+  .kind { font-size: 12px; }
 </style>
 </head>
 <body>
@@ -53,6 +80,27 @@
     <div class="stat"><div class="v" id="streamRate">–</div><div class="k">quotes delivered to leaders / s (stream while a lane is open + flush at announce)</div></div>
     <div class="stat"><div class="v" id="pubRate">–</div><div class="k">public high-tip txs / s (mempool)</div></div>
     <div class="stat"><div class="v" id="verified">–</div><div class="k">blocks with lane txs at index 0 (verified via another validator's RPC)</div></div>
+  </section>
+
+  <section class="panel wide">
+    <h2>Send a transaction through the lane</h2>
+    <div class="row">
+      <input id="note" maxlength="256" placeholder="calldata note (optional)">
+      <button id="send">Send top-of-block tx</button>
+      <span class="muted">Signed by a funded dashboard account with a <b>0 wei</b> tip and held for the next leader. Public txs pay <span id="tips2"></span>.</span>
+    </div>
+    <details>
+      <summary>…or send your own signed transaction with <span class="mono">tempo_sendTobTransaction</span></summary>
+      <textarea id="raw" placeholder="0x… (signed, EIP-2718 encoded)"></textarea>
+      <div class="row"><button id="sendRaw" class="secondary">Send raw tx</button>
+        <span class="mono" id="curl"></span></div>
+    </details>
+    <div id="sendMsg"></div>
+    <div id="summary" class="muted"></div>
+    <table>
+      <thead><tr><th>sent</th><th>tx</th><th>from</th><th>via</th><th>status</th><th>block</th><th>position in block</th></tr></thead>
+      <tbody id="submissions"></tbody>
+    </table>
   </section>
 
   <section class="panel">
@@ -78,6 +126,7 @@
     </table>
   </section>
 </main>
+<div id="explorer" class="modal hidden"><div class="panel" id="explorerBody"></div></div>
 <script>
 const colors = ["#ff7b72", "#d2a8ff", "#7ee787", "#79c0ff", "#ffa657", "#f778ba", "#a5d6ff"];
 let prev = null;
@@ -145,7 +194,7 @@ function rounds(state) {
         : `<span class="bad">✗ prefix mismatch</span>`;
     }
     return `<tr>
-      <td class="mono">${r.height}</td><td class="mono">${r.view}</td>
+      <td class="mono">${v && v.canonical ? `<a href="#block/${r.height}">${r.height}</a>` : r.height}</td><td class="mono">${r.view}</td>
       <td><span class="dot" style="background:${colors[r.leader % colors.length]}"></span>V${r.leader}</td>
       <td class="mono">${fmtUs(r.first_ack_rtt_us)}</td>
       <td class="mono">${r.first_since_open_us != null ? "+" + fmtUs(r.first_since_open_us) : "–"}</td>
@@ -154,6 +203,159 @@ function rounds(state) {
       <td>${verdict}</td></tr>`;
   }).join("");
 }
+
+// Hashes sent from this page; the explorer opens on the block of each once it lands.
+const mine = new Set();
+const opened = new Set();
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+function position(i) {
+  if (!i) return "";
+  const inLane = i.index < i.lane_len;
+  const parts = [`<b>index ${i.index}</b> of ${i.tx_count}`];
+  parts.push(inLane ? `<span class="badge">✓ top of block · lane [0..${i.lane_len})</span>` : `<span class="bad">outside the lane prefix [0..${i.lane_len})</span>`);
+  if (i.first_public != null) parts.push(`<span class="muted">first public high-tip tx @${i.first_public}</span>`);
+  return parts.join(" ");
+}
+
+function submissions(state) {
+  const now = Date.now();
+  const rows = state.submissions.map(s => {
+    const age = now - s.submitted_at_ms;
+    let status;
+    if (s.inclusion) status = `<span class="ok">✓ finalized</span>`;
+    else if (s.proposed_height != null && age > 6000) status = `<span class="bad">proposal not finalized, send again</span>`;
+    else if (s.proposed_height != null) status = `<span class="muted">in proposal #${s.proposed_height}…</span>`;
+    else if (age > 15000) status = `<span class="bad">not picked up</span>`;
+    else status = `<span class="muted">waiting for the next leader…</span>`;
+    const block = s.inclusion ? `<a href="#block/${s.inclusion.block_number}/${s.hash}">#${s.inclusion.block_number} →</a>` : "–";
+    return `<tr class="${mine.has(s.hash) ? "mine" : ""}">
+      <td class="mono">${new Date(s.submitted_at_ms).toLocaleTimeString()}</td>
+      <td class="mono" title="${s.hash}">${short(s.hash)}</td>
+      <td class="mono" title="${s.from}">${short(s.from)}</td>
+      <td>${s.source}</td><td>${status}</td><td class="mono">${block}</td><td>${position(s.inclusion)}</td></tr>`;
+  });
+  document.getElementById("submissions").innerHTML = rows.join("") || `<tr><td colspan="7" class="muted">nothing sent yet</td></tr>`;
+  const landed = state.submissions.filter(s => s.inclusion);
+  const top = landed.filter(s => s.inclusion.index < s.inclusion.lane_len);
+  const first = landed.filter(s => s.inclusion.index === 0);
+  document.getElementById("summary").innerHTML = landed.length
+    ? `<b>${top.length} / ${landed.length}</b> finalized submissions landed in the top-of-block lane, <b>${first.length}</b> at index 0.`
+    : "";
+  for (const s of landed) {
+    if (mine.has(s.hash) && !opened.has(s.hash)) {
+      opened.add(s.hash);
+      location.hash = `block/${s.inclusion.block_number}/${s.hash}`;
+    }
+  }
+}
+
+async function send() {
+  const button = document.getElementById("send");
+  const msg = document.getElementById("sendMsg");
+  button.disabled = true;
+  try {
+    const response = await fetch("submit", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ note: document.getElementById("note").value }) });
+    if (!response.ok) throw new Error(await response.text());
+    const result = await response.json();
+    mine.add(result.hash);
+    msg.innerHTML = `Queued <span class="mono">${result.hash}</span> from <span class="mono">${short(result.from)}</span> (nonce ${result.nonce}) for the next leader. The block opens here once it is finalized.`;
+  } catch (e) {
+    msg.innerHTML = `<span class="bad">${esc(e.message)}</span>`;
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function sendRaw() {
+  const msg = document.getElementById("sendMsg");
+  const raw = document.getElementById("raw").value.trim();
+  try {
+    const response = await fetch(".", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tempo_sendTobTransaction", params: [raw] }) });
+    const result = await response.json();
+    if (result.error) throw new Error(result.error.message);
+    mine.add(result.result.hash);
+    msg.innerHTML = `Accepted <span class="mono">${result.result.hash}</span> (slot seq ${result.result.seq}${result.result.streamedTo != null ? `, streamed to V${result.result.streamedTo}` : ", held for the next leader"}).`;
+  } catch (e) {
+    msg.innerHTML = `<span class="bad">${esc(e.message)}</span>`;
+  }
+}
+
+const kindLabel = { dashboard: "your tx (dashboard)", rpc: "your tx (rpc)", lane: "operator lane", public: "public high tip", other: "other" };
+const kindClass = { dashboard: "s", rpc: "s", lane: "t", public: "p", other: "o" };
+
+async function explorer() {
+  const modal = document.getElementById("explorer");
+  const body = document.getElementById("explorerBody");
+  const match = location.hash.match(/^#block\/(\d+)(?:\/(0x[0-9a-fA-F]+))?/);
+  if (!match) { modal.classList.add("hidden"); return; }
+  const [, number, focus] = match;
+  modal.classList.remove("hidden");
+  body.innerHTML = `<div class="muted">loading block ${number}…</div>`;
+  try {
+    const response = await fetch(`block/${number}`);
+    if (!response.ok) throw new Error(await response.text());
+    const b = await response.json();
+    const txs = b.transactions;
+    const laneLen = txs.findIndex(t => !["lane", "dashboard", "rpc"].includes(t.kind));
+    const prefix = laneLen === -1 ? txs.length : laneLen;
+    const focused = txs.find(t => focus && t.hash && t.hash.toLowerCase() === focus.toLowerCase());
+    const publicTxs = txs.filter(t => t.kind === "public");
+    const maxPublicTip = publicTxs.reduce((m, t) => Math.max(m, t.tip || 0), 0);
+    let banner = "";
+    if (focused) {
+      const inLane = focused.index < prefix;
+      banner = `<div class="banner">Your transaction <span class="mono">${short(focused.hash)}</span> is at <b>index ${focused.index}</b> of ${txs.length}
+        ${inLane ? `— inside the top-of-block lane [0..${prefix})` : `— <span class="bad">outside the lane prefix</span>`},
+        with a <b>${focused.tip ?? 0} wei</b> tip, ahead of ${publicTxs.length} public txs paying up to ${maxPublicTip.toLocaleString()} wei.
+        ${focused.status === 1 ? `<span class="ok">Executed successfully.</span>` : focused.status === 0 ? `<span class="bad">Reverted.</span>` : ""}</div>`;
+    }
+    const time = b.timestamp_ms ? new Date(b.timestamp_ms) : b.timestamp ? new Date(b.timestamp * 1000) : null;
+    const cells = txs.slice(0, 200).map(t => `<i class="cell ${kindClass[t.kind]}" title="#${t.index} ${kindLabel[t.kind]}"></i>`).join("");
+    body.innerHTML = `
+      <div class="explorer-head">
+        <h3>Block #${b.number}</h3>
+        <a href="#block/${b.number - 1}">← #${b.number - 1}</a>
+        <a href="#block/${b.number + 1}">#${b.number + 1} →</a>
+        <span style="flex:1"></span>
+        <button class="secondary" onclick="explorer()">refresh</button>
+        <button class="secondary" onclick="location.hash=''">close</button>
+      </div>
+      ${banner}
+      <div class="meta">
+        <div><div class="k">hash</div><div class="mono" title="${b.hash}">${short(b.hash)}</div></div>
+        <div><div class="k">time</div><div>${time ? time.toLocaleTimeString() + (b.timestamp_ms ? "." + String(b.timestamp_ms % 1000).padStart(3, "0") : "") : "–"}</div></div>
+        <div><div class="k">proposer</div><div>${b.leader != null ? `<span class="dot" style="background:${colors[b.leader % colors.length]}"></span>V${b.leader} · ` : ""}<span class="mono">${short(b.miner)}</span></div></div>
+        <div><div class="k">transactions · gas used</div><div>${txs.length} · ${(b.gas_used ?? 0).toLocaleString()}</div></div>
+      </div>
+      <div class="legend"><span><i class="cell s"></i>your tx</span><span><i class="cell t"></i>operator lane (tip 0)</span><span><i class="cell p"></i>public (high tip)</span><span><i class="cell o"></i>other</span>
+        ${b.lane_known ? "" : `<span>lane membership unknown for this block (older than the operator's history)</span>`}</div>
+      <div class="bar" style="max-width:none;margin:8px 0 14px">${cells}</div>
+      <table>
+        <thead><tr><th>#</th><th>kind</th><th>hash</th><th>from</th><th>to</th><th>tip (wei)</th><th>gas used</th><th>status</th><th>note</th></tr></thead>
+        <tbody>${txs.map(t => `<tr class="${focused && t === focused ? "mine" : ""}">
+          <td class="mono">${t.index}</td>
+          <td class="kind"><i class="cell ${kindClass[t.kind]}" style="display:inline-block;vertical-align:-2px;margin-right:6px"></i>${kindLabel[t.kind]}</td>
+          <td class="mono" title="${t.hash}">${short(t.hash)}</td>
+          <td class="mono" title="${t.from}">${short(t.from)}</td>
+          <td class="mono" title="${t.to ?? ""}">${short(t.to) || "–"}</td>
+          <td class="mono">${(t.tip ?? 0).toLocaleString()}</td>
+          <td class="mono">${(t.gas_used ?? 0).toLocaleString()}</td>
+          <td>${t.status === 1 ? `<span class="ok">ok</span>` : t.status === 0 ? `<span class="bad">reverted</span>` : "–"}</td>
+          <td>${esc(t.note ?? "")}</td></tr>`).join("")}</tbody>
+      </table>`;
+  } catch (e) {
+    body.innerHTML = `<div class="explorer-head"><h3>Block #${number}</h3><span style="flex:1"></span><button class="secondary" onclick="location.hash=''">close</button></div><p class="bad">${esc(e.message)}</p>`;
+  }
+}
+
+document.getElementById("send").onclick = send;
+document.getElementById("sendRaw").onclick = sendRaw;
+document.getElementById("curl").textContent = `curl -X POST ${location.origin}/ -H 'content-type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"tempo_sendTobTransaction","params":["0x…"]}'`;
+document.getElementById("explorer").onclick = e => { if (e.target.id === "explorer") location.hash = ""; };
+document.addEventListener("keydown", e => { if (e.key === "Escape") location.hash = ""; });
+window.addEventListener("hashchange", explorer);
+explorer();
 
 async function tick() {
   try {
@@ -172,7 +374,8 @@ async function tick() {
     document.getElementById("operator").textContent = short(state.operator);
     document.getElementById("rpc").textContent = state.rpc_received.toLocaleString();
     document.getElementById("tips").textContent = `${state.public_tip_wei.toLocaleString()} wei vs ${state.maker_tip_wei} wei`;
-    topology(state); current(state); rounds(state);
+    document.getElementById("tips2").textContent = `${state.public_tip_wei.toLocaleString()} wei`;
+    topology(state); current(state); rounds(state); submissions(state);
   } catch (e) { console.error(e); }
 }
 setInterval(tick, 250);
