@@ -982,7 +982,11 @@ def txgen-run-preset-pipeline [
     let bench_cmd = $bench_cmd | append "--skip-setup"
     let bench_cmd = if $is_vault { $bench_cmd | append ["--drain-timeout" "300"] } else { $bench_cmd }
     let bench_cmd_str = (txgen-shell-join $bench_cmd)
-    let pipeline = $"set -euo pipefail; ($bench_env_export)ulimit -Sn unlimited && ($txgen_cmd_str) | ($bench_cmd_str)"
+    let policy_transactions = $"($report_path).transactions.ndjson"
+    let capture_policy = if $preset_name == "tip20-policy" {
+        $"tee (txgen-shell-quote $policy_transactions) | "
+    } else { "" }
+    let pipeline = $"set -euo pipefail; ($bench_env_export)ulimit -Sn unlimited && ($txgen_cmd_str) | ($capture_policy)($bench_cmd_str)"
 
     let setup_state_args = ["--setup-state-out" $setup_state_path]
     let txgen_setup_cmd_str = (txgen-shell-join ($txgen_setup_cmd | append $workload_extra_args | append $setup_state_args))
@@ -1023,10 +1027,19 @@ def txgen-run-preset-pipeline [
         print $"ERROR: ($preset_name) workload contains sender failures; see ($report_path)"
         return { ok: false, exit_code: 1, report_path: $report_path }
     }
-    if $check_receipts {
+    if $preset_name == "tip20-policy" {
+        let verifier = ([(txgen-repo-root) "contrib/bench/txgen/verify-policy-receipts.py"] | path join)
+        let verification = (uv run --no-project $verifier $generate_rpc_url $policy_transactions $report_path $workload_start_block | complete)
+        if $verification.stdout != "" { print $verification.stdout }
+        if $verification.stderr != "" { print $verification.stderr }
+        if $verification.exit_code != 0 {
+            return { ok: false, exit_code: $verification.exit_code, report_path: $report_path }
+        }
+    }
+    if $is_vault {
         # Check block receipts after bench drains the pool, without polling every transaction.
         let report = (open $report_path)
-        let expected = if $is_vault { $tx_count } else { $report.sent }
+        let expected = $tx_count
         let deadline = (date now) + 60sec
         mut next_block = $workload_start_block + 1
         mut included = 0
