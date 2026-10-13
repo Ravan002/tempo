@@ -30,4 +30,6 @@ assert equal (txgen-workload-metadata-args $default.scenario_id $default.spec_pa
 for preset in [tip20 tip20_existing_recipients mix dex mpp neobank-deposit neobank-swap neobank-withdraw zones vault-deposit vault-withdraw] {
     assert equal (txgen-workload-metadata-args $preset "") ["-m" "workload_mix_weighting=gas"]
 }
+# Nodes without TIP-1145 (failed `tokenPolicy` probe) keep the spec unchanged.
+assert equal (txgen-prepare-tip1145-activation $default.spec_path "http://127.0.0.1:1" 4) $default.spec_path
 print "Preset alias, transfer compatibility, state-bloat setup, and workload metadata checks passed"
