@@ -20,32 +20,34 @@ fn sign_recover(hash: B256, signature: Vec<u8>) -> Result<Address> {
 #[test]
 fn keychain_verification_rejects_multisig() -> eyre::Result<()> {
     let account = Address::repeat_byte(1);
-    let multisig = MultisigSignature::try_new(
-        Address::repeat_byte(2),
-        MultisigConfig {
-            salt: B256::ZERO,
-            version: 1,
-            threshold: 1,
-            owners: vec![MultisigOwner {
-                owner: Address::repeat_byte(3),
-                weight: 1,
-            }],
-        },
-        vec![PrimitiveSignature::Secp256k1(Signature::test_signature())],
-    )
-    .unwrap();
-    let signature = TempoSignature::Keychain(KeychainSignature::new(account, multisig));
     let mut storage = HashMapStorageProvider::new_with_spec(1, TempoHardfork::T14);
     StorageCtx::enter(&mut storage, || {
-        let verifier = SignatureVerifier::new();
-        for result in [
-            verifier.verify_keychain(account, B256::ZERO, signature.to_bytes()),
-            verifier.verify_keychain_admin(account, B256::ZERO, signature.to_bytes()),
-        ] {
-            assert_eq!(
-                result.unwrap_err(),
-                SignatureVerifierError::invalid_format().into()
-            );
+        for claimed_account in [Address::repeat_byte(2), account] {
+            let multisig = MultisigSignature::try_new(
+                claimed_account,
+                MultisigConfig {
+                    salt: B256::ZERO,
+                    version: 1,
+                    threshold: 1,
+                    owners: vec![MultisigOwner {
+                        owner: Address::repeat_byte(3),
+                        weight: 1,
+                    }],
+                },
+                vec![PrimitiveSignature::Secp256k1(Signature::test_signature())],
+            )
+            .unwrap();
+            let signature = TempoSignature::Keychain(KeychainSignature::new(account, multisig));
+            let verifier = SignatureVerifier::new();
+            for result in [
+                verifier.verify_keychain(account, B256::ZERO, signature.to_bytes()),
+                verifier.verify_keychain_admin(account, B256::ZERO, signature.to_bytes()),
+            ] {
+                assert_eq!(
+                    result.unwrap_err(),
+                    SignatureVerifierError::invalid_format().into()
+                );
+            }
         }
         Ok(())
     })
