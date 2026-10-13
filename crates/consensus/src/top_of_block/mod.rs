@@ -1,8 +1,11 @@
 //! Privileged top-of-block access for designated operators.
 //!
-//! Operators are authenticated commonware peers listed in a registry file
-//! (`--consensus.top-of-block-operators`). Validators track them as secondary
-//! peers: operators dial validators, validators never dial operators.
+//! Operators are authenticated commonware peers listed in the Ownable
+//! `TopOfBlockRegistry` contract (`--consensus.top-of-block-registry`). The
+//! peer manager reads the registry from the latest finalized state, so every
+//! validator sees the same operators at the same height. Validators track
+//! operators as secondary peers: operators dial validators, validators never
+//! dial operators.
 //!
 //! The flow for one round:
 //!
@@ -41,7 +44,7 @@ use governor::Quota;
 use tempo_payload_types::TopOfBlockLane;
 
 pub(crate) use actor::{Actor, Mailbox};
-pub use registry::{OperatorPolicy, Registry};
+pub use registry::{OperatorPolicy, Registry, RegistryHandle};
 
 /// The p2p channel for top-of-block messages.
 pub const CHANNEL: commonware_p2p::Channel = 6;
@@ -54,7 +57,10 @@ pub const LIMIT: Quota = Quota::per_second(std::num::NonZeroU32::new(2048).expec
 
 /// Validator-side configuration.
 pub struct Config {
-    pub registry: Registry,
+    /// Address of the `TopOfBlockRegistry` contract.
+    pub registry_address: alloy_primitives::Address,
+    /// The registry as last read by the peer manager.
+    pub registry: RegistryHandle,
     /// The lane of the execution node's payload builder.
     pub lane: TopOfBlockLane,
 }

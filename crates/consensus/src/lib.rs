@@ -67,12 +67,10 @@ pub async fn run_consensus_stack(
     config.validate_simplex_timing()?;
 
     let top_of_block = config
-        .top_of_block_operators
-        .as_deref()
-        .map(top_of_block::Registry::load)
-        .transpose()?
-        .map(|registry| top_of_block::Config {
-            registry,
+        .top_of_block_registry
+        .map(|registry_address| top_of_block::Config {
+            registry_address,
+            registry: Default::default(),
             lane: top_of_block_lane,
         });
 

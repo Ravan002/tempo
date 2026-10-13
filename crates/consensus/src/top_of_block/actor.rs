@@ -1,6 +1,6 @@
 //! The validator side of the top-of-block channel.
 
-use std::{collections::HashSet, sync::Arc};
+use std::{collections::HashSet, time::SystemTime};
 
 use alloy_consensus::transaction::{SignerRecoverable as _, TxHashRef as _};
 use alloy_eips::eip2718::Decodable2718 as _;
@@ -16,7 +16,7 @@ use tempo_primitives::TempoTxEnvelope;
 use tracing::{debug, warn};
 
 use super::{
-    Config, Registry,
+    Config, RegistryHandle,
     wire::{Ack, AckStatus, Built, Leader, Message, Submit},
 };
 use crate::{
@@ -26,11 +26,11 @@ use crate::{
 
 pub(super) fn init<TContext>(context: TContext, config: Config) -> (Actor<TContext>, Mailbox) {
     let (tx, rx) = mpsc::unbounded();
-    let registry = Arc::new(config.registry);
+    let registry = config.registry;
     let mailbox = Mailbox {
         tx,
         lane: config.lane.clone(),
-        window: registry.window,
+        registry: registry.clone(),
     };
     let actor = Actor {
         context: ContextCell::new(context),
@@ -46,21 +46,28 @@ pub(super) fn init<TContext>(context: TContext, config: Config) -> (Actor<TConte
 pub(crate) struct Mailbox {
     tx: mpsc::UnboundedSender<Message>,
     lane: TopOfBlockLane,
-    window: std::time::Duration,
+    registry: RegistryHandle,
 }
 
 impl Mailbox {
     /// Opens the lane for `round`, in which this node builds the block at
     /// `height` on `parent`, and announces it to the operators.
+    ///
+    /// Does nothing if the registry has no active operators or a zero window,
+    /// so the builder does not wait.
     pub(crate) fn open(&self, round: Round, height: u64, parent: Digest) {
+        let registry = self.registry.get();
+        if registry.window.is_zero() || registry.active(SystemTime::now()).is_empty() {
+            return;
+        }
         let (epoch, view) = (round.epoch().get(), round.view().get());
-        self.lane.open(epoch, view, self.window);
+        self.lane.open(epoch, view, registry.window);
         let _ = self.tx.unbounded_send(Message::Leader(Leader {
             epoch,
             view,
             height,
             parent: parent.0,
-            window_ms: self.window.as_millis() as u64,
+            window_ms: registry.window.as_millis() as u64,
         }));
     }
 
@@ -90,7 +97,7 @@ impl Mailbox {
 
 pub(crate) struct Actor<TContext> {
     context: ContextCell<TContext>,
-    registry: Arc<Registry>,
+    registry: RegistryHandle,
     lane: TopOfBlockLane,
     mailbox: mpsc::UnboundedReceiver<Message>,
 }
@@ -121,7 +128,7 @@ impl<TContext: Clock + Spawner> Actor<TContext> {
                     let Some(message) = message else { break };
                     // Leader announcements and build reports go to every
                     // operator. The leader is authenticated by the connection.
-                    let operators = self.registry.active(self.context.current());
+                    let operators = self.registry.get().active(self.context.current());
                     if !operators.is_empty() {
                         sender.send(Recipients::Some(operators), message.encode(), true);
                     }
@@ -162,7 +169,8 @@ impl<TContext: Clock + Spawner> Actor<TContext> {
             rejected: 0,
             since_open_us: 0,
         };
-        let Some(policy) = self.registry.authorize(operator, self.context.current()) else {
+        let registry = self.registry.get();
+        let Some(policy) = registry.authorize(operator, self.context.current()) else {
             ack.status = AckStatus::Unauthorized;
             return ack;
         };
