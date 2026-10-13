@@ -66,6 +66,12 @@ use tempo_precompiles::{
     validator_config_v2::ValidatorConfigV2,
 };
 
+/// OpenUSD's creator and salt on Tempo mainnet and testnet, which derive its address there.
+const OUSD_CREATOR: Address = address!("0x22c01F26b74c808C89bbBaBDC31A4f03bDD4A020");
+const OUSD_SALT: B256 = b256!("0xf33dc2a859c2e7b057c1b3c1d2c3dd002405b1afab213e14d51cf86bd941e73b");
+/// OpenUSD's address on Tempo mainnet and testnet.
+const OUSD_ADDRESS: Address = address!("0x20c0000000000000000000006a37DA5C996874BE");
+
 /// Generate genesis allocation file for testing
 #[derive(Debug, clap::Args)]
 pub(crate) struct GenesisArgs {
@@ -606,12 +612,6 @@ fn create_path_usd_token(
         Ok(())
     })
 }
-
-/// OpenUSD's creator and salt on Tempo mainnet and testnet, which derive its address there.
-const OUSD_CREATOR: Address = address!("0x22c01F26b74c808C89bbBaBDC31A4f03bDD4A020");
-const OUSD_SALT: B256 = b256!("0xf33dc2a859c2e7b057c1b3c1d2c3dd002405b1afab213e14d51cf86bd941e73b");
-/// OpenUSD's address on Tempo mainnet and testnet.
-const OUSD_ADDRESS: Address = address!("0x20c0000000000000000000006a37DA5C996874BE");
 
 enum SaltOrAddress {
     Salt(B256),
