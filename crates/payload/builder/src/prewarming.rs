@@ -1,7 +1,10 @@
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-    mpsc::{self, Receiver, Sender},
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, RecvTimeoutError, Sender},
+    },
+    time::{Duration, Instant},
 };
 
 use alloy_primitives::B256;
@@ -15,9 +18,18 @@ use reth_transaction_pool::{
 };
 use tempo_evm::{ExpiringNonceReplay, StorageActionReplay, TempoEvmConfig, evm::TempoEvm};
 use tempo_transaction_pool::{StateAwarePoolTransaction, best::BestTransaction};
-use tracing::{instrument, trace};
+use tracing::{error, instrument, trace};
 
 pub(crate) type PrewarmEvmState = Option<TempoEvm<StateProviderDatabase<EvmStateProviderBox>>>;
+
+/// How long [`BestTransactionsPrewarming::drop`] waits for the prewarming coordinator to return
+/// after it was asked to stop.
+///
+/// The coordinator only has to observe the stop flag, let the in-flight prewarm executions finish
+/// and release its own state, so this budget is never expected to be reached. It exists so that a
+/// wedged coordinator degrades to today's behaviour with a loud diagnostic instead of hanging
+/// shutdown forever.
+const COORDINATOR_JOIN_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Prewarming orchestrator that consumes source [`BestTransactions`] with bounded
 /// lookahead, prewarms buffered transactions in parallel, and produces a new
@@ -27,6 +39,10 @@ pub(crate) struct BestTransactionsPrewarming {
     transactions_rx: Receiver<Option<PrewarmedTransaction>>,
     commands_tx: Sender<BestTransactionsCommand>,
     stop: Arc<AtomicBool>,
+    /// Signalled by the coordinator task once it returned and released everything it owns.
+    ///
+    /// [`Drop`] blocks on this so the coordinator can never outlive the builder that spawned it.
+    finished_rx: Receiver<()>,
 }
 
 impl BestTransactionsPrewarming {
@@ -41,10 +57,12 @@ impl BestTransactionsPrewarming {
     {
         let (transactions_tx, transactions_rx) = mpsc::channel();
         let (commands_tx, commands_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
         let this = Self {
             transactions_rx,
             commands_tx: commands_tx.clone(),
             stop: prewarm.stop.clone(),
+            finished_rx,
         };
 
         let prewarm_executor = prewarm.executor();
@@ -62,6 +80,13 @@ impl BestTransactionsPrewarming {
                         next_expiring_nonce_offset: 0,
                     },
                 );
+                // `start_prewarming` takes both the executor and the context by value, so by the
+                // time it returns every resource the coordinator owns has been released: the
+                // transaction source, the state provider and saved cache behind
+                // `PrewarmingExecutionContext`, the per-thread EVMs in the prewarming pool and the
+                // `TaskExecutor` handle itself. Signalling only here is what makes the join in
+                // `Drop` a release barrier for all of them rather than just for the caches.
+                let _ = finished_tx.send(());
             });
 
         this
@@ -86,6 +111,14 @@ impl BestTransactionsPrewarming {
             });
 
             let advance = |ctx: &mut BestTransactionsPrewarmingContext<Txs, Provider>| {
+                // The consumer sets the stop flag before it queues `Stop`, so a backlog of
+                // `Advance` commands can still be queued ahead of it. Bail out instead of polling
+                // the source and scheduling work nobody will read, which keeps the time between
+                // the stop request and the coordinator returning bounded by the prewarm
+                // executions that are already in flight.
+                if ctx.prewarm.is_stopped() {
+                    return;
+                }
                 let Some(tx) = ctx.best_txs.next() else {
                     let _ = ctx.transactions_tx.send(None);
                     return;
@@ -251,6 +284,8 @@ impl BestTransactionsPrewarming {
 
 impl Drop for BestTransactionsPrewarming {
     fn drop(&mut self) {
+        // Set the stop flag before sending the command: in-flight prewarm executions observe it
+        // immediately instead of waiting for the coordinator to dequeue `Stop`.
         self.stop.store(true, Ordering::Relaxed);
         // Move buffered transaction cleanup to the prewarm coordinator instead of this builder thread.
         let (_drain_tx, replacement_rx) = mpsc::channel();
@@ -258,6 +293,32 @@ impl Drop for BestTransactionsPrewarming {
         let _ = self
             .commands_tx
             .send(BestTransactionsCommand::Stop { drain_rx });
+
+        // Join the coordinator. Spawning it detached means it can outlive this builder, the
+        // payload service and even the node's shutdown sequence, and it owns the last reference to
+        // some of the state it executes against. Returning from here while it still runs lets it
+        // execute on a state provider the node is concurrently tearing down, and makes it the
+        // thread that performs the final release of those resources.
+        let started_at = Instant::now();
+        match self.finished_rx.recv_timeout(COORDINATOR_JOIN_TIMEOUT) {
+            // `Disconnected` means the task never ran or unwound. Either way the closure and
+            // everything it captured has been dropped, which is exactly what we are waiting for.
+            Ok(()) | Err(RecvTimeoutError::Disconnected) => {
+                trace!(
+                    target: "payload_builder",
+                    elapsed = ?started_at.elapsed(),
+                    "joined prewarming coordinator"
+                );
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                error!(
+                    target: "payload_builder",
+                    timeout = ?COORDINATOR_JOIN_TIMEOUT,
+                    "prewarming coordinator did not stop in time; it may still execute against \
+                     state that is about to be released"
+                );
+            }
+        }
     }
 }
 
@@ -537,6 +598,8 @@ mod tests {
     struct TestBestTransactions {
         txs: VecDeque<BestTransaction>,
         log: Arc<Mutex<TestLog>>,
+        /// Records when the coordinator released the source it owns, see [`CoordinatorDropProbe`].
+        drop_probe: Option<CoordinatorDropProbe>,
     }
 
     impl TestBestTransactions {
@@ -544,7 +607,31 @@ mod tests {
             Self {
                 txs: txs.into(),
                 log,
+                drop_probe: None,
             }
+        }
+
+        fn with_drop_probe(mut self, probe: CoordinatorDropProbe) -> Self {
+            self.drop_probe = Some(probe);
+            self
+        }
+    }
+
+    /// Records the moment the prewarming coordinator drops the state it owns.
+    ///
+    /// It is parked inside [`TestBestTransactions`], which the coordinator owns through
+    /// [`BestTransactionsPrewarmingContext`], so it can only run once the coordinator task has
+    /// left `start_prewarming`.
+    struct CoordinatorDropProbe {
+        events: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl Drop for CoordinatorDropProbe {
+        fn drop(&mut self) {
+            // Make the unjoined case deterministic rather than racy: without the join in
+            // `BestTransactionsPrewarming::drop` the builder thread always wins this race.
+            thread::sleep(Duration::from_millis(250));
+            self.events.lock().unwrap().push("coordinator-released");
         }
     }
 
@@ -652,35 +739,23 @@ mod tests {
         })
     }
 
-    struct TestPrewarming {
-        prewarming: Option<BestTransactionsPrewarming>,
-        executor: TaskExecutor,
+    // Tests used to wrap the iterator in a harness whose `Drop` submitted a no-op to the
+    // `builder-prewarm` worker and blocked on it, because dropping the iterator alone did not
+    // wait for the coordinator. `BestTransactionsPrewarming::drop` now joins it, so the tests can
+    // use the real type and exercise that join.
+
+    /// A `finished_rx` for iterators assembled by hand, without a coordinator task.
+    ///
+    /// The sender is dropped right away, so `Drop` sees the coordinator as already finished
+    /// instead of waiting out [`COORDINATOR_JOIN_TIMEOUT`].
+    fn finished_without_coordinator() -> Receiver<()> {
+        mpsc::channel().1
     }
 
-    impl Drop for TestPrewarming {
-        fn drop(&mut self) {
-            drop(self.prewarming.take());
-            self.executor
-                .spawn_blocking_named("builder-prewarm", || {})
-                .get();
-        }
-    }
-
-    impl std::ops::Deref for TestPrewarming {
-        type Target = BestTransactionsPrewarming;
-
-        fn deref(&self) -> &Self::Target {
-            self.prewarming.as_ref().expect("prewarming exists")
-        }
-    }
-
-    impl std::ops::DerefMut for TestPrewarming {
-        fn deref_mut(&mut self) -> &mut Self::Target {
-            self.prewarming.as_mut().expect("prewarming exists")
-        }
-    }
-
-    fn prewarming(txs: Vec<BestTransaction>, log: Arc<Mutex<TestLog>>) -> TestPrewarming {
+    fn prewarming(
+        txs: Vec<BestTransaction>,
+        log: Arc<Mutex<TestLog>>,
+    ) -> BestTransactionsPrewarming {
         let executor = TaskExecutor::test();
         prewarming_with_executor(executor, txs, log)
     }
@@ -689,14 +764,9 @@ mod tests {
         executor: TaskExecutor,
         txs: Vec<BestTransaction>,
         log: Arc<Mutex<TestLog>>,
-    ) -> TestPrewarming {
-        let context = prewarming_context(executor.clone(), false);
-        let prewarming =
-            BestTransactionsPrewarming::new(context, TestBestTransactions::new(txs, log));
-        TestPrewarming {
-            prewarming: Some(prewarming),
-            executor,
-        }
+    ) -> BestTransactionsPrewarming {
+        let context = prewarming_context(executor, false);
+        BestTransactionsPrewarming::new(context, TestBestTransactions::new(txs, log))
     }
 
     fn prewarming_context(
@@ -758,6 +828,49 @@ mod tests {
             thread::sleep(Duration::from_millis(5));
         }
         assert!(condition(), "condition did not become true before timeout");
+    }
+
+    /// The coordinator is spawned detached, so nothing but `Drop` can keep it from outliving the
+    /// builder and executing against - and performing the final release of - state the node is
+    /// tearing down. Asserting on the ordering of the two events rather than just on "the
+    /// coordinator eventually stops" is what pins the join down to `Drop` itself.
+    #[test]
+    fn drop_joins_prewarming_coordinator_before_returning() {
+        let sender = Address::random();
+        let executor = TaskExecutor::test();
+        let txs = (0..executor.prewarming_pool().current_num_threads() * 2 + 4)
+            .map(|nonce| test_tx(sender, nonce as u64))
+            .collect::<Vec<_>>();
+        let log = Arc::new(Mutex::new(TestLog::default()));
+        let events = Arc::new(Mutex::new(Vec::new()));
+
+        let context = prewarming_context(executor, false);
+        let source =
+            TestBestTransactions::new(txs, log.clone()).with_drop_probe(CoordinatorDropProbe {
+                events: events.clone(),
+            });
+        let mut prewarming = BestTransactionsPrewarming::new(context, source);
+
+        // Positive half of the assertion: the coordinator really started and served the builder.
+        // Without it an early return that never spawns the task would satisfy the ordering check
+        // below for the wrong reason.
+        assert!(
+            prewarming.next().is_some(),
+            "coordinator should serve prewarmed transactions"
+        );
+        assert!(
+            log.lock().unwrap().yielded > 0,
+            "coordinator should have polled the source"
+        );
+
+        drop(prewarming);
+        events.lock().unwrap().push("drop-returned");
+
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec!["coordinator-released", "drop-returned"],
+            "Drop must not return before the prewarming coordinator released its state"
+        );
     }
 
     #[test]
@@ -830,6 +943,7 @@ mod tests {
                 transactions_rx,
                 commands_tx,
                 stop: Arc::default(),
+                finished_rx: finished_without_coordinator(),
             };
 
             assert_eq!(prewarming.next().unwrap().tx.hash(), first.hash());
@@ -863,6 +977,7 @@ mod tests {
             transactions_rx,
             commands_tx,
             stop: Arc::default(),
+            finished_rx: finished_without_coordinator(),
         };
 
         let next = prewarming.next();
@@ -889,6 +1004,7 @@ mod tests {
             transactions_rx,
             commands_tx,
             stop: Arc::default(),
+            finished_rx: finished_without_coordinator(),
         };
 
         assert!(prewarming.next().is_none());
@@ -916,6 +1032,7 @@ mod tests {
             transactions_rx,
             commands_tx,
             stop: Arc::default(),
+            finished_rx: finished_without_coordinator(),
         };
 
         assert_eq!(
@@ -1038,6 +1155,7 @@ mod tests {
             transactions_rx,
             commands_tx,
             stop: Arc::default(),
+            finished_rx: finished_without_coordinator(),
         };
 
         // Leave the coordinator commands unprocessed: the original buffer must
