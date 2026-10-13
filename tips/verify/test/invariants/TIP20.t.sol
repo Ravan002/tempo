@@ -826,8 +826,7 @@ contract TIP20InvariantTest is InvariantBaseTest {
         address target = _selectActor(targetSeed);
 
         // Ensure target is blacklisted for this test
-        uint64 policyId = _tokenPolicyIds[address(token)];
-        bool isBlacklisted = !registry.isAuthorized(policyId, target);
+        bool isBlacklisted = !_isAuthorized(address(token), target);
         vm.assume(isBlacklisted);
 
         uint256 targetBalance = token.balanceOf(target);
@@ -1227,6 +1226,13 @@ contract TIP20InvariantTest is InvariantBaseTest {
 
         if (blacklist && !currentlyAuthorized) return;
         if (!blacklist && currentlyAuthorized) return;
+
+        if (_tip1145) {
+            vm.prank(policyAdmin);
+            _setBlacklisted(address(token), actor, blacklist);
+            assertEq(_isAuthorized(address(token), actor), !blacklist);
+            return;
+        }
 
         // Try to set blacklist - may fail if policy doesn't exist or we're not admin
         vm.startPrank(policyAdmin);

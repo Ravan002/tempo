@@ -296,15 +296,13 @@ contract FeeAMMInvariantTest is InvariantBaseTest {
         view
         returns (address actor, uint256 balance)
     {
-        uint64 policyId = token == address(pathUSD) ? _pathUsdPolicyId : _tokenPolicyIds[token];
-
         address[] memory blacklisted = new address[](BLACKLISTABLE_ACTOR_COUNT);
         uint256[] memory balances = new uint256[](BLACKLISTABLE_ACTOR_COUNT);
         uint256 count = 0;
 
         for (uint256 i = 0; i < BLACKLISTABLE_ACTOR_COUNT; i++) {
             address a = _actors[i];
-            if (!registry.isAuthorized(policyId, a)) {
+            if (!_isAuthorized(token, a)) {
                 uint256 bal = ITIP20(token).balanceOf(a);
                 if (bal >= MIN_LIQUIDITY) {
                     blacklisted[count] = a;
@@ -392,18 +390,18 @@ contract FeeAMMInvariantTest is InvariantBaseTest {
         _degenerateUserToken.grantRole(_ISSUER_ROLE, admin);
 
         uint64 hopPolicyId = registry.createPolicy(admin, ITIP403Registry.PolicyType.BLACKLIST);
-        _hopToken.changeTransferPolicyId(hopPolicyId);
+        _setBlacklistPolicy(_hopToken, hopPolicyId);
         _tokenPolicyIds[address(_hopToken)] = hopPolicyId;
         _tokens.push(_hopToken);
 
         uint64 uhPolicyId = registry.createPolicy(admin, ITIP403Registry.PolicyType.BLACKLIST);
-        _userTokenWithHop.changeTransferPolicyId(uhPolicyId);
+        _setBlacklistPolicy(_userTokenWithHop, uhPolicyId);
         _tokenPolicyIds[address(_userTokenWithHop)] = uhPolicyId;
         _tokens.push(_userTokenWithHop);
 
         uint64 degeneratePolicyId =
             registry.createPolicy(admin, ITIP403Registry.PolicyType.BLACKLIST);
-        _degenerateUserToken.changeTransferPolicyId(degeneratePolicyId);
+        _setBlacklistPolicy(_degenerateUserToken, degeneratePolicyId);
         _tokenPolicyIds[address(_degenerateUserToken)] = degeneratePolicyId;
         _tokens.push(_degenerateUserToken);
         vm.stopPrank();
@@ -1001,7 +999,6 @@ contract FeeAMMInvariantTest is InvariantBaseTest {
         address actor = _selectActor(actorSeed);
         address token = _selectToken(tokenSeed);
 
-        uint64 policyId = token == address(pathUSD) ? _pathUsdPolicyId : _tokenPolicyIds[token];
         address policyAdmin = token == address(pathUSD) ? pathUSDAdmin : admin;
 
         // Determine if this actor is in the blacklistable pool (actors 0-4)
@@ -1009,13 +1006,13 @@ contract FeeAMMInvariantTest is InvariantBaseTest {
         bool isBlacklistableActor = actorIndex < BLACKLISTABLE_ACTOR_COUNT;
 
         // Check current blacklist status
-        bool currentlyBlacklisted = !registry.isAuthorized(policyId, actor);
+        bool currentlyBlacklisted = !_isAuthorized(token, actor);
 
         if (!isBlacklistableActor) {
             // Non-blacklistable actor (5-19): always recover if blacklisted, never blacklist
             if (currentlyBlacklisted) {
                 vm.prank(policyAdmin);
-                registry.modifyPolicyBlacklist(policyId, actor, false);
+                _setBlacklisted(token, actor, false);
             }
             // If not blacklisted, do nothing - keep it that way
             return;
@@ -1030,7 +1027,7 @@ contract FeeAMMInvariantTest is InvariantBaseTest {
         // Not blacklisted yet - 20% chance to blacklist
         if ((probabilitySeed % 100) < 20) {
             vm.prank(policyAdmin);
-            registry.modifyPolicyBlacklist(policyId, actor, true);
+            _setBlacklisted(token, actor, true);
         }
     }
 
@@ -1112,9 +1109,7 @@ contract FeeAMMInvariantTest is InvariantBaseTest {
         uint256 expectedOutForCheck = (feeAmount * M) / SCALE;
 
         // Skip if user is blacklisted for userToken (can't mint funds to them or transfer from them)
-        uint64 userTokenPolicyId =
-            userToken == address(pathUSD) ? _pathUsdPolicyId : _tokenPolicyIds[userToken];
-        vm.assume(registry.isAuthorized(userTokenPolicyId, user));
+        vm.assume(_isAuthorized(userToken, user));
 
         // Bias toward cross-token swaps: 90% chance to force different tokens
         // This exercises the actual swap logic more frequently
@@ -1236,8 +1231,7 @@ contract FeeAMMInvariantTest is InvariantBaseTest {
 
         // User must be authorised to send userToken (otherwise transfer reverts).
         vm.assume(
-            registry.isAuthorized(_tokenPolicyIds[ctx.userToken], ctx.user)
-                && registry.isAuthorized(_tokenPolicyIds[ctx.validatorToken], ctx.validator)
+            _isAuthorized(ctx.userToken, ctx.user) && _isAuthorized(ctx.validatorToken, ctx.validator)
         );
 
         ctx.directPool = amm.getPool(ctx.userToken, ctx.validatorToken);
@@ -2439,20 +2433,19 @@ contract FeeAMMInvariantTest is InvariantBaseTest {
             // Unblacklist for each token
             for (uint256 t = 0; t < _tokens.length; t++) {
                 address token = address(_tokens[t]);
-                uint64 policyId = _tokenPolicyIds[token];
 
                 // Only unblacklist if currently blacklisted
-                if (!registry.isAuthorized(policyId, actor)) {
+                if (!_isAuthorized(token, actor)) {
                     vm.prank(admin);
-                    registry.modifyPolicyBlacklist(policyId, actor, false);
+                    _setBlacklisted(token, actor, false);
                     unblacklistedCount++;
                 }
             }
 
             // Unblacklist for pathUSD
-            if (!registry.isAuthorized(_pathUsdPolicyId, actor)) {
+            if (!_isAuthorized(address(pathUSD), actor)) {
                 vm.prank(pathUSDAdmin);
-                registry.modifyPolicyBlacklist(_pathUsdPolicyId, actor, false);
+                _setBlacklisted(address(pathUSD), actor, false);
                 unblacklistedCount++;
             }
         }

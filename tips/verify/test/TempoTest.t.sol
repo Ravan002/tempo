@@ -17,6 +17,8 @@ contract TempoTest is Tempo, Test {
     /// @notice Thrown when a call was expected to revert.
     error CallShouldHaveReverted();
 
+    bool internal _tip1145;
+
     // Precompiles aliases (for succinctness)
     ITIP403Registry registry = tip403Registry;
     ITIP20Factory factory = tip20Factory;
@@ -50,6 +52,7 @@ contract TempoTest is Tempo, Test {
     }
 
     function setUp() public virtual {
+        _tip1145 = keccak256(bytes(vm.getEvmVersion())) == keccak256("t14");
         _requirePrecompile("AccountKeychain", KEYCHAIN);
         _requirePrecompile("TIP403Registry", TIP403_REGISTRY);
         _requirePrecompile("AddressRegistry", ADDRESS_REGISTRY);

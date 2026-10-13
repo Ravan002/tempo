@@ -903,15 +903,22 @@ contract VirtualAddressesInvariantTest is InvariantBaseTest {
         vm.startPrank(admin);
         for (uint256 i = 0; i < _tokens.length; i++) {
             ITIP20 token = _tokens[i];
-            uint64 recipientPolicyId =
-                registry.createPolicy(admin, ITIP403Registry.PolicyType.BLACKLIST);
-            uint64 mintPolicyId = registry.createPolicy(admin, ITIP403Registry.PolicyType.BLACKLIST);
-            uint64 compoundPolicyId =
-                registry.createCompoundPolicy(1, recipientPolicyId, mintPolicyId);
+            if (_tip1145) {
+                registry.setTokenPolicyModes(
+                    address(token), ITIP403Registry.PolicyMode.ALLOW,
+                    ITIP403Registry.PolicyMode.BLACKLIST, ITIP403Registry.PolicyMode.BLACKLIST
+                );
+            } else {
+                uint64 recipientPolicyId =
+                    registry.createPolicy(admin, ITIP403Registry.PolicyType.BLACKLIST);
+                uint64 mintPolicyId = registry.createPolicy(admin, ITIP403Registry.PolicyType.BLACKLIST);
+                uint64 compoundPolicyId =
+                    registry.createCompoundPolicy(1, recipientPolicyId, mintPolicyId);
 
-            token.changeTransferPolicyId(compoundPolicyId);
-            _recipientPolicyIds[address(token)] = recipientPolicyId;
-            _mintPolicyIds[address(token)] = mintPolicyId;
+                token.changeTransferPolicyId(compoundPolicyId);
+                _recipientPolicyIds[address(token)] = recipientPolicyId;
+                _mintPolicyIds[address(token)] = mintPolicyId;
+            }
         }
 
         _policyRejectWhitelistId =
@@ -1039,25 +1046,34 @@ contract VirtualAddressesInvariantTest is InvariantBaseTest {
     }
 
     function _setTransferAllowed(ITIP20 token, address master, bool allowed) internal {
-        uint64 policyId = _recipientPolicyIds[address(token)];
-        bool current = registry.isAuthorized(policyId, master);
-        if (current == allowed) {
-            return;
-        }
-
-        vm.prank(admin);
-        registry.modifyPolicyBlacklist(policyId, master, !allowed);
+        _setPolicyAllowed(
+            token, master, allowed, ITIP403Registry.AuthRole.RECIPIENT, _recipientPolicyIds[address(token)]
+        );
     }
 
     function _setMintAllowed(ITIP20 token, address master, bool allowed) internal {
-        uint64 policyId = _mintPolicyIds[address(token)];
-        bool current = registry.isAuthorized(policyId, master);
-        if (current == allowed) {
-            return;
-        }
+        _setPolicyAllowed(
+            token, master, allowed, ITIP403Registry.AuthRole.MINT_RECIPIENT, _mintPolicyIds[address(token)]
+        );
+    }
 
-        vm.prank(admin);
-        registry.modifyPolicyBlacklist(policyId, master, !allowed);
+    function _setPolicyAllowed(
+        ITIP20 token,
+        address master,
+        bool allowed,
+        ITIP403Registry.AuthRole role,
+        uint64 policyId
+    ) internal {
+        if (_tip1145) {
+            address[] memory accounts = new address[](1);
+            accounts[0] = master;
+            vm.prank(admin);
+            if (allowed) registry.removeTokenMembers(address(token), accounts, role);
+            else registry.addTokenMembers(address(token), accounts, role);
+        } else if (registry.isAuthorized(policyId, master) != allowed) {
+            vm.prank(admin);
+            registry.modifyPolicyBlacklist(policyId, master, !allowed);
+        }
     }
 
     function _mintableAmount(ITIP20 token) internal view returns (uint256) {

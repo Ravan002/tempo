@@ -579,14 +579,12 @@ contract StablecoinDEXInvariantTest is InvariantBaseTest {
         if (forBids) {
             // For bids, blacklist in quote token (pathUSD) since that's the escrow token
             vm.prank(pathUSDAdmin);
-            registry.modifyPolicyBlacklist(_pathUsdPolicyId, blacklistedActor, true);
+            _setBlacklisted(address(pathUSD), blacklistedActor, true);
         } else {
             // For asks, blacklist in all base tokens since orders can be on any token
             vm.startPrank(admin);
             for (uint256 t = 0; t < _tokens.length; t++) {
-                registry.modifyPolicyBlacklist(
-                    _tokenPolicyIds[address(_tokens[t])], blacklistedActor, true
-                );
+                _setBlacklisted(address(_tokens[t]), blacklistedActor, true);
             }
             vm.stopPrank();
         }
@@ -657,13 +655,11 @@ contract StablecoinDEXInvariantTest is InvariantBaseTest {
         // Whitelist the actor again so they can continue to be used in tests
         if (forBids) {
             vm.prank(pathUSDAdmin);
-            registry.modifyPolicyBlacklist(_pathUsdPolicyId, blacklistedActor, false);
+            _setBlacklisted(address(pathUSD), blacklistedActor, false);
         } else {
             vm.startPrank(admin);
             for (uint256 t = 0; t < _tokens.length; t++) {
-                registry.modifyPolicyBlacklist(
-                    _tokenPolicyIds[address(_tokens[t])], blacklistedActor, false
-                );
+                _setBlacklisted(address(_tokens[t]), blacklistedActor, false);
             }
             vm.stopPrank();
         }

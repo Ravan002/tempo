@@ -64,7 +64,7 @@ abstract contract InvariantBaseTest is TempoTest {
 
             // Create blacklist policy for each token
             uint64 policyId = registry.createPolicy(admin, ITIP403Registry.PolicyType.BLACKLIST);
-            tokens[i].changeTransferPolicyId(policyId);
+            _setBlacklistPolicy(tokens[i], policyId);
             _tokenPolicyIds[address(tokens[i])] = policyId;
         }
         vm.stopPrank();
@@ -72,7 +72,7 @@ abstract contract InvariantBaseTest is TempoTest {
         // Create blacklist policy for pathUSD
         vm.startPrank(pathUSDAdmin);
         _pathUsdPolicyId = registry.createPolicy(pathUSDAdmin, ITIP403Registry.PolicyType.BLACKLIST);
-        pathUSD.changeTransferPolicyId(_pathUsdPolicyId);
+        _setBlacklistPolicy(ITIP20Token(address(pathUSD)), _pathUsdPolicyId);
         vm.stopPrank();
 
         // Register known balance holders for invariant checks
@@ -222,12 +222,10 @@ abstract contract InvariantBaseTest is TempoTest {
     /// @param token Token to check authorization for
     /// @return The selected authorized actor
     function _selectAuthorizedActor(uint256 seed, address token) internal view returns (address) {
-        uint64 policyId = token == address(pathUSD) ? _pathUsdPolicyId : _tokenPolicyIds[token];
-
         address[] memory authorized = new address[](_actors.length);
         uint256 count = 0;
         for (uint256 i = 0; i < _actors.length; i++) {
-            if (registry.isAuthorized(policyId, _actors[i])) {
+            if (_isAuthorized(token, _actors[i])) {
                 authorized[count++] = _actors[i];
             }
         }
@@ -276,7 +274,9 @@ abstract contract InvariantBaseTest is TempoTest {
     /// @param token Token address
     /// @return policyId The policy ID
     function _getPolicyId(address token) internal view returns (uint64) {
-        return ITIP20(token).transferPolicyId();
+        return _tip1145
+            ? (token == address(pathUSD) ? _pathUsdPolicyId : _tokenPolicyIds[token])
+            : ITIP20(token).transferPolicyId();
     }
 
     /// @dev Gets the policy admin for a token by querying the registry
@@ -293,7 +293,9 @@ abstract contract InvariantBaseTest is TempoTest {
     /// @param actor Actor address
     /// @return True if authorized
     function _isAuthorized(address token, address actor) internal view returns (bool) {
-        return registry.isAuthorized(_getPolicyId(token), actor);
+        return _tip1145
+            ? registry.isTokenAuthorized(token, actor, ITIP403Registry.AuthRole.ALL)
+            : registry.isAuthorized(_getPolicyId(token), actor);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -312,6 +314,7 @@ abstract contract InvariantBaseTest is TempoTest {
             || selector == ITIP20.PolicyForbids.selector
             || selector == ITIP20.SupplyCapExceeded.selector
             || selector == ITIP20.NoOptedInSupply.selector
+            || selector == ITIP403Registry.TokenPolicyIdsUnsupported.selector
             || selector == ITIP20.InvalidTransferPolicyId.selector
             || selector == ITIP20.InvalidQuoteToken.selector
             || selector == ITIP20.InvalidCurrency.selector
@@ -380,4 +383,30 @@ abstract contract InvariantBaseTest is TempoTest {
         return string(buffer);
     }
 
+    /// @dev Keep legacy policy fixtures on T13 and use token-specific blacklists on T14.
+    function _setBlacklistPolicy(ITIP20Token token, uint64 policyId) internal {
+        if (_tip1145) {
+            registry.setTokenPolicyModes(
+                address(token),
+                ITIP403Registry.PolicyMode.BLACKLIST,
+                ITIP403Registry.PolicyMode.BLACKLIST,
+                ITIP403Registry.PolicyMode.BLACKLIST
+            );
+        } else {
+            token.changeTransferPolicyId(policyId);
+        }
+    }
+
+    function _setBlacklisted(address token, address actor, bool blacklisted) internal {
+        if (_tip1145) {
+            address[] memory accounts = new address[](1);
+            accounts[0] = actor;
+            if (blacklisted) registry.addTokenMembers(token, accounts, ITIP403Registry.AuthRole.ALL);
+            else registry.removeTokenMembers(token, accounts, ITIP403Registry.AuthRole.ALL);
+        } else {
+            registry.modifyPolicyBlacklist(
+                token == address(pathUSD) ? _pathUsdPolicyId : _tokenPolicyIds[token], actor, blacklisted
+            );
+        }
+    }
 }
