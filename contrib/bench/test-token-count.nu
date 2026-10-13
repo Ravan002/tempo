@@ -4,8 +4,10 @@ source ../../bench-e2e.nu
 use std/assert
 
 let spec = "contrib/bench/txgen/presets/tip20/nonce-expiring.yml"
-for count in [1 4 20] {
+for count in [1 2 3 4 5 20] {
     e2e-validate-token-count $count
+    let bloat_count = (e2e-bloat-token-count $count)
+    assert equal $bloat_count (if $count <= 4 { 4 } else { $count })
     txgen-configure-tip20-token-env $count
     let tokens = ($env.TXGEN_TIP20_TOKENS | from json)
     assert equal ($tokens | length) $count
@@ -23,14 +25,19 @@ for count in [1 4 20] {
         assert equal ($step.tx.call.args | get 1) (txgen-tip20-token-address 0)
         assert equal ($step.tx.call.args | get 2) 10000000000
     }
-    let args = (build-base-args genesis.json data logs "127.0.0.1" 8545 9001 $count)
-    assert equal ($args | where { |arg| $arg == "--faucet.address" } | length) $count
+    let args = (build-base-args genesis.json data logs "127.0.0.1" 8545 9001 $bloat_count)
+    assert equal ($args | where { |arg| $arg == "--faucet.address" } | length) $bloat_count
 
-    # Increasing token count redistributes one total size, rather than multiplying it.
-    let accounts = (txgen-bloat-accounts-per-token 1024 $count)
-    let bytes = $count * (104 + 64 * $accounts)
+    # Selections 1..4 retain the same state and existing-recipient range.
+    let accounts = (txgen-bloat-accounts-per-token 1024 $bloat_count)
+    if $count <= 4 {
+        assert equal $accounts (txgen-bloat-accounts-per-token 1024 4)
+    }
+    txgen-configure-existing-recipients-env "contrib/bench/txgen/presets/tip20/recipient-existing.yml" 1024 $bloat_count
+    assert equal ($env.TXGEN_EXISTING_RECIPIENTS_END | into int) $accounts
+    let bytes = $bloat_count * (104 + 64 * $accounts)
     assert ($bytes <= 1024 * 1024 * 1024)
-    assert ($bytes > 1024 * 1024 * 1024 - 64 * $count)
+    assert ($bytes > 1024 * 1024 * 1024 - 64 * $bloat_count)
 }
 
 txgen-configure-fee-amm-env "contrib/bench/txgen/presets/tip20/nonce-2d.yml" 20
@@ -45,7 +52,11 @@ for count in [0 21] {
 }
 
 let legacy = {bloat_version: 1, bloat_mib: 1024, nonce_ring_hardfork: T13}
-assert (bloat-matches $legacy 1024 T13 4)
+for count in 1..4 {
+    assert (bloat-matches $legacy 1024 T13 (e2e-bloat-token-count $count))
+    let old_pr_snapshot = ($legacy | insert bloat_token_count $count)
+    assert equal (bloat-matches $old_pr_snapshot 1024 T13 (e2e-bloat-token-count $count)) ($count == 4)
+}
 assert (not (bloat-matches $legacy 1024 T13 20))
 let twenty = ($legacy | insert bloat_token_count 20)
 assert (bloat-matches $twenty 1024 T13 20)

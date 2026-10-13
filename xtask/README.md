@@ -17,8 +17,9 @@ tokens use reserved IDs 4..19, have USD currency, quote pathUSD, and fund the ge
 
 E2E benchmarks accept `token-count=1..20` (`--token-count` in `nu bench-e2e.nu e2e`), defaulting
 to four. For example, `derek bench preset=tip20 token-count=20 bloat=100` spreads the same total
-100 GiB TIP-20 state bloat across twenty tokens; the nonce ring is additional. Increasing token
-count reduces balances per token, and cached snapshots are rebuilt when token count changes.
-The four canonical genesis tokens remain available to static presets when fewer tokens are selected.
+100 GiB TIP-20 state bloat across twenty tokens; the nonce ring is additional. Selections of 1–4 tokens
+retain the existing four-token bloat distribution and recipient range. Above four, increasing
+token count reduces balances per token; cached snapshots are rebuilt when the bloat token count
+changes. The four canonical genesis tokens remain available to static presets.
 Scenarios with `fee-token=any_tip20` seed each selected non-pathUSD token's fee pool against
 pathUSD during setup.
