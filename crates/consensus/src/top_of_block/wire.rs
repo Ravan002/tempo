@@ -14,27 +14,12 @@ const MAX_BUILT_HASHES: usize = 64 * 1024;
 /// A message on the top-of-block channel.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Message {
-    /// Leader to operators: the sender opened its lane for a round it proposes.
-    Leader(Leader),
     /// Operator to leader: signed transactions for the lane of a round.
     Submit(Submit),
     /// Leader to operator: what the lane did with a [`Submit`].
     Ack(Ack),
     /// Leader to operators: the proposal built from a round's lane.
     Built(Built),
-}
-
-/// Announces that the sender leads round `(epoch, view)` and opened its lane.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Leader {
-    pub epoch: u64,
-    pub view: u64,
-    /// Height of the block being built.
-    pub height: u64,
-    /// Hash of the parent block.
-    pub parent: B256,
-    /// Time after which the builder takes the lane.
-    pub window_ms: u64,
 }
 
 /// Signed transactions for the lane of round `(epoch, view)`.
@@ -118,27 +103,13 @@ fn read_b256(buf: &mut impl Buf) -> Result<B256, Error> {
 impl Write for Message {
     fn write(&self, buf: &mut impl BufMut) {
         match self {
-            Self::Leader(Leader {
-                epoch,
-                view,
-                height,
-                parent,
-                window_ms,
-            }) => {
-                0u8.write(buf);
-                epoch.write(buf);
-                view.write(buf);
-                height.write(buf);
-                write_b256(parent, buf);
-                window_ms.write(buf);
-            }
             Self::Submit(Submit {
                 epoch,
                 view,
                 id,
                 txs,
             }) => {
-                1u8.write(buf);
+                0u8.write(buf);
                 epoch.write(buf);
                 view.write(buf);
                 id.write(buf);
@@ -164,7 +135,7 @@ impl Write for Message {
                 rejected,
                 since_open_us,
             }) => {
-                2u8.write(buf);
+                1u8.write(buf);
                 epoch.write(buf);
                 view.write(buf);
                 id.write(buf);
@@ -182,7 +153,7 @@ impl Write for Message {
                 tx_count,
                 top_of_block,
             }) => {
-                3u8.write(buf);
+                2u8.write(buf);
                 epoch.write(buf);
                 view.write(buf);
                 height.write(buf);
@@ -200,7 +171,6 @@ impl Write for Message {
 impl EncodeSize for Message {
     fn encode_size(&self) -> usize {
         1 + match self {
-            Self::Leader(_) => 8 * 4 + 32,
             Self::Submit(submit) => {
                 8 * 3
                     + submit.txs.len().encode_size()
@@ -227,14 +197,7 @@ impl Read for Message {
 
     fn read_cfg(buf: &mut impl Buf, _: &()) -> Result<Self, Error> {
         match u8::read(buf)? {
-            0 => Ok(Self::Leader(Leader {
-                epoch: u64::read(buf)?,
-                view: u64::read(buf)?,
-                height: u64::read(buf)?,
-                parent: read_b256(buf)?,
-                window_ms: u64::read(buf)?,
-            })),
-            1 => {
+            0 => {
                 let epoch = u64::read(buf)?;
                 let view = u64::read(buf)?;
                 let id = u64::read(buf)?;
@@ -255,7 +218,7 @@ impl Read for Message {
                     txs,
                 }))
             }
-            2 => Ok(Self::Ack(Ack {
+            1 => Ok(Self::Ack(Ack {
                 epoch: u64::read(buf)?,
                 view: u64::read(buf)?,
                 id: u64::read(buf)?,
@@ -271,7 +234,7 @@ impl Read for Message {
                 rejected: u32::read(buf)?,
                 since_open_us: u64::read(buf)?,
             })),
-            3 => {
+            2 => {
                 let epoch = u64::read(buf)?;
                 let view = u64::read(buf)?;
                 let height = u64::read(buf)?;
@@ -302,13 +265,6 @@ mod tests {
     #[test]
     fn messages_round_trip() {
         let messages = [
-            Message::Leader(Leader {
-                epoch: 1,
-                view: 2,
-                height: 3,
-                parent: B256::repeat_byte(4),
-                window_ms: 5,
-            }),
             Message::Submit(Submit {
                 epoch: 1,
                 view: 2,

@@ -136,10 +136,10 @@ impl Inner {
             parent: (parent_view, parent_digest),
         } = context;
 
-        // Open the lane first so operators can submit while the parent
-        // executes and the payload job starts.
+        // Open the lane first: its window starts now, and operators keep
+        // submitting while the parent executes and the payload job starts.
         if let Some(top_of_block) = &self.top_of_block {
-            top_of_block.open(round, parent.height().next().get(), parent_digest);
+            top_of_block.open(round);
         }
 
         let (extra_data, deferred_extra_data) = if self.is_boundary(parent.height().next()) {

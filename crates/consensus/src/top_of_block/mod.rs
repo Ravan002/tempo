@@ -9,15 +9,17 @@
 //!
 //! The flow for one round:
 //!
-//! 1. When this node starts proposing a round, it opens its
-//!    [`TopOfBlockLane`] for the round and sends [`wire::Leader`] to every
-//!    operator. This is the earliest moment the leader is known: the VRF
-//!    leader of a view is derived from the certificate of the previous view.
+//! 1. Operators receive the validators' consensus certificates. The VRF
+//!    leader of a view is elected from any certificate of the previous view,
+//!    so an operator verifies the certificate and computes the next leader
+//!    itself ([`leader::EpochLeaders`]), as early as the validators do.
 //! 2. Operators send [`wire::Submit`] with signed transactions directly to
-//!    the leader. Each transaction replaces the previous transaction of its
+//!    that leader. Each transaction replaces the previous transaction of its
 //!    maker (signer) in the round. The leader answers with [`wire::Ack`],
-//!    since commonware may drop messages.
-//! 3. When the lane's window elapses, the payload builder takes the lane and
+//!    since commonware may drop messages. The lane keeps submissions for
+//!    rounds that have not started yet.
+//! 3. When this node starts proposing the round, it opens its
+//!    [`TopOfBlockLane`]. When the lane's window elapses, the payload builder takes the lane and
 //!    executes its transactions after the start-of-block system work and
 //!    before any pool transaction. Invalid or late transactions are skipped,
 //!    and an empty lane builds a normal block.
@@ -28,10 +30,11 @@
 //! any other block.
 
 mod actor;
+pub mod leader;
 mod registry;
 pub mod wire;
 
-use std::{net::SocketAddr, time::Duration};
+use std::net::SocketAddr;
 
 use commonware_cryptography::ed25519::{PrivateKey, PublicKey};
 use commonware_p2p::{
@@ -85,22 +88,28 @@ pub struct OperatorNetwork {
     pub max_message_size: u32,
 }
 
-/// The operator's handles to the top-of-block channel.
-pub type OperatorChannel = (
-    lookup::Sender<PublicKey, commonware_runtime::tokio::Context>,
-    lookup::Receiver<PublicKey>,
-);
+/// The operator's handles to the network.
+pub struct OperatorChannels {
+    /// The top-of-block channel.
+    pub top_of_block: (
+        lookup::Sender<PublicKey, commonware_runtime::tokio::Context>,
+        lookup::Receiver<PublicKey>,
+    ),
+    /// Consensus certificates broadcast by the validators; decode them with
+    /// [`leader::decode_certificate`].
+    pub certificates: lookup::Receiver<PublicKey>,
+}
 
-/// Starts an operator's network and returns its top-of-block channel.
+/// Starts an operator's network and returns its channels.
 ///
 /// Validators send their consensus broadcasts to operators as well, so the
-/// consensus channels are registered and drained. Their quotas must exceed
-/// what validators send: an exceeded inbound quota stalls the whole
+/// other consensus channels are registered and drained. Their quotas must
+/// exceed what validators send: an exceeded inbound quota stalls the whole
 /// connection, including the top-of-block channel.
 pub fn start_operator_network(
     context: &commonware_runtime::tokio::Context,
     config: OperatorNetwork,
-) -> eyre::Result<OperatorChannel> {
+) -> eyre::Result<OperatorChannels> {
     use commonware_runtime::Supervisor as _;
 
     let namespace = commonware_utils::union_unique(crate::config::NAMESPACE, b"_P2P");
@@ -123,9 +132,10 @@ pub fn start_operator_network(
         },
     );
 
+    let (_sender, certificates) =
+        network.register(crate::config::CERTIFICATES_CHANNEL_IDENT, drained);
     for channel in [
         crate::config::VOTES_CHANNEL_IDENT,
-        crate::config::CERTIFICATES_CHANNEL_IDENT,
         crate::config::RESOLVER_CHANNEL_IDENT,
         crate::config::BROADCASTER_CHANNEL_IDENT,
         crate::config::MARSHAL_CHANNEL_IDENT,
@@ -136,7 +146,7 @@ pub fn start_operator_network(
             .child("drain")
             .spawn(async move |_| while receiver.recv().await.is_ok() {});
     }
-    let channel = network.register(CHANNEL, LIMIT);
+    let top_of_block = network.register(CHANNEL, LIMIT);
 
     let validators = ordered::Map::from_iter_dedup(
         config
@@ -153,7 +163,10 @@ pub fn start_operator_network(
         },
     );
     network.start();
-    Ok(channel)
+    Ok(OperatorChannels {
+        top_of_block,
+        certificates,
+    })
 }
 
 /// Parses `<hex ed25519 public key>@<ip:port>`.
@@ -162,9 +175,4 @@ pub fn parse_peer(value: &str) -> eyre::Result<(PublicKey, SocketAddr)> {
         .split_once('@')
         .ok_or_eyre("expected `<public key>@<ip:port>`")?;
     Ok((registry::parse_public_key(key)?, address.parse()?))
-}
-
-/// The time an operator may keep streaming to a leader before its lane closes.
-pub fn window(leader: &wire::Leader) -> Duration {
-    Duration::from_millis(leader.window_ms)
 }

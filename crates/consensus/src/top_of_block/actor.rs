@@ -17,12 +17,9 @@ use tracing::{debug, warn};
 
 use super::{
     Config, RegistryHandle,
-    wire::{Ack, AckStatus, Built, Leader, Message, Submit},
+    wire::{Ack, AckStatus, Built, Message, Submit},
 };
-use crate::{
-    consensus::{Digest, block::Block},
-    utils::public_key_to_b256,
-};
+use crate::{consensus::block::Block, utils::public_key_to_b256};
 
 pub(super) fn init<TContext>(context: TContext, config: Config) -> (Actor<TContext>, Mailbox) {
     let (tx, rx) = mpsc::unbounded();
@@ -50,25 +47,20 @@ pub(crate) struct Mailbox {
 }
 
 impl Mailbox {
-    /// Opens the lane for `round`, in which this node builds the block at
-    /// `height` on `parent`, and announces it to the operators.
+    /// Opens the lane for `round`, which this node proposes.
+    ///
+    /// Operators do not wait for this: they derive the leader from the
+    /// certificate of the previous view and submit ahead of the round.
     ///
     /// Does nothing if the registry has no active operators or a zero window,
     /// so the builder does not wait.
-    pub(crate) fn open(&self, round: Round, height: u64, parent: Digest) {
+    pub(crate) fn open(&self, round: Round) {
         let registry = self.registry.get();
         if registry.window.is_zero() || registry.active(SystemTime::now()).is_empty() {
             return;
         }
-        let (epoch, view) = (round.epoch().get(), round.view().get());
-        self.lane.open(epoch, view, registry.window);
-        let _ = self.tx.unbounded_send(Message::Leader(Leader {
-            epoch,
-            view,
-            height,
-            parent: parent.0,
-            window_ms: registry.window.as_millis() as u64,
-        }));
+        self.lane
+            .open(round.epoch().get(), round.view().get(), registry.window);
     }
 
     /// Reports which lane transactions made it into `proposal` for `round`.
@@ -126,8 +118,8 @@ impl<TContext: Clock + Spawner> Actor<TContext> {
 
                 message = self.mailbox.next() => {
                     let Some(message) = message else { break };
-                    // Leader announcements and build reports go to every
-                    // operator. The leader is authenticated by the connection.
+                    // Build reports go to every operator. The leader is
+                    // authenticated by the connection.
                     let operators = self.registry.get().active(self.context.current());
                     if !operators.is_empty() {
                         sender.send(Recipients::Some(operators), message.encode(), true);
