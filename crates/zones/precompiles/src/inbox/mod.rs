@@ -259,16 +259,15 @@ impl ZoneInbox {
             // Zone tokens keep the legacy layout and resolve their policy, including TIP-1145
             // token-specific modes, from the L1-mirrored registry, never from a local cache.
             let mut token = TIP20Token::from_address(enabled.token)?;
-            token.initialize_with_layout(
+            token.initialize_with_mirror(
                 ZONE_INBOX_ADDRESS,
                 &enabled.name,
                 &enabled.symbol,
                 &enabled.currency,
                 PATH_USD_ADDRESS,
                 ZONE_INBOX_ADDRESS,
-                false,
+                true,
             )?;
-            token.resolve_policy_from_registry()?;
             token.grant_role_internal(ZONE_INBOX_ADDRESS, ISSUER_ROLE)?;
             token.grant_role_internal(ZONE_OUTBOX_ADDRESS, ISSUER_ROLE)?;
             policy_registry.token_transfer_policies[enabled.token].write(l1_policy)?;

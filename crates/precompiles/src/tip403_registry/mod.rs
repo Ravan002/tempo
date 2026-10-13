@@ -324,7 +324,7 @@ impl TIP403Registry {
             return Err(tempo_contracts::precompiles::TIP20Error::invalid_token().into());
         }
 
-        if self.storage.spec().is_t14() && self.active_token_policy(call.token)?.is_some() {
+        if self.storage.spec().is_t14() && self.token_policy(call.token)?.is_set {
             return Ok(ITIP403Registry::tokenTransferPolicyIdReturn {
                 isSet: true,
                 policyId: TOKEN_POLICY_ID,
@@ -377,7 +377,7 @@ impl TIP403Registry {
         for token in call.tokens {
             if !factory.is_tip20(token)?
                 || self.registered_token_transfer_policy_id(token)?.is_some()
-                || (self.storage.spec().is_t14() && self.active_token_policy(token)?.is_some())
+                || (self.storage.spec().is_t14() && self.token_policy(token)?.is_set)
             {
                 continue;
             }
@@ -602,7 +602,7 @@ impl TIP403Registry {
             return Err(TIP403RegistryError::virtual_address_not_allowed().into());
         }
         // (T14+) TIP-1145 receivers cannot switch back to policy IDs.
-        if self.storage.spec().is_t14() && self.active_receive_config(msg_sender)?.is_some() {
+        if self.storage.spec().is_t14() && self.load_receive_config(msg_sender)?.is_some() {
             return Err(TIP403RegistryError::receive_policy_ids_unsupported().into());
         }
 
@@ -894,13 +894,7 @@ impl TIP403Registry {
     /// - `InvalidPolicyType` — stored type cannot be decoded
     /// - `IncompatiblePolicyType` — a compound policy was passed where a simple one is required
     pub fn is_authorized_as(&self, policy_id: u64, user: Address, role: AuthRole) -> Result<bool> {
-        let hardfork = self.storage.spec();
-
-        // (spec: +T6) some protocol addresses can't be policed and are always authorized.
-        if ALWAYS_AUTHORIZED
-            .iter()
-            .any(|(fork, addrs)| hardfork >= *fork && addrs.contains(&user))
-        {
+        if self.is_always_authorized(user) {
             return Ok(true);
         }
 
@@ -926,7 +920,7 @@ impl TIP403Registry {
                     // (spec: +T2) short-circuit and skip recipient check if sender fails
                     let sender_auth =
                         self.is_authorized_simple(compound.sender_policy_id, user, None)?;
-                    if hardfork.is_t2() && !sender_auth {
+                    if self.storage.spec().is_t2() && !sender_auth {
                         return Ok(false);
                     }
                     let recipient_auth =
@@ -937,6 +931,15 @@ impl TIP403Registry {
         }
 
         self.is_authorized_simple_inner(policy_id, user, &data)
+    }
+
+    /// (spec: +T6) Returns whether `user` is a protocol address that can't be policed and is
+    /// always authorized.
+    fn is_always_authorized(&self, user: Address) -> bool {
+        let spec = self.storage.spec();
+        ALWAYS_AUTHORIZED
+            .iter()
+            .any(|(fork, addrs)| spec >= *fork && addrs.contains(&user))
     }
 
     /// Returns authorization result for built-in policies ([`REJECT_ALL_POLICY_ID`] / [`ALLOW_ALL_POLICY_ID`]).

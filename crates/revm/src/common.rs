@@ -130,8 +130,8 @@ pub trait TempoStateAccess<M = ()> {
         self.with_read_only_storage_ctx(spec, actions, || {
             // SAFETY: caller must ensure prefix is already checked
             let token = TIP20Token::from_address_unchecked(fee_token);
-            if let Some(is_usd) = token.packed_is_usd()? {
-                return Ok(is_usd);
+            if let Some(control) = token.token_control()? {
+                return Ok(control.inline_currency() == Some("USD"));
             }
             Ok(token.currency.len()? == 3 && token.currency.read()?.as_str() == "USD")
         })
@@ -152,18 +152,15 @@ pub trait TempoStateAccess<M = ()> {
         self.with_read_only_storage_ctx(spec, actions, || {
             // SAFETY: caller must ensure prefix is already checked
             let token = TIP20Token::from_address_unchecked(fee_token);
-            let currency = match token.packed_is_usd()? {
-                Some(true) => return Ok(Ok(())),
-                Some(false) => token.load_currency()?,
-                None => None,
-            }
-            .map_or_else(
-                || match token.currency.len()? {
-                    len if len > 31 => Ok(format!("<{len} bytes>")),
-                    _ => token.currency.read(),
+            let control = token.token_control()?;
+            let currency = match control.as_ref().and_then(|c| c.inline_currency()) {
+                Some("USD") => return Ok(Ok(())),
+                Some(currency) => currency.to_owned(),
+                None => match token.currency.len()? {
+                    len if len > 31 => format!("<{len} bytes>"),
+                    _ => token.currency.read()?,
                 },
-                Ok,
-            )?;
+            };
 
             if currency.as_str() != "USD" {
                 return Ok(Err(EVMError::Transaction(

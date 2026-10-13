@@ -28,11 +28,7 @@ use crate::{
     error::{Result, TempoPrecompileError},
     receive_policy_guard::{InboundKind, ReceivePolicyGuard, RecoveryMode},
     storage::{Handler, Mapping},
-    tip20::{
-        layout::{Supply, TokenControl},
-        rewards::UserRewardInfo,
-        roles::DEFAULT_ADMIN_ROLE,
-    },
+    tip20::{layout::Supply, rewards::UserRewardInfo, roles::DEFAULT_ADMIN_ROLE},
     tip20_factory::TIP20Factory,
     tip403_registry::{
         ALLOW_ALL_POLICY_ID, AuthRole, ITIP403Registry, REJECT_ALL_POLICY_ID, TIP403Registry,
@@ -176,8 +172,14 @@ impl TIP20Token {
 
     /// Returns the token's currency denomination (e.g. `"USD"`).
     pub fn currency(&self) -> Result<String> {
-        self.load_currency()?
-            .map_or_else(|| self.currency.read(), Ok)
+        match self
+            .token_control()?
+            .as_ref()
+            .and_then(|c| c.inline_currency())
+        {
+            Some(currency) => Ok(currency.to_owned()),
+            None => self.currency.read(),
+        }
     }
 
     /// Returns the logo URI for this token (TIP-1026).
@@ -217,7 +219,7 @@ impl TIP20Token {
     ///
     /// (T14+) Tokens with a token-specific policy report [`TOKEN_POLICY_ID`].
     pub fn transfer_policy_id(&self) -> Result<u64> {
-        Ok(match self.issuer_policy(None)? {
+        Ok(match self.issuer_policy()? {
             IssuerPolicy::Generic(policy_id) => policy_id,
             IssuerPolicy::TokenSpecific(_) => TOKEN_POLICY_ID,
         })
@@ -228,7 +230,7 @@ impl TIP20Token {
     /// # Errors
     /// - `InvalidTransferPolicyId` — the token uses a generic TIP-403 policy
     pub fn transfer_policy(&self) -> Result<ITIP20::transferPolicyReturn> {
-        match self.issuer_policy(None)? {
+        match self.issuer_policy()? {
             IssuerPolicy::TokenSpecific(policy) => Ok(ITIP20::transferPolicyReturn {
                 senderMode: policy.sender as u8,
                 recipientMode: policy.recipient as u8,
@@ -238,23 +240,19 @@ impl TIP20Token {
         }
     }
 
-    /// Resolves the active issuer policy. `control` may carry the already-loaded control word.
+    /// Resolves the active issuer policy.
     ///
     /// Token-specific policies always use the packed layout, so packed tokens read their cached
     /// modes and legacy tokens use their generic policy ID. Registry-mirroring tokens (see
-    /// [`Self::resolve_policy_from_registry`]) resolve [`TOKEN_POLICY_ID`] through the registry.
-    pub(crate) fn issuer_policy(&self, control: Option<&TokenControl>) -> Result<IssuerPolicy> {
-        let cached = match control {
-            Some(control) => control.policy(),
-            None => self.token_control()?.and_then(|control| control.policy()),
-        };
-        if let Some(policy) = cached {
+    /// [`Self::initialize_with_mirror`]) resolve [`TOKEN_POLICY_ID`] through the registry.
+    pub(crate) fn issuer_policy(&self) -> Result<IssuerPolicy> {
+        if let Some(policy) = self.token_control()?.and_then(|control| control.policy()) {
             return Ok(IssuerPolicy::TokenSpecific(policy));
         }
         Ok(match self.generic_transfer_policy_id()? {
-            TOKEN_POLICY_ID => match TIP403Registry::new().active_token_policy(self.address)? {
-                Some(policy) => IssuerPolicy::TokenSpecific(policy),
-                None => IssuerPolicy::Generic(REJECT_ALL_POLICY_ID),
+            TOKEN_POLICY_ID => match TIP403Registry::new().token_policy(self.address)? {
+                policy if policy.is_set => IssuerPolicy::TokenSpecific(policy),
+                _ => IssuerPolicy::Generic(REJECT_ALL_POLICY_ID),
             },
             policy_id => IssuerPolicy::Generic(policy_id),
         })
@@ -280,15 +278,6 @@ impl TIP20Token {
     /// Clears the legacy TIP-20 policy slot after its value has moved to TIP-403.
     pub(crate) fn delete_legacy_transfer_policy_id(&mut self) -> Result<()> {
         self.transfer_policy_id.delete()
-    }
-
-    /// Makes a legacy token mirror an external registry: without a registry binding, its policy
-    /// resolves from the registry's token-specific policy, or rejects all if none is active.
-    ///
-    /// For environments whose TIP-403 state mirrors another chain (e.g. zones), where tokens keep
-    /// the legacy layout because a packed mode cache could not be synchronized.
-    pub fn resolve_policy_from_registry(&mut self) -> Result<()> {
-        self.transfer_policy_id.write(TOKEN_POLICY_ID)
     }
 
     /// Returns the PAUSE_ROLE constant
@@ -357,10 +346,8 @@ impl TIP20Token {
             let control = self.load_control()?;
             if call.newPolicyId == TOKEN_POLICY_ID {
                 if !control.is_packed() {
-                    let mut registry = TIP403Registry::new();
-                    let policy = registry.prepared_token_policy(self.address)?;
+                    let policy = TIP403Registry::new().activate_token_policy(self.address)?;
                     self.convert_to_packed(control.is_paused(), &policy)?;
-                    registry.activate_token_policy(self.address, policy)?;
                     self.emit_event(TIP20Event::transfer_policy_update(
                         msg_sender,
                         TOKEN_POLICY_ID,
@@ -413,7 +400,13 @@ impl TIP20Token {
             return Err(TIP20Error::supply_cap_exceeded().into());
         }
 
-        self.store_supply_cap(&supply, call.newSupplyCap)?;
+        match supply.cap {
+            Some(_) => self.store_supply(Supply {
+                cap: Some(call.newSupplyCap),
+                ..supply
+            })?,
+            None => self.supply_cap.write(call.newSupplyCap)?,
+        }
 
         self.emit_event(TIP20Event::supply_cap_update(msg_sender, call.newSupplyCap))
     }
@@ -679,7 +672,10 @@ impl TIP20Token {
 
         self.handle_rewards_on_mint(to.target, amount)?;
 
-        self.store_total_supply(&supply, new_supply)?;
+        self.store_supply(Supply {
+            total: new_supply,
+            ..supply
+        })?;
         self.increment_balance(to.target, amount)?;
 
         self.emit_event(to.build_transfer_event(Address::ZERO, amount))
@@ -731,11 +727,9 @@ impl TIP20Token {
         let hardfork = self.storage.spec();
 
         // Validate burner role and (+T3) ensure token is not paused
-        let control = if hardfork.is_t3() {
-            Some(self.check_not_paused()?)
-        } else {
-            None
-        };
+        if hardfork.is_t3() {
+            self.check_not_paused()?;
+        }
         self.check_role(msg_sender, BURN_BLOCKED_ROLE)?;
 
         if check_protected {
@@ -743,8 +737,8 @@ impl TIP20Token {
         }
 
         // Check if the address is blocked from transferring (sender authorization)
-        let policy = self.issuer_policy(control.as_ref())?;
-        if self.policy_allows(&TIP403Registry::new(), policy, owner, AuthRole::sender())? {
+        let policy = self.issuer_policy()?;
+        if self.policy_allows(policy, owner, AuthRole::sender())? {
             // Only allow burning from addresses that are blocked from transferring
             return Err(TIP20Error::policy_forbids().into());
         }
@@ -755,7 +749,7 @@ impl TIP20Token {
             RECEIVE_POLICY_GUARD_ADDRESS
         };
         self._transfer(burn_from, &Recipient::direct(Address::ZERO), amount)?;
-        self.decrease_total_supply(control.as_ref(), amount)?;
+        self.decrease_total_supply(amount)?;
 
         self.emit_event(TIP20Event::burn_blocked(owner, amount))
     }
@@ -765,13 +759,13 @@ impl TIP20Token {
     /// Requires `BURN_AT_ROLE` and an unpaused token. When `from` is the transaction origin,
     /// the burn consumes the access key's spending limit even if a bridge is the caller.
     pub fn burn_at(&mut self, msg_sender: Address, call: ITIP20::burnAtCall) -> Result<()> {
-        let control = self.check_not_paused()?;
+        self.check_not_paused()?;
         self.check_role(msg_sender, BURN_AT_ROLE)?;
         self.check_burn_address(call.from)?;
         self.check_and_update_spending_limit(call.from, call.amount)?;
 
         self._transfer(call.from, &Recipient::direct(Address::ZERO), call.amount)?;
-        self.decrease_total_supply(Some(&control), call.amount)?;
+        self.decrease_total_supply(call.amount)?;
 
         self.emit_event(TIP20Event::burn_at(msg_sender, call.from, call.amount))
     }
@@ -792,29 +786,19 @@ impl TIP20Token {
 
     fn _burn(&mut self, msg_sender: Address, amount: U256) -> Result<()> {
         // Validate issuer role and (+T3) ensure token is not paused
-        let control = if self.storage.spec().is_t3() {
-            Some(self.check_not_paused()?)
-        } else {
-            None
-        };
+        if self.storage.spec().is_t3() {
+            self.check_not_paused()?;
+        }
         self.check_role(msg_sender, ISSUER_ROLE)?;
 
         self._transfer(msg_sender, &Recipient::direct(Address::ZERO), amount)?;
-        self.decrease_total_supply(control.as_ref(), amount)
+        self.decrease_total_supply(amount)
     }
 
     /// Reduces total supply by a burned `amount`, reverting with `InsufficientBalance` on
-    /// underflow. `control` may carry the already-loaded control word.
-    fn decrease_total_supply(
-        &mut self,
-        control: Option<&TokenControl>,
-        amount: U256,
-    ) -> Result<()> {
-        let packed = match control {
-            Some(control) => control.is_packed(),
-            None => self.token_control()?.is_some(),
-        };
-        let supply = self.load_supply(packed)?;
+    /// underflow.
+    fn decrease_total_supply(&mut self, amount: U256) -> Result<()> {
+        let supply = self.load_supply(self.token_control()?.is_some())?;
         let new_supply =
             supply
                 .total
@@ -824,7 +808,10 @@ impl TIP20Token {
                     amount,
                     self.address,
                 ))?;
-        self.store_total_supply(&supply, new_supply)
+        self.store_supply(Supply {
+            total: new_supply,
+            ..supply
+        })
     }
 
     /// Sets `spender`'s allowance to `amount` for the caller's tokens.
@@ -1182,22 +1169,23 @@ impl TIP20Token {
         quote_token: Address,
         admin: Address,
     ) -> Result<()> {
-        self.initialize_with_layout(
+        self.initialize_with_mirror(
             msg_sender,
             name,
             symbol,
             currency,
             quote_token,
             admin,
-            self.storage.spec().is_t14(),
+            false,
         )
     }
 
-    /// Like [`Self::initialize`], with `packed` selecting the TIP-1145 layout. Environments
-    /// mirroring an external registry (e.g. zones) pass `false`, so that authorization always
-    /// follows the canonical TIP-403 registry instead of a local mode cache.
+    /// Like [`Self::initialize`]. With `mirror_registry`, for environments whose TIP-403 state
+    /// mirrors another chain (e.g. zones), the token keeps the legacy layout, as a packed mode
+    /// cache could not be synchronized. Without a registry binding, its policy then resolves from
+    /// the registry's token-specific policy, or rejects all if none is active.
     #[allow(clippy::too_many_arguments)]
-    pub fn initialize_with_layout(
+    pub fn initialize_with_mirror(
         &mut self,
         msg_sender: Address,
         name: &str,
@@ -1205,7 +1193,7 @@ impl TIP20Token {
         currency: &str,
         quote_token: Address,
         admin: Address,
-        packed: bool,
+        mirror_registry: bool,
     ) -> Result<()> {
         trace!(%name, address=%self.address, "Initializing token");
 
@@ -1215,6 +1203,7 @@ impl TIP20Token {
         self.name.write(name.to_string())?;
         self.symbol.write(symbol.to_string())?;
 
+        let packed = !mirror_registry && self.storage.spec().is_t14();
         if !(packed && self.try_initialize_packed(currency, quote_token)?) {
             self.currency.write(currency.to_string())?;
 
@@ -1229,6 +1218,9 @@ impl TIP20Token {
                     .set_token_transfer_policy(self.address, ALLOW_ALL_POLICY_ID)?;
             } else {
                 self.transfer_policy_id.write(ALLOW_ALL_POLICY_ID)?;
+            }
+            if mirror_registry {
+                self.transfer_policy_id.write(TOKEN_POLICY_ID)?;
             }
         }
 
@@ -1283,13 +1275,12 @@ impl TIP20Token {
         self.allowances[owner][spender].write(amount)
     }
 
-    /// Loads the control word, reverting with `ContractPaused` if the token is paused.
-    pub fn check_not_paused(&self) -> Result<TokenControl> {
-        let control = self.load_control()?;
-        if control.is_paused() {
+    /// Reverts with `ContractPaused` if the token is paused.
+    pub fn check_not_paused(&self) -> Result<()> {
+        if self.load_control()?.is_paused() {
             return Err(TIP20Error::contract_paused().into());
         }
-        Ok(control)
+        Ok(())
     }
 
     /// Resolves `to`, checks pause state and recipient validity, ensures TIP-403 transfer
@@ -1310,9 +1301,9 @@ impl TIP20Token {
         memo: B256,
     ) -> Result<Option<Recipient>> {
         let to = Recipient::resolve(to)?;
-        let control = self.check_not_paused()?;
+        self.check_not_paused()?;
         to.validate()?;
-        let policy = self.issuer_policy(Some(&control))?;
+        let policy = self.issuer_policy()?;
         if !self.policy_allows_transfer(policy, from, to.target)? {
             return Err(TIP20Error::policy_forbids().into());
         }
@@ -1347,25 +1338,15 @@ impl TIP20Token {
         let to = Recipient::resolve(to)?;
         self.check_role(msg_sender, ISSUER_ROLE)?;
 
-        // (T14+) The control word selects the supply layout, so it is checked first.
-        let spec = self.storage.spec();
-        let (supply, control) = if spec.is_t14() {
-            let control = self.check_not_paused()?;
-            (self.load_supply(control.is_packed())?, Some(control))
-        } else {
-            let supply = self.load_supply(false)?;
-            (
-                supply,
-                spec.is_t3().then(|| self.check_not_paused()).transpose()?,
-            )
-        };
-        if spec.is_t3() {
+        let supply = self.load_supply(self.token_control()?.is_some())?;
+        if self.storage.spec().is_t3() {
+            self.check_not_paused()?;
             to.validate()?;
         }
 
         // Authorize the resolved target using the role selected by the mint operation.
-        let policy = self.issuer_policy(control.as_ref())?;
-        if !self.policy_allows(&TIP403Registry::new(), policy, to.target, recipient_role)? {
+        let policy = self.issuer_policy()?;
+        if !self.policy_allows(policy, to.target, recipient_role)? {
             return Err(TIP20Error::policy_forbids().into());
         }
 
@@ -1381,7 +1362,7 @@ impl TIP20Token {
     ///
     /// [TIP-1015]: <https://docs.tempo.xyz/protocol/tips/tip-1015>
     pub fn is_transfer_authorized(&self, from: Address, to: Address) -> Result<bool> {
-        let policy = self.issuer_policy(None)?;
+        let policy = self.issuer_policy()?;
         self.policy_allows_transfer(policy, from, to)
     }
 
@@ -1392,24 +1373,18 @@ impl TIP20Token {
         from: Address,
         to: Address,
     ) -> Result<bool> {
-        let registry = TIP403Registry::new();
-        let sender_auth = self.policy_allows(&registry, policy, from, AuthRole::sender())?;
+        let sender_auth = self.policy_allows(policy, from, AuthRole::sender())?;
         // (spec: +T2) short-circuit and skip recipient check if sender fails
         if self.storage.spec().is_t2() && !sender_auth {
             return Ok(false);
         }
-        Ok(self.policy_allows(&registry, policy, to, AuthRole::recipient())? && sender_auth)
+        Ok(self.policy_allows(policy, to, AuthRole::recipient())? && sender_auth)
     }
 
     /// Returns whether the resolved `policy` allows `user` in `role`. Callers resolve `policy` once
-    /// via [`Self::issuer_policy`] and share one `registry` handle across repeated checks.
-    fn policy_allows(
-        &self,
-        registry: &TIP403Registry,
-        policy: IssuerPolicy,
-        user: Address,
-        role: AuthRole,
-    ) -> Result<bool> {
+    /// via [`Self::issuer_policy`] for repeated checks.
+    fn policy_allows(&self, policy: IssuerPolicy, user: Address, role: AuthRole) -> Result<bool> {
+        let registry = TIP403Registry::new();
         match policy {
             IssuerPolicy::Generic(policy_id) => registry.is_authorized_as(policy_id, user, role),
             IssuerPolicy::TokenSpecific(policy) => {
@@ -1420,12 +1395,7 @@ impl TIP20Token {
 
     /// Returns whether `user` is authorized for `role` by the token's active issuer policy.
     pub fn is_authorized_as(&self, user: Address, role: AuthRole) -> Result<bool> {
-        self.policy_allows(
-            &TIP403Registry::new(),
-            self.issuer_policy(None)?,
-            user,
-            role,
-        )
+        self.policy_allows(self.issuer_policy()?, user, role)
     }
 
     /// Ensures the transfer is authorized by the token's [`TIP403Registry`] policy.
@@ -1464,10 +1434,9 @@ impl TIP20Token {
     /// # Errors
     /// - `PolicyForbids` — a user is not authorized for the requested role by the active transfer policy
     pub fn ensure_authorized_as(&self, user_auth: &[(Address, AuthRole)]) -> Result<()> {
-        let policy = self.issuer_policy(None)?;
-        let registry = TIP403Registry::new();
+        let policy = self.issuer_policy()?;
         for &(user, role) in user_auth {
-            if !self.policy_allows(&registry, policy, user, role)? {
+            if !self.policy_allows(policy, user, role)? {
                 return Err(TIP20Error::policy_forbids().into());
             }
         }
@@ -1580,10 +1549,10 @@ impl TIP20Token {
             "checked in ReceivePolicyGuard::claim"
         );
 
-        let control = self.check_not_paused()?;
+        self.check_not_paused()?;
         let destination = Recipient::resolve(to)?;
         destination.validate()?;
-        let policy = self.issuer_policy(Some(&control))?;
+        let policy = self.issuer_policy()?;
         if recovery_mode.is_reroute(to, receiver) {
             let policy_subject = recovery_mode.policy_subject(originator, receiver);
             if !self.policy_allows_transfer(policy, policy_subject, destination.target)?
@@ -1596,12 +1565,7 @@ impl TIP20Token {
             if let Some(addr) = recovery_mode.spending_account(recovery_auth) {
                 self.check_and_update_spending_limit(addr, amount)?;
             }
-        } else if !self.policy_allows(
-            &TIP403Registry::new(),
-            policy,
-            destination.target,
-            AuthRole::recipient(),
-        )? {
+        } else if !self.policy_allows(policy, destination.target, AuthRole::recipient())? {
             return Err(TIP20Error::policy_forbids().into());
         }
 

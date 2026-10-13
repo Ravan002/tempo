@@ -1,7 +1,6 @@
 use alloy::{
     primitives::{B256, U256},
     providers::{Provider, ProviderBuilder},
-    sol_types::SolEvent,
 };
 use reth_e2e_test_utils::wallet::test_signer;
 use tempo_chainspec::spec::TEMPO_T1_BASE_FEE;
@@ -47,9 +46,7 @@ async fn test_create_token() -> eyre::Result<()> {
         .await?;
 
     let event = receipt
-        .logs()
-        .iter()
-        .find_map(|log| ITIP20Factory::TokenCreated::decode_log(&log.inner).ok())
+        .decoded_log::<ITIP20Factory::TokenCreated>()
         .unwrap();
     assert_eq!(event.address, TIP20_FACTORY_ADDRESS);
     assert_eq!(event.name, "Test");

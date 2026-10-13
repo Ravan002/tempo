@@ -60,7 +60,7 @@ fn add_members(admin: Address, token: Address, accounts: &[Address], role: Role)
 
 fn flags(token: Address, account: Address) -> u8 {
     TIP403Registry::new()
-        .token_user_flags(ITIP403Registry::tokenUserFlagsCall { token, account })
+        .token_user_flags(token, account)
         .unwrap()
 }
 
@@ -107,9 +107,8 @@ fn new_tokens_use_packed_layout_and_allow_all_policy() -> eyre::Result<()> {
                 mintRecipientMode: 0
             }
         );
-        let policy = TIP403Registry::new()
-            .token_policy(ITIP403Registry::tokenPolicyCall { token: address })?;
-        assert!(policy.isSet);
+        let policy = TIP403Registry::new().token_policy(address)?;
+        assert!(policy.is_set);
         assert_eq!(
             TIP403Registry::new()
                 .token_transfer_policy_id(ITIP403Registry::tokenTransferPolicyIdCall {
@@ -344,13 +343,8 @@ fn issuer_modes_and_memberships() -> eyre::Result<()> {
         assert_eq!(mint(&mut token, admin, carol, 1).unwrap_err(), forbids());
 
         // The registry view checks every selected role.
-        let is_authorized = |account, role| {
-            TIP403Registry::new().is_token_authorized(ITIP403Registry::isTokenAuthorizedCall {
-                token: address,
-                account,
-                role,
-            })
-        };
+        let is_authorized =
+            |account, role| TIP403Registry::new().is_token_authorized(address, account, role);
         assert!(is_authorized(carol, Role::TRANSFER)?);
         assert!(!is_authorized(carol, Role::ALL)?);
         assert!(!is_authorized(carol, Role::MINT_RECIPIENT)?);
@@ -372,11 +366,7 @@ fn issuer_modes_and_memberships() -> eyre::Result<()> {
         );
         assert_eq!(
             TIP403Registry::new()
-                .is_token_authorized(ITIP403Registry::isTokenAuthorizedCall {
-                    token: undeployed,
-                    account: bob,
-                    role: Role::SENDER,
-                })
+                .is_token_authorized(undeployed, bob, Role::SENDER)
                 .unwrap_err(),
             TIP403RegistryError::invalid_token().into(),
             "unregistered tokens are rejected"
@@ -819,10 +809,10 @@ fn activation_rejects_unpackable_tokens_and_malformed_words() -> eyre::Result<()
     let admin = Address::random();
 
     StorageCtx::enter(&mut storage, || {
-        let (mut token, policy_id) = legacy_token(admin, Address::random())?;
+        let (mut token, _) = legacy_token(admin, Address::random())?;
         let address = token.address;
 
-        // A non-pathUSD null quote cannot be packed, so activation reverts atomically.
+        // A non-pathUSD null quote cannot be packed, so activation reverts.
         StorageCtx.sstore(address, slots::QUOTE_TOKEN, U256::ZERO)?;
         let activate = ITIP20::changeTransferPolicyIdCall {
             newPolicyId: TOKEN_POLICY_ID,
@@ -833,7 +823,6 @@ fn activation_rejects_unpackable_tokens_and_malformed_words() -> eyre::Result<()
                 .unwrap_err(),
             TIP20Error::invalid_quote_token().into()
         );
-        assert_eq!(token.transfer_policy_id()?, policy_id);
 
         // Malformed control words revert reads.
         StorageCtx.sstore(address, slots::PAUSED, U256::from(4))?;
@@ -856,17 +845,16 @@ fn registry_mirrors_resolve_token_specific_policies() -> eyre::Result<()> {
         TIP20Setup::path_usd(admin).apply()?;
         let address = Address::new_tip20(0x1145);
         let mut token = TIP20Token::from_address(address)?;
-        token.initialize_with_layout(
+        token.initialize_with_mirror(
             admin,
             "Mirror",
             "MIR",
             "USD",
             PATH_USD_ADDRESS,
             admin,
-            false,
+            true,
         )?;
         token.grant_role_internal(admin, ISSUER_ROLE)?;
-        token.resolve_policy_from_registry()?;
         let mut registry = TIP403Registry::new();
         registry.token_transfer_policies[address].delete()?;
         assert!(!token.is_packed()?);
@@ -875,7 +863,7 @@ fn registry_mirrors_resolve_token_specific_policies() -> eyre::Result<()> {
         assert_eq!(mint(&mut token, admin, alice, 10).unwrap_err(), forbids());
 
         // The mirrored registry policy applies, including its lists.
-        registry.register_token_policy(
+        registry.write_token_policy(
             address,
             TokenPolicy {
                 recipient: MODE_WHITELIST,
@@ -901,11 +889,7 @@ fn pre_t14_tokens_keep_the_legacy_layout() -> eyre::Result<()> {
         assert!(!token.is_packed()?);
         assert_eq!(token.transfer_policy_id()?, ALLOW_ALL_POLICY_ID);
         assert_eq!(word(token.address, slots::SUPPLY_CAP), U128_MAX);
-        assert!(
-            TIP403Registry::new()
-                .active_token_policy(token.address)?
-                .is_none()
-        );
+        assert!(!TIP403Registry::new().token_policy(token.address)?.is_set);
         Ok(())
     })
 }

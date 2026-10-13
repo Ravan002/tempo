@@ -271,7 +271,6 @@ use alloy::{
     primitives::Address,
     providers::{PendingTransactionBuilder, Provider, RootProvider},
     rpc::client::RpcClient,
-    sol_types::SolEvent,
     transports::http::reqwest::Url,
 };
 use alloy_primitives::{B256, Bytes};
@@ -322,9 +321,7 @@ where
         .get_receipt()
         .await?;
     let event = receipt
-        .logs()
-        .iter()
-        .find_map(|log| ITIP20Factory::TokenCreated::decode_log(&log.inner).ok())
+        .decoded_log::<ITIP20Factory::TokenCreated>()
         .unwrap();
 
     let token_addr = event.token;
