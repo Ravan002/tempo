@@ -70,7 +70,7 @@ on:
         required: false
         default: ""
       token-count:
-        description: 1–20 TIP20 tokens; total state bloat size stays fixed.
+        description: Number of TIP20 tokens to use in txgen presets.
         type: string
         required: true
         default: "4"

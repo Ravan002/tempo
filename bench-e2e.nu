@@ -1371,7 +1371,7 @@ def "main e2e" [
     --accounts: int = 1000                              # Number of accounts
     --max-concurrent-requests: int = 500                # Max concurrent requests
     --bloat: int = $E2E_DEFAULT_BLOAT                   # State bloat snapshot size in GiB: 0, 1, 10, or 100
-    --token-count: int = 4                         # Number of TIP20 tokens used in txgen presets (1..20)
+    --token-count: int = 4                         # Number of TIP20 tokens to use in txgen presets
     --gas-limit: string = $E2E_GAS_LIMIT                # Builder gas limit
     --general-gas-limit: string = $E2E_GENERAL_GAS_LIMIT # General (non-payment) gas limit override
     --force-bloat                                      # Regenerate and promote both local e2e snapshots
