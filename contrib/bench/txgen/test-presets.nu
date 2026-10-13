@@ -36,6 +36,7 @@ assert equal (txgen-prepare-tip1145-activation $default.spec_path "http://127.0.
 # The policy-heavy preset keeps the same payment and receiver checks on both layouts.
 let policy_spec = (txgen-resolve-bench-spec tip20-policy)
 assert equal $policy_spec.kind static
+assert ("tip20-policy" in $TXGEN_HELPER_ALWAYS_FUND_PRESETS)
 assert equal (open $policy_spec.spec_path).merge.templates.tip20_transfer.fee_token (txgen-tip20-token-address 1)
 for packed in [false true] {
     let policy = (txgen-tip20-policy-calls $packed 2 17)

@@ -44,7 +44,8 @@ to configured receivers in a disjoint account pool, paid in AlphaUSD through the
 It requires at least two selected tokens. Setup installs distinct blacklist leaves
 under a separate compound issuer policy per token and both receiver filters on legacy nodes; TIP-1145
 nodes use equivalent token-specific and receiver blacklist modes. Empty blacklists
-allow every user while forcing membership reads. Setup runs outside measurement.
+allow every user while forcing membership reads. All account pools are faucet-funded
+even with state bloat, so receiver setup can pay fees. Setup runs outside measurement.
 For example: `derek bench preset=tip20-policy bloat=100` (E2E), or
 `nu tempo.nu bench --preset tip20-policy` (local). Compare the same preset on
 `tip/1145` and the packed-storage branch; snapshots establish access savings, while

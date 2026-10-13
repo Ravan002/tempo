@@ -10,6 +10,7 @@ const TXGEN_HELPER_ALWAYS_FUND_PRESETS = [
     "neobank-deposit"
     "neobank-swap"
     "neobank-withdraw"
+    "tip20-policy"
     "vault-deposit"
     "vault-withdraw"
 ]
