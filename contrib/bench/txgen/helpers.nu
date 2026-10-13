@@ -25,6 +25,10 @@ const TXGEN_HELPER_FEE_AMM_LIQUIDITY_AMOUNT = 10000000000
 const TXGEN_HELPER_FEE_AMM_2D_LIQUIDITY_AMOUNT = 10000000000000
 const TXGEN_HELPER_DEFAULT_RENDERED_SPECS_DIR = ".bench-tmp/txgen-specs"
 const TXGEN_HELPER_CLICKHOUSE_METRICS_FILE = "contrib/bench/clickhouse-metrics.txt"
+const TXGEN_HELPER_TIP403_REGISTRY = "0x403c000000000000000000000000000000000000"
+const TXGEN_HELPER_TIP1145_TOKEN_POLICY_SELECTOR = "0x96d725df"
+const TXGEN_HELPER_TIP1145_ABI = "contrib/bench/txgen/tip1145.abi.json"
+const TXGEN_HELPER_TIP1145_ACTIVATION_GAS_LIMIT = 10000000
 
 def txgen-tip20-base-scenario [] {
     {
@@ -666,6 +670,46 @@ def txgen-prepare-zones-preset [spec_path: string, count: int, accounts: int, zo
     $output
 }
 
+# Genesis TIP-20s always start in the legacy layout. On TIP-1145 nodes, activating their
+# token-specific policy (`changeTransferPolicyId(type(uint64).max)`) converts them to the packed
+# layout, so runs measure converted tokens. Activation reverts on nodes without TIP-1145, which
+# keep the spec unchanged. The genesis admin is account 0 of the benchmark mnemonic.
+def txgen-prepare-tip1145-activation [spec_path: string, rpc_url: string, token_count: int] {
+    let path_usd = (txgen-tip20-token-address 0)
+    let probe_data = $"($TXGEN_HELPER_TIP1145_TOKEN_POLICY_SELECTOR)000000000000000000000000($path_usd | str substring 2..)"
+    let probe = $"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_call\",\"params\":[{\"to\":\"($TXGEN_HELPER_TIP403_REGISTRY)\",\"data\":\"($probe_data)\"},\"latest\"]}"
+    if not (try { txgen-rpc-call $rpc_url $probe | ignore; true } catch { false }) {
+        return $spec_path
+    }
+
+    let calls = (0..<$token_count | each { |id|
+        {to: (txgen-tip20-token-address $id), abi: TIP1145, function: changeTransferPolicyId, args: ["0xffffffffffffffff"]}
+    })
+    let output_dir = ([ (txgen-repo-root) $TXGEN_HELPER_DEFAULT_RENDERED_SPECS_DIR (random uuid) ] | path join)
+    mkdir $output_dir
+    let fragment = ($output_dir | path join "tip1145-activation.yml")
+    {
+        merge: {
+            artifacts: {TIP1145: ([ (txgen-repo-root) $TXGEN_HELPER_TIP1145_ABI ] | path join)}
+            accounts: {tip1145_admin: {mnemonic: $TXGEN_HELPER_ACCOUNT_MNEMONIC, range: [0 1]}}
+        }
+        append: {setup: {steps: [{
+            id: tip1145_activate
+            tx: {
+                type: tempo
+                from: {pool: tip1145_admin, select: {index: 0}}
+                gas_limit: $TXGEN_HELPER_TIP1145_ACTIVATION_GAS_LIMIT
+                fee_token: $path_usd
+                calls: $calls
+            }
+        }]}}
+    } | to json | save -f $fragment
+    let output = ($output_dir | path join ($spec_path | path basename))
+    {include: [($spec_path | path expand) $fragment]} | to json | save -f $output
+    print $"  TIP-1145 supported: activating ($token_count) TIP20 token\(s\) during setup"
+    $output
+}
+
 def txgen-prepare-vault-preset [spec_path: string, accounts: int, chain_id: int] {
     if $chain_id != 1337 or $accounts <= 0 or $accounts > 100000 {
         error make { msg: "Vault presets require chain ID 1337 and 1..100000 user accounts" }
@@ -804,6 +848,9 @@ def txgen-run-preset-pipeline [
     }
     let total_accounts = $accounts + $recipient_accounts
     let workload_metadata = (txgen-workload-metadata-args $preset_name $spec_path)
+    if not ($is_vault or $preset_name == "zones") {
+        $spec_path = (txgen-prepare-tip1145-activation $spec_path $generate_rpc_url $tx_token_count)
+    }
     if not $skip_faucet_funding {
         txgen-fund-accounts $txgen_tempo_bin $spec_path $generate_rpc_url
     }
