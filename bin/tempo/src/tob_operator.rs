@@ -53,6 +53,8 @@ struct Args {
     #[arg(long, default_value = "127.0.0.1:9900")]
     listen: SocketAddr,
     /// Validators as `<public key>@<consensus ip:port>`, in the order of `--rpc`.
+    /// With only `<consensus ip:port>`, the key is read from the validator's
+    /// RPC (`admin_validatorKey`).
     #[arg(long = "validator")]
     validators: Vec<String>,
     /// JSON-RPC endpoints of the validators, in the order of `--validator`.
@@ -101,7 +103,10 @@ fn main() -> eyre::Result<()> {
     let validators = args
         .validators
         .iter()
-        .map(|value| top_of_block::parse_peer(value))
+        .map(|value| match value.split_once('@') {
+            Some(_) => top_of_block::parse_peer(value).map(|(key, address)| (Some(key), address)),
+            None => Ok((None, value.parse()?)),
+        })
         .collect::<eyre::Result<Vec<_>>>()?;
 
     let storage = tempfile::tempdir()?;
@@ -212,15 +217,43 @@ async fn run(
     context: commonware_runtime::tokio::Context,
     args: Args,
     signer: PrivateKey,
-    validators: Vec<(commonware_cryptography::ed25519::PublicKey, SocketAddr)>,
+    validators: Vec<(
+        Option<commonware_cryptography::ed25519::PublicKey>,
+        SocketAddr,
+    )>,
 ) -> eyre::Result<()> {
+    // Serve the dashboard before anything else so it answers while the
+    // validators are still starting.
+    let dashboard = Arc::new(Mutex::new(Dashboard {
+        operator: signer.public_key().to_string(),
+        makers: args.makers,
+        rate: args.rate,
+        public_rate: args.public_rate,
+        ..Default::default()
+    }));
+    tokio::spawn(serve_dashboard(args.http, dashboard.clone()));
+
     let providers: Vec<RootProvider> = args
         .rpcs
         .iter()
         .map(|url| Ok(ProviderBuilder::default().connect_http(url.parse()?)))
         .collect::<eyre::Result<_>>()?;
-    let chain_id = providers[0].get_chain_id().await?;
-    let gas_price = providers[0].get_gas_price().await?;
+    let chain_id = retry(|| providers[0].get_chain_id()).await;
+    let gas_price = retry(|| providers[0].get_gas_price()).await;
+    let mut resolved = Vec::with_capacity(validators.len());
+    for ((key, address), provider) in validators.into_iter().zip(&providers) {
+        let key = match key {
+            Some(key) => key,
+            None => {
+                let key: B256 =
+                    retry(|| provider.raw_request::<_, B256>("admin_validatorKey".into(), ()))
+                        .await;
+                top_of_block::parse_peer(&format!("{key}@{address}"))?.0
+            }
+        };
+        resolved.push((key, address));
+    }
+    let validators = resolved;
     // Makers pay no tip; the public flow outbids them by far. Pool ordering
     // alone would put the public flow first.
     let maker_tip = 0u128;
@@ -230,7 +263,7 @@ async fn run(
     let mut makers = Vec::new();
     for i in 0..args.makers {
         let signer = MnemonicBuilder::from_phrase_nth(&args.mnemonic, args.maker_offset + i);
-        let nonce = providers[0].get_transaction_count(signer.address()).await?;
+        let nonce = retry(|| providers[0].get_transaction_count(signer.address())).await;
         makers.push(Maker {
             signer,
             nonce: AtomicU64::new(nonce),
@@ -239,14 +272,11 @@ async fn run(
     }
     let makers = Arc::new(makers);
 
-    let dashboard = Arc::new(Mutex::new(Dashboard {
-        operator: signer.public_key().to_string(),
-        makers: args.makers,
-        rate: args.rate,
-        public_rate: args.public_rate,
-        maker_tip_wei: maker_tip,
-        public_tip_wei: public_tip,
-        validators: validators
+    {
+        let mut dashboard = dashboard.lock();
+        dashboard.maker_tip_wei = maker_tip;
+        dashboard.public_tip_wei = public_tip;
+        dashboard.validators = validators
             .iter()
             .zip(&args.rpcs)
             .enumerate()
@@ -258,9 +288,8 @@ async fn run(
                 tob_txs_received: 0,
                 last_ack_rtt_us: None,
             })
-            .collect(),
-        ..Default::default()
-    }));
+            .collect();
+    }
     let public_hashes = Arc::new(Mutex::new(HashSet::<B256>::new()));
 
     let index_of: HashMap<_, _> = validators
@@ -280,7 +309,6 @@ async fn run(
         },
     )?;
 
-    tokio::spawn(serve_dashboard(args.http, dashboard.clone()));
     tokio::spawn(public_flow(
         args.clone_public(),
         providers.clone(),
@@ -478,6 +506,19 @@ async fn run(
                 }
             }
         }
+    }
+}
+
+/// Retries an RPC call until it succeeds; validators may still be starting.
+async fn retry<T, E, F>(mut call: impl FnMut() -> F) -> T
+where
+    F: std::future::IntoFuture<Output = Result<T, E>>,
+{
+    loop {
+        if let Ok(value) = call().await {
+            return value;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
     }
 }
 
