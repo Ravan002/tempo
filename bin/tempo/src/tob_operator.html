@@ -45,7 +45,7 @@
 <body>
 <header>
   <h1>Privileged top-of-block lane</h1>
-  <span class="sub">operator <span class="mono" id="operator"></span></span>
+  <span class="sub">operator <span class="mono" id="operator"></span> · <span id="rpc">0</span> received via <span class="mono">tempo_sendTobTransaction</span></span>
 </header>
 <main>
   <section class="stats">
@@ -170,6 +170,7 @@ async function tick() {
     const good = checked.filter(r => r.verification.prefix_ok && r.built.top_of_block.length > 0);
     document.getElementById("verified").textContent = `${good.length} / ${checked.length}`;
     document.getElementById("operator").textContent = short(state.operator);
+    document.getElementById("rpc").textContent = state.rpc_received.toLocaleString();
     document.getElementById("tips").textContent = `${state.public_tip_wei.toLocaleString()} wei vs ${state.maker_tip_wei} wei`;
     topology(state); current(state); rounds(state);
   } catch (e) { console.error(e); }
