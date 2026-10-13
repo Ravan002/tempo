@@ -32,6 +32,10 @@ pub(crate) struct Registry {
     /// Map from extension name (e.g. `"wallet"`) to its recorded state.
     #[serde(default)]
     pub(crate) extensions: HashMap<String, ExtensionState>,
+    /// Last [`ExtensionState::generation`] handed out. Kept across removals,
+    /// so a reinstall never reuses an earlier generation.
+    #[serde(default)]
+    generation: u64,
 }
 
 /// Persisted metadata for a single extension.
@@ -53,6 +57,11 @@ pub(crate) struct ExtensionState {
     /// next invocation whose stderr is a terminal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) notice: Option<String>,
+    /// Identity of this entry: new whenever an install is recorded or the
+    /// entry is recreated, even for the same version, so a background update
+    /// can tell that the install it started from was replaced.
+    #[serde(default)]
+    pub(crate) generation: u64,
 }
 
 impl Registry {
@@ -162,6 +171,7 @@ impl Registry {
         pinned: bool,
         description: &str,
     ) {
+        let generation = self.next_generation();
         self.extensions.insert(
             extension.to_string(),
             ExtensionState {
@@ -170,6 +180,7 @@ impl Registry {
                 pinned,
                 description: description.to_string(),
                 notice: None,
+                generation,
             },
         );
     }
@@ -182,6 +193,7 @@ impl Registry {
         } else {
             // No record at all — record with empty version so we don't
             // keep retrying on every launch during an outage.
+            let generation = self.next_generation();
             self.extensions.insert(
                 extension.to_string(),
                 ExtensionState {
@@ -190,9 +202,15 @@ impl Registry {
                     pinned: false,
                     description: String::new(),
                     notice: None,
+                    generation,
                 },
             );
         }
+    }
+
+    fn next_generation(&mut self) -> u64 {
+        self.generation += 1;
+        self.generation
     }
 
     /// Returns `true` if a background update check left a notice to show.
@@ -249,7 +267,7 @@ fn now_secs() -> u64 {
 /// Uses `TEMPO_HOME/extensions.json` if set, otherwise the platform data
 /// directory via `dirs_next` (e.g. `~/Library/Application Support/tempo` on
 /// macOS, `$XDG_DATA_HOME/tempo` on Linux).
-fn state_path() -> Option<PathBuf> {
+pub(crate) fn state_path() -> Option<PathBuf> {
     if let Some(home) = env::var_os("TEMPO_HOME") {
         Some(PathBuf::from(home).join("extensions.json"))
     } else {
@@ -408,6 +426,7 @@ mod tests {
                 pinned: false,
                 description: String::new(),
                 notice: None,
+                generation: 0,
             },
         );
         assert!(reg.needs_update_check("wallet"));
@@ -534,6 +553,45 @@ mod tests {
             .map(|e| e.unwrap().file_name())
             .collect();
         assert_eq!(names, ["extensions.json"]);
+    }
+
+    #[test]
+    fn generation_identifies_each_recorded_install() {
+        let mut reg = Registry::default();
+        let generation = |reg: &Registry| reg.extensions["wallet"].generation;
+
+        reg.record_check("wallet", "1.0.0", false, "");
+        let first = generation(&reg);
+        reg.touch_check("wallet");
+        assert_eq!(generation(&reg), first, "a check is not a new install");
+
+        reg.record_check("wallet", "1.0.0", false, "");
+        let reinstall = generation(&reg);
+        assert_ne!(reinstall, first, "same-version reinstall");
+
+        reg.extensions.remove("wallet");
+        reg.touch_check("wallet");
+        assert!(
+            ![first, reinstall].contains(&generation(&reg)),
+            "a recreated entry never reuses a generation"
+        );
+
+        let json = serde_json::to_string(&reg).unwrap();
+        let mut loaded: Registry = serde_json::from_str(&json).unwrap();
+        loaded.record_check("other", "1.0.0", false, "");
+        assert!(
+            loaded.extensions["other"].generation > generation(&reg),
+            "the counter survives a save and load"
+        );
+    }
+
+    #[test]
+    fn deserialize_without_generation_defaults_zero() {
+        let json = r#"{"extensions":{"wallet":{"checked_at":0,"installed_version":"1.0.0"}}}"#;
+        let mut reg: Registry = serde_json::from_str(json).unwrap();
+        assert_eq!(reg.extensions["wallet"].generation, 0);
+        reg.record_check("wallet", "1.0.0", false, "");
+        assert_eq!(reg.extensions["wallet"].generation, 1);
     }
 
     #[test]

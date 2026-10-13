@@ -21,7 +21,7 @@ tempo remove <extension>        →  delete binary and skill files
 
 ## Auto-update
 
-At most once every 6 hours per extension, `tempo <extension>` starts a detached background process after the extension exits. It checks the release manifest, downloads and verifies a newer version (binary and skill file), and installs it unless the extension was removed, pinned, or reinstalled in the meantime. The invocation itself never waits on the update; the next one uses it. Pinned extensions are only checked, never upgraded.
+At most once every 6 hours per extension, `tempo <extension>` starts a detached background process after the extension exits. It checks the release manifest, downloads and verifies a newer version (binary and skill file), and installs it unless the extension was removed, pinned, or reinstalled (even at the same version) in the meantime. The background process records the check itself, so an invocation that is interrupted before starting it leaves the check for the next one. The invocation never waits on the update; the next one uses it. Pinned extensions are only checked, never upgraded.
 
 The background process writes nothing to the terminal. Instead it leaves a notice (e.g. `updated tempo-wallet to 1.2.0`) that is printed to stderr on the next invocation whose stderr is a terminal, so scripts and agents never see it.
 

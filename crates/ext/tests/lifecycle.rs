@@ -314,12 +314,28 @@ impl Fixture {
             .map(|s| s.to_string())
     }
 
+    fn read_registry(&self) -> serde_json::Value {
+        serde_json::from_str(&fs::read_to_string(self.home.join("extensions.json")).unwrap())
+            .unwrap()
+    }
+
+    /// Mark an extension's update check as due, keeping the rest of its entry.
+    fn make_due(&self, extension: &str) {
+        let mut reg = self.read_registry();
+        reg["extensions"][extension]["checked_at"] = 0.into();
+        fs::write(self.home.join("extensions.json"), reg.to_string()).unwrap();
+    }
+
+    /// Read the last update check time from the registry.
+    fn checked_at(&self, extension: &str) -> u64 {
+        self.read_registry()["extensions"][extension]["checked_at"]
+            .as_u64()
+            .unwrap()
+    }
+
     /// Read the pending update notice from the registry.
     fn notice(&self, extension: &str) -> Option<String> {
-        let reg: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(self.home.join("extensions.json")).unwrap())
-                .unwrap();
-        reg["extensions"][extension]["notice"]
+        self.read_registry()["extensions"][extension]["notice"]
             .as_str()
             .map(|s| s.to_string())
     }
@@ -999,6 +1015,7 @@ fn auto_update_command_installs_or_reports() {
 
         let after = fs::read(fix.binary_path("testpkg")).unwrap();
         let case = format!("pinned={pinned} latest={latest}");
+        assert!(fix.checked_at("testpkg") > 0, "{case}: check recorded");
         assert_eq!(before != after, replaced, "{case}");
         assert_eq!(fix.is_pinned("testpkg"), pinned, "{case}: pin preserved");
         let expected_version = if replaced { latest } else { "1.0.0" };
@@ -1014,33 +1031,81 @@ fn auto_update_command_installs_or_reports() {
 #[cfg(unix)]
 #[test]
 fn auto_update_yields_to_changes_made_during_check() {
-    use std::io::Write;
+    use std::{io::Write, sync::mpsc, time::Duration};
 
     type Change = fn(&Fixture);
-    // (change made while the update is in flight, binary version, registry version)
-    let cases: [(Change, Option<&str>, Option<&str>); 4] = [
-        (|_| {}, Some("2.0.0"), Some("2.0.0")),
+    // (change made while the update is in flight, binary version, registry
+    // version, notice recorded)
+    let cases: [(Change, Option<&str>, Option<&str>, bool); 6] = [
+        (|_| {}, Some("2.0.0"), Some("2.0.0"), true),
         (
             |fix| assert_eq!(fix.run(&["tempo", "remove", "testpkg"]).unwrap(), 0),
             None,
             None,
+            false,
         ),
         (
             |fix| fix.record_installed_version_inner("testpkg", "1.0.0", true),
             Some("1.0.0"),
             Some("1.0.0"),
+            false,
         ),
         (
             |fix| fix.record_installed_version("testpkg", "1.5.0"),
             Some("1.0.0"),
             Some("1.5.0"),
+            false,
+        ),
+        // Same-version reinstall: only the install generation changes.
+        (
+            |fix| {
+                fix.run(&["tempo", "remove", "testpkg"]).unwrap();
+                let release = format!("file://{}", fix.base_dir.join("v1/manifest.json").display());
+                let args = ["tempo", "add", "testpkg", "--release-manifest", &release];
+                fix.run(&args).unwrap();
+                assert!(!fix.is_pinned("testpkg"));
+            },
+            Some("1.0.0"),
+            Some("1.0.0"),
+            false,
+        ),
+        // A second updater finds the check claimed and exits without
+        // waiting on it.
+        (
+            |_| {
+                let (tx, rx) = mpsc::channel();
+                std::thread::spawn(move || {
+                    let code = tempo_ext::run(["tempo", "__auto-update", "testpkg"]).unwrap();
+                    tx.send(code).unwrap();
+                });
+                let code = rx.recv_timeout(Duration::from_secs(10));
+                assert_eq!(code, Ok(0), "second updater must exit immediately");
+            },
+            Some("2.0.0"),
+            Some("2.0.0"),
+            true,
         ),
     ];
-    for (i, (change, binary_version, registry_version)) in cases.into_iter().enumerate() {
+    for (i, (change, binary_version, registry_version, notice)) in cases.into_iter().enumerate() {
         let _lock = lock();
         let fix = Fixture::new();
         fix.publish_extension("testpkg", "1.0.0");
         fix.run(&["tempo", "add", "testpkg"]).unwrap();
+        fix.make_due("testpkg");
+
+        // Keep a copy of the 1.0.0 release so it can be reinstalled after
+        // 2.0.0 replaces the published one.
+        let platform_key = platform_binary_name("testpkg");
+        let ext_dir = fix.base_dir.join("extensions/tempo-testpkg");
+        let copy_dir = fix.base_dir.join("v1");
+        fs::create_dir_all(&copy_dir).unwrap();
+        fs::copy(ext_dir.join(&platform_key), copy_dir.join(&platform_key)).unwrap();
+        let mut release: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(ext_dir.join("manifest.json")).unwrap())
+                .unwrap();
+        release["binaries"][&platform_key]["url"] =
+            format!("file://{}", copy_dir.join(&platform_key).display()).into();
+        fs::write(copy_dir.join("manifest.json"), release.to_string()).unwrap();
 
         // Serve the 2.0.0 manifest through a FIFO so the update blocks
         // mid-check until the change has been made.
@@ -1068,7 +1133,7 @@ fn auto_update_yields_to_changes_made_during_check() {
             registry_version,
             "case {i}: registry"
         );
-        assert_eq!(fix.notice("testpkg").is_some(), i == 0, "case {i}: notice");
+        assert_eq!(fix.notice("testpkg").is_some(), notice, "case {i}: notice");
     }
 }
 
@@ -1084,7 +1149,27 @@ fn auto_update_after_remove_is_noop() {
     let code = fix.run(&["tempo", "__auto-update", "testpkg"]).unwrap();
     assert_eq!(code, 0);
     assert!(!fix.binary_path("testpkg").exists());
-    assert_eq!(fix.installed_version("testpkg"), None);
+    assert!(tempo_ext::installed_extensions().unwrap().is_empty());
+}
+
+#[test]
+fn auto_update_command_skips_claimed_check() {
+    let _lock = lock();
+    let fix = Fixture::new();
+    fix.publish_extension("testpkg", "1.0.0");
+    fix.run(&["tempo", "add", "testpkg"]).unwrap();
+    let before = fs::read(fix.binary_path("testpkg")).unwrap();
+    fix.publish_extension("testpkg", "2.0.0");
+
+    // The check was just recorded, as if by another updater: do nothing.
+    fix.run(&["tempo", "__auto-update", "testpkg"]).unwrap();
+    assert_eq!(fs::read(fix.binary_path("testpkg")).unwrap(), before);
+    assert_eq!(fix.installed_version("testpkg").as_deref(), Some("1.0.0"));
+
+    // Once due again, the updater claims the check and installs.
+    fix.make_due("testpkg");
+    fix.run(&["tempo", "__auto-update", "testpkg"]).unwrap();
+    assert_eq!(fix.installed_version("testpkg").as_deref(), Some("2.0.0"));
 }
 
 #[test]
@@ -1147,6 +1232,7 @@ fn update_clears_pending_notice() {
     let fix = Fixture::new();
     fix.publish_extension("testpkg", "1.0.0");
     fix.run(&["tempo", "add", "testpkg", "1.0.0"]).unwrap();
+    fix.make_due("testpkg");
 
     fix.publish_extension("testpkg", "2.0.0");
     fix.run(&["tempo", "__auto-update", "testpkg"]).unwrap();
