@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::{
-    PATH_USD_ADDRESS, TIP403_REGISTRY_ADDRESS,
+    PATH_USD_ADDRESS, Precompile, TIP403_REGISTRY_ADDRESS,
     error::TempoPrecompileError,
     receive_policy_guard::{BLOCKED_RECEIPT_VERSION, IReceivePolicyGuard, InboundKind},
     storage::{StorageCtx, StorageKey, hashmap::HashMapStorageProvider},
@@ -13,7 +13,10 @@ use crate::{
         REJECT_ALL_POLICY_ID, SENDER_FLAG, tip403_registry_slots,
     },
 };
-use alloy::{primitives::LogData, sol_types::SolEvent};
+use alloy::{
+    primitives::LogData,
+    sol_types::{SolCall, SolEvent},
+};
 use tempo_contracts::precompiles::ITIP403Registry::{
     AuthRole as Role, BlockedReason, MembershipKind, PolicyMode,
 };
@@ -84,6 +87,13 @@ fn mint(token: &mut TIP20Token, issuer: Address, to: Address, amount: u64) -> Re
     )
 }
 
+/// Reads `receiveConfig` through ABI dispatch.
+fn receive_config(receiver: Address) -> ITIP403Registry::receiveConfigReturn {
+    let call = ITIP403Registry::receiveConfigCall { receiver }.abi_encode();
+    let output = TIP403Registry::new().call(&call, Address::ZERO).unwrap();
+    ITIP403Registry::receiveConfigCall::abi_decode_returns(&output.bytes).unwrap()
+}
+
 fn forbids() -> TempoPrecompileError {
     TIP20Error::policy_forbids().into()
 }
@@ -99,14 +109,7 @@ fn new_tokens_use_packed_layout_and_allow_all_policy() -> eyre::Result<()> {
 
         assert!(token.is_packed()?);
         assert_eq!(token.transfer_policy_id()?, TOKEN_POLICY_ID);
-        assert_eq!(
-            token.transfer_policy()?,
-            ITIP20::transferPolicyReturn {
-                senderMode: 0,
-                recipientMode: 0,
-                mintRecipientMode: 0
-            }
-        );
+        assert_eq!(token.transfer_policy()?, TokenPolicy::ALLOW_ALL);
         let policy = TIP403Registry::new().token_policy(address)?;
         assert!(policy.is_set);
         assert_eq!(
@@ -296,7 +299,7 @@ fn issuer_modes_and_memberships() -> eyre::Result<()> {
 
         // Sender blacklist and recipient whitelist.
         set_modes(admin, address, MODE_BLACKLIST, MODE_WHITELIST, MODE_ALLOW)?;
-        assert_eq!(token.transfer_policy()?.senderMode, MODE_BLACKLIST as u8);
+        assert_eq!(token.transfer_policy()?.sender, MODE_BLACKLIST);
         assert_eq!(
             transfer(&mut token, alice, bob, 10).unwrap_err(),
             forbids(),
@@ -317,7 +320,12 @@ fn issuer_modes_and_memberships() -> eyre::Result<()> {
         assert!(transfer(&mut token, alice, bob, 10)?);
 
         // `ALL` edits all three lists without touching the receive-token bit.
-        TIP403Registry::new().modify_receive_tokens(carol, &[address], true)?;
+        TIP403Registry::new().modify_receive_list(
+            carol,
+            MembershipKind::RECEIVE_TOKEN,
+            &[address],
+            true,
+        )?;
         add_members(admin, address, &[carol], Role::ALL)?;
         assert_eq!(
             flags(address, carol),
@@ -474,7 +482,7 @@ fn receive_configs_filter_tokens_then_senders() -> eyre::Result<()> {
             },
         )?;
         assert_eq!(
-            registry.receive_config(receiver)?,
+            receive_config(receiver),
             ITIP403Registry::receiveConfigReturn {
                 hasReceivePolicy: true,
                 tokenMode: MODE_WHITELIST,
@@ -538,7 +546,7 @@ fn receive_configs_filter_tokens_then_senders() -> eyre::Result<()> {
         );
 
         // Whitelisting the token (a future-token-capable list) lets the transfer through.
-        registry.modify_receive_tokens(receiver, &[address], true)?;
+        registry.modify_receive_list(receiver, MembershipKind::RECEIVE_TOKEN, &[address], true)?;
         assert_eq!(flags(address, receiver), RECEIVE_TOKEN_FLAG);
         assert!(transfer(&mut token, sender, receiver, 10)?);
         assert_eq!(
@@ -547,8 +555,8 @@ fn receive_configs_filter_tokens_then_senders() -> eyre::Result<()> {
         );
 
         // Blacklisting the sender blocks with `RECEIVE_POLICY`.
-        registry.modify_receive_senders(receiver, &[sender], true)?;
-        assert!(registry.receive_sender_membership(receiver, sender)?);
+        registry.modify_receive_list(receiver, MembershipKind::RECEIVE_SENDER, &[sender], true)?;
+        assert!(registry.receive_sender_members[receiver][sender].read()?);
         assert_eq!(
             registry.validate_receive_policy(address, sender, receiver)?,
             Some(BlockedReason::RECEIVE_POLICY)
@@ -602,13 +610,23 @@ fn receive_configs_filter_tokens_then_senders() -> eyre::Result<()> {
         // Caller restrictions.
         assert_eq!(
             registry
-                .modify_receive_tokens(RECEIVE_POLICY_GUARD_ADDRESS, &[], true)
+                .modify_receive_list(
+                    RECEIVE_POLICY_GUARD_ADDRESS,
+                    MembershipKind::RECEIVE_TOKEN,
+                    &[],
+                    true
+                )
                 .unwrap_err(),
             TIP403RegistryError::address_reserved().into()
         );
         assert_eq!(
             registry
-                .modify_receive_tokens(receiver, &[Address::random()], true)
+                .modify_receive_list(
+                    receiver,
+                    MembershipKind::RECEIVE_TOKEN,
+                    &[Address::random()],
+                    true
+                )
                 .unwrap_err(),
             TIP403RegistryError::invalid_token().into()
         );
@@ -635,7 +653,7 @@ fn unconfigured_receivers_report_allow_all() -> eyre::Result<()> {
     StorageCtx::enter(&mut storage, || {
         let receiver = Address::random();
         assert_eq!(
-            TIP403Registry::new().receive_config(receiver)?,
+            receive_config(receiver),
             ITIP403Registry::receiveConfigReturn {
                 hasReceivePolicy: false,
                 tokenMode: MODE_ALLOW,

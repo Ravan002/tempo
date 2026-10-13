@@ -191,7 +191,7 @@ impl TIP20Token {
 
     /// Returns the current total supply.
     pub fn total_supply(&self) -> Result<U256> {
-        Ok(self.load_supply(self.token_control()?.is_some())?.total)
+        Ok(self.load_supply()?.total)
     }
 
     /// Returns the active quote token address used for pricing.
@@ -206,8 +206,7 @@ impl TIP20Token {
 
     /// Returns the maximum mintable supply.
     pub fn supply_cap(&self) -> Result<U256> {
-        let supply = self.load_supply(self.token_control()?.is_some())?;
-        self.supply_cap_of(&supply)
+        self.supply_cap_of(&self.load_supply()?)
     }
 
     /// Returns whether the token is currently paused.
@@ -229,13 +228,9 @@ impl TIP20Token {
     ///
     /// # Errors
     /// - `InvalidTransferPolicyId` — the token uses a generic TIP-403 policy
-    pub fn transfer_policy(&self) -> Result<ITIP20::transferPolicyReturn> {
+    pub fn transfer_policy(&self) -> Result<TokenPolicy> {
         match self.issuer_policy()? {
-            IssuerPolicy::TokenSpecific(policy) => Ok(ITIP20::transferPolicyReturn {
-                senderMode: policy.sender as u8,
-                recipientMode: policy.recipient as u8,
-                mintRecipientMode: policy.mint_recipient as u8,
-            }),
+            IssuerPolicy::TokenSpecific(policy) => Ok(policy),
             IssuerPolicy::Generic(_) => Err(TIP20Error::invalid_transfer_policy_id().into()),
         }
     }
@@ -391,7 +386,7 @@ impl TIP20Token {
         call: ITIP20::setSupplyCapCall,
     ) -> Result<()> {
         self.check_role(msg_sender, DEFAULT_ADMIN_ROLE)?;
-        let supply = self.load_supply(self.token_control()?.is_some())?;
+        let supply = self.load_supply()?;
         if call.newSupplyCap < supply.total {
             return Err(TIP20Error::invalid_supply_cap().into());
         }
@@ -798,7 +793,7 @@ impl TIP20Token {
     /// Reduces total supply by a burned `amount`, reverting with `InsufficientBalance` on
     /// underflow.
     fn decrease_total_supply(&mut self, amount: U256) -> Result<()> {
-        let supply = self.load_supply(self.token_control()?.is_some())?;
+        let supply = self.load_supply()?;
         let new_supply =
             supply
                 .total
@@ -1338,7 +1333,7 @@ impl TIP20Token {
         let to = Recipient::resolve(to)?;
         self.check_role(msg_sender, ISSUER_ROLE)?;
 
-        let supply = self.load_supply(self.token_control()?.is_some())?;
+        let supply = self.load_supply()?;
         if self.storage.spec().is_t3() {
             self.check_not_paused()?;
             to.validate()?;

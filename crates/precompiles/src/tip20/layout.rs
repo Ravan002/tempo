@@ -182,9 +182,9 @@ impl TIP20Token {
 
     // ----- supply -----------------------------------------------------------------------------
 
-    /// Loads the total supply for the given layout.
-    pub(crate) fn load_supply(&self, packed: bool) -> Result<Supply> {
-        Ok(if packed {
+    /// Loads the total supply in the token's layout.
+    pub(crate) fn load_supply(&self) -> Result<Supply> {
+        Ok(if self.token_control()?.is_some() {
             let supply = self.supply_slot().read()?;
             Supply {
                 total: U256::from(supply.total_supply),
@@ -218,7 +218,7 @@ impl TIP20Token {
     /// Overwrites the total supply in either layout (test helper).
     #[cfg(test)]
     pub(crate) fn set_total_supply(&mut self, total: U256) -> Result<()> {
-        let supply = self.load_supply(self.is_packed()?)?;
+        let supply = self.load_supply()?;
         self.store_supply(Supply { total, ..supply })
     }
 

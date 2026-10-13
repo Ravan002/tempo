@@ -67,19 +67,15 @@ impl Storable for PolicyMode {
     }
 }
 
-/// Returns whether `mode` allows an account with list membership `member`.
-fn allows(mode: PolicyMode, member: bool) -> bool {
-    match mode {
+/// Returns whether `mode` allows an account, evaluating its list `member`ship only for list
+/// modes.
+fn allows(mode: PolicyMode, member: impl FnOnce() -> Result<bool>) -> Result<bool> {
+    Ok(match mode {
         PolicyMode::ALLOW => true,
-        PolicyMode::WHITELIST => member,
-        PolicyMode::BLACKLIST => !member,
+        PolicyMode::WHITELIST => member()?,
+        PolicyMode::BLACKLIST => !member()?,
         PolicyMode::DENY | PolicyMode::__Invalid => false,
-    }
-}
-
-/// Returns whether `mode` consults its membership list.
-fn is_list(mode: PolicyMode) -> bool {
-    matches!(mode, PolicyMode::WHITELIST | PolicyMode::BLACKLIST)
+    })
 }
 
 /// Maps an ABI role to its issuer membership mask.
@@ -106,17 +102,6 @@ impl AuthRole {
     }
 }
 
-impl From<TokenPolicy> for ITIP403Registry::tokenPolicyReturn {
-    fn from(policy: TokenPolicy) -> Self {
-        Self {
-            isSet: policy.is_set,
-            senderMode: policy.sender,
-            recipientMode: policy.recipient,
-            mintRecipientMode: policy.mint_recipient,
-        }
-    }
-}
-
 impl TokenPolicy {
     /// Active policy with all three roles in `ALLOW` mode (the creation default).
     pub const ALLOW_ALL: Self = Self {
@@ -125,15 +110,6 @@ impl TokenPolicy {
         recipient: PolicyMode::ALLOW,
         mint_recipient: PolicyMode::ALLOW,
     };
-
-    /// Issuer roles in evaluation order.
-    fn roles(&self) -> [(u8, PolicyMode); 3] {
-        [
-            (SENDER_FLAG, self.sender),
-            (RECIPIENT_FLAG, self.recipient),
-            (MINT_RECIPIENT_FLAG, self.mint_recipient),
-        ]
-    }
 
     /// Packs the modes into the TIP-20 control byte: two bits per role, sender lowest.
     pub(crate) fn modes_byte(&self) -> u8 {
@@ -181,7 +157,7 @@ fn ensure_receive_owner(msg_sender: Address) -> Result<()> {
 impl ReceiveConfig {
     /// Returns the public recovery authority: zero for originator recovery, the receiver for
     /// receiver recovery, or the third party.
-    fn recovery_authority(&self, receiver: Address) -> Address {
+    pub(super) fn recovery_authority(&self, receiver: Address) -> Address {
         match self.recovery_mode {
             RecoveryMode::Originator => Address::ZERO,
             RecoveryMode::Receiver => receiver,
@@ -254,17 +230,22 @@ impl TIP403Registry {
         }
 
         let mut flags = None;
-        for (flag, mode) in policy.roles() {
+        for (flag, mode) in [
+            (SENDER_FLAG, policy.sender),
+            (RECIPIENT_FLAG, policy.recipient),
+            (MINT_RECIPIENT_FLAG, policy.mint_recipient),
+        ] {
             if mask & flag == 0 {
                 continue;
             }
-            let member = is_list(mode)
-                && match flags {
+            let member = || {
+                let flags = match flags {
                     Some(flags) => flags,
                     None => *flags.insert(self.token_user_flags(token, account)?),
-                } & flag
-                    != 0;
-            if !allows(mode, member) {
+                };
+                Ok(flags & flag != 0)
+            };
+            if !allows(mode, member)? {
                 return Ok(false);
             }
         }
@@ -373,25 +354,10 @@ impl TIP403Registry {
     // ----- receive configurations -------------------------------------------------------------
 
     /// Returns the active receive configuration of `receiver`, or `None` if not opted in.
-    pub(crate) fn load_receive_config(&self, receiver: Address) -> Result<Option<ReceiveConfig>> {
+    pub(crate) fn receive_config(&self, receiver: Address) -> Result<Option<ReceiveConfig>> {
         Ok(match self.receive_policies[receiver].config.read()? {
             ReceivePolicyConfig::Config(config) => Some(config),
             ReceivePolicyConfig::Legacy(_) => None,
-        })
-    }
-
-    /// Returns the receive configuration. Unconfigured receivers report allow-all with
-    /// originator recovery.
-    pub fn receive_config(
-        &self,
-        receiver: Address,
-    ) -> Result<ITIP403Registry::receiveConfigReturn> {
-        let config = self.load_receive_config(receiver)?;
-        Ok(ITIP403Registry::receiveConfigReturn {
-            hasReceivePolicy: config.is_some(),
-            tokenMode: config.map_or(PolicyMode::ALLOW, |c| c.token_mode),
-            senderMode: config.map_or(PolicyMode::ALLOW, |c| c.sender_mode),
-            recoveryAuthority: config.map_or(Address::ZERO, |c| c.recovery_authority(receiver)),
         })
     }
 
@@ -440,62 +406,39 @@ impl TIP403Registry {
         })
     }
 
-    /// Adds or removes tokens from the caller's receive-token list. Supports future tokens.
+    /// Adds or removes accounts from the caller's receive-token (`RECEIVE_TOKEN`) or
+    /// receive-sender (`RECEIVE_SENDER`) list. Token lists support future tokens.
     ///
     /// # Errors
-    /// - `VirtualAddressNotAllowed` — caller is a virtual address
+    /// - `VirtualAddressNotAllowed` — caller or a listed sender is a virtual address
     /// - `AddressReserved` — caller is the `ReceivePolicyGuard`
-    /// - `InvalidToken` — a token lacks the TIP-20 prefix
-    pub fn modify_receive_tokens(
+    /// - `InvalidToken` — a listed token lacks the TIP-20 prefix
+    pub fn modify_receive_list(
         &mut self,
         msg_sender: Address,
-        tokens: &[Address],
+        kind: MembershipKind,
+        accounts: &[Address],
         is_member: bool,
     ) -> Result<()> {
+        debug_assert_ne!(kind, MembershipKind::ISSUER);
         ensure_receive_owner(msg_sender)?;
-        for &token in tokens {
-            ensure_tip20_prefix(token)?;
-            self.set_token_flags(token, msg_sender, RECEIVE_TOKEN_FLAG, is_member)?;
+        for &account in accounts {
+            if kind == MembershipKind::RECEIVE_TOKEN {
+                ensure_tip20_prefix(account)?;
+                self.set_token_flags(account, msg_sender, RECEIVE_TOKEN_FLAG, is_member)?;
+            } else {
+                ensure_not_virtual(account)?;
+                self.receive_sender_members[msg_sender][account].write(is_member)?;
+            }
             self.emit_event(ITIP403Registry::PolicyMembershipUpdated {
-                kind: MembershipKind::RECEIVE_TOKEN,
+                kind,
                 owner: msg_sender,
-                account: token,
+                account,
                 role: Role::SENDER,
                 isMember: is_member,
             })?;
         }
         Ok(())
-    }
-
-    /// Adds or removes senders from the caller's receive-sender list.
-    ///
-    /// # Errors
-    /// - `VirtualAddressNotAllowed` — caller or a sender is a virtual address
-    /// - `AddressReserved` — caller is the `ReceivePolicyGuard`
-    pub fn modify_receive_senders(
-        &mut self,
-        msg_sender: Address,
-        senders: &[Address],
-        is_member: bool,
-    ) -> Result<()> {
-        ensure_receive_owner(msg_sender)?;
-        for &sender in senders {
-            ensure_not_virtual(sender)?;
-            self.receive_sender_members[msg_sender][sender].write(is_member)?;
-            self.emit_event(ITIP403Registry::PolicyMembershipUpdated {
-                kind: MembershipKind::RECEIVE_SENDER,
-                owner: msg_sender,
-                account: sender,
-                role: Role::SENDER,
-                isMember: is_member,
-            })?;
-        }
-        Ok(())
-    }
-
-    /// Returns whether `sender` is in `receiver`'s receive-sender list.
-    pub fn receive_sender_membership(&self, receiver: Address, sender: Address) -> Result<bool> {
-        self.receive_sender_members[receiver][sender].read()
     }
 
     /// Evaluates an active receive configuration. Token rejection has priority; constant modes
@@ -507,17 +450,14 @@ impl TIP403Registry {
         sender: Address,
         receiver: Address,
     ) -> Result<Option<(BlockedReason, Address)>> {
-        let token_member = is_list(config.token_mode)
-            && self.token_user_flags(token, receiver)? & RECEIVE_TOKEN_FLAG != 0;
-        let reason = if !allows(config.token_mode, token_member) {
+        let token_member = || Ok(self.token_user_flags(token, receiver)? & RECEIVE_TOKEN_FLAG != 0);
+        let sender_member = || self.receive_sender_members[receiver][sender].read();
+        let reason = if !allows(config.token_mode, token_member)? {
             BlockedReason::TOKEN_FILTER
-        } else {
-            let sender_member = is_list(config.sender_mode)
-                && self.receive_sender_members[receiver][sender].read()?;
-            if allows(config.sender_mode, sender_member) {
-                return Ok(None);
-            }
+        } else if !allows(config.sender_mode, sender_member)? {
             BlockedReason::RECEIVE_POLICY
+        } else {
+            return Ok(None);
         };
         Ok(Some((reason, config.recovery_authority(receiver))))
     }

@@ -39,7 +39,14 @@ impl Precompile for TIP20Token {
                     supplyCap(call) => view(call, |_| self.supply_cap()),
                     transferPolicyId(call) => view(call, |_| self.transfer_policy_id()),
                     #[schedule(since = T14)]
-                    transferPolicy(call) => view(call, |_| self.transfer_policy()),
+                    transferPolicy(call) => view(call, |_| {
+                        let policy = self.transfer_policy()?;
+                        Ok(ITIP20::transferPolicyReturn {
+                            senderMode: policy.sender as u8,
+                            recipientMode: policy.recipient as u8,
+                            mintRecipientMode: policy.mint_recipient as u8,
+                        })
+                    }),
                     paused(call) => view(call, |_| self.paused()),
                     #[schedule(since = T5)]
                     logoURI(call) => view(call, |_| self.logo_uri()),
