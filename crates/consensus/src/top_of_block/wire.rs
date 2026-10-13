@@ -53,7 +53,8 @@ pub struct SubmitTx {
 pub enum AckStatus {
     /// The lane processed the submission; see the counters.
     Ok = 0,
-    /// The receiver does not lead this round.
+    /// The round is earlier than the last one the receiver opened, or too
+    /// many rounds are already pending.
     NotOpen = 1,
     /// The receiver's builder already took the lane for this round.
     Closed = 2,
@@ -75,7 +76,8 @@ pub struct Ack {
     /// the operator's limits, belong to a slot held by another operator, or
     /// did not raise their slot's sequence.
     pub rejected: u32,
-    /// Time between opening the lane and receiving the submission.
+    /// Time between opening the lane and receiving the submission; zero if
+    /// the submission arrived before the lane opened.
     pub since_open_us: u64,
 }
 
