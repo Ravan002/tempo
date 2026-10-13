@@ -32,7 +32,7 @@ use tempo_contracts::precompiles::{
 };
 use tempo_precompiles::{storage::StorageActions, tip_fee_manager::TipFeeManager};
 use tempo_primitives::{SubBlockMetadata, TempoReceipt, TempoTxEnvelope, TempoTxType};
-use tempo_revm::{ExecutionContext, TempoStateAccess, evm::TempoContext};
+use tempo_revm::{ExecutionContext, evm::TempoContext};
 use tracing::trace;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -504,13 +504,13 @@ where
         }
 
         let beneficiary = self.evm().block().beneficiary;
-        let token = self
-            .evm_mut()
-            .db_mut()
-            .with_read_only_storage_ctx(spec, StorageActions::disabled(), || {
-                TipFeeManager::new().get_validator_token(beneficiary)
-            })
-            .map_err(BlockExecutionError::other)?;
+        let token = tempo_revm::TempoStateAccess::<()>::with_read_only_storage_ctx(
+            self.evm_mut().db_mut(),
+            spec,
+            StorageActions::disabled(),
+            || TipFeeManager::new().get_validator_token(beneficiary),
+        )
+        .map_err(BlockExecutionError::other)?;
         let calldata = IFeeManager::distributeFeesCall {
             validator: beneficiary,
             token,
@@ -814,6 +814,7 @@ mod tests {
         storage::{ContractStorage, Handler, StorageCtx},
         test_util::TIP20Setup,
         tip20::{ITIP20, TIP20Token},
+        tip403_registry::TIP403Registry,
     };
     use tempo_primitives::{
         SubBlockMetadata, TempoSignature, TempoTransaction, TempoTxType,
@@ -2498,6 +2499,7 @@ mod tests {
                     .build(&mut db, &chainspec);
                 executor.evm_mut().block.beneficiary = validator;
                 let (token, old_token) = with_fee_payout_storage(&mut executor, || {
+                    TIP403Registry::new().initialize()?;
                     let mut fm = TipFeeManager::new();
                     fm.initialize()?;
                     let default = TIP20Setup::path_usd(user)
@@ -2546,7 +2548,8 @@ mod tests {
                     fm.collected_fees[validator][old_token].write(fee)?;
                     fm.collected_fees[other_validator][token].write(fee)?;
                     assert_eq!(
-                        TIP20Token::from_address(token)?.get_balance(validator)?,
+                        TIP20Token::from_address(token)?
+                            .balance_of(ITIP20::balanceOfCall { account: validator })?,
                         U256::ZERO
                     );
                     Ok::<_, eyre::Report>((token, old_token))
@@ -2563,9 +2566,14 @@ mod tests {
                     };
                     let fm = TipFeeManager::new();
                     let token = TIP20Token::from_address(token)?;
-                    assert_eq!(token.get_balance(validator)?, paid);
                     assert_eq!(
-                        token.get_balance(TIP_FEE_MANAGER_ADDRESS)?,
+                        token.balance_of(ITIP20::balanceOfCall { account: validator })?,
+                        paid
+                    );
+                    assert_eq!(
+                        token.balance_of(ITIP20::balanceOfCall {
+                            account: TIP_FEE_MANAGER_ADDRESS
+                        })?,
                         fee * U256::from(3) - paid
                     );
                     assert_eq!(
@@ -2598,6 +2606,7 @@ mod tests {
                 .build(&mut db, &chainspec);
             executor.evm_mut().block.beneficiary = validator;
             with_fee_payout_storage(&mut executor, || {
+                TIP403Registry::new().initialize()?;
                 TipFeeManager::new().initialize()?;
                 let mut token = TIP20Setup::path_usd(user)
                     .with_issuer(user)
@@ -2631,8 +2640,16 @@ mod tests {
                     TipFeeManager::new().collected_fees[validator][PATH_USD_ADDRESS].read()?,
                     fee
                 );
-                assert_eq!(token.get_balance(TIP_FEE_MANAGER_ADDRESS)?, fee);
-                assert_eq!(token.get_balance(validator)?, U256::ZERO);
+                assert_eq!(
+                    token.balance_of(ITIP20::balanceOfCall {
+                        account: TIP_FEE_MANAGER_ADDRESS
+                    })?,
+                    fee
+                );
+                assert_eq!(
+                    token.balance_of(ITIP20::balanceOfCall { account: validator })?,
+                    U256::ZERO
+                );
                 if paused {
                     token.unpause(user, ITIP20::unpauseCall {})?;
                 } else {
@@ -2650,8 +2667,16 @@ mod tests {
                     TipFeeManager::new().collected_fees[validator][PATH_USD_ADDRESS].read()?,
                     U256::ZERO
                 );
-                assert_eq!(token.get_balance(TIP_FEE_MANAGER_ADDRESS)?, U256::ZERO);
-                assert_eq!(token.get_balance(validator)?, fee);
+                assert_eq!(
+                    token.balance_of(ITIP20::balanceOfCall {
+                        account: TIP_FEE_MANAGER_ADDRESS
+                    })?,
+                    U256::ZERO
+                );
+                assert_eq!(
+                    token.balance_of(ITIP20::balanceOfCall { account: validator })?,
+                    fee
+                );
                 Ok::<_, eyre::Report>(())
             })?;
         }
@@ -2670,6 +2695,7 @@ mod tests {
             .build(&mut db, &chainspec);
         executor.evm_mut().block.beneficiary = validator;
         let (token, credited) = with_fee_payout_storage(&mut executor, || {
+            TIP403Registry::new().initialize()?;
             let mut fm = TipFeeManager::new();
             fm.initialize()?;
             let user_token = TIP20Setup::path_usd(user)
@@ -2709,7 +2735,10 @@ mod tests {
                 validator,
             )?;
             assert_eq!(credited, U256::from(8_973));
-            assert_eq!(user_token.get_balance(user)?, U256::from(1_000));
+            assert_eq!(
+                user_token.balance_of(ITIP20::balanceOfCall { account: user })?,
+                U256::from(1_000)
+            );
             Ok::<_, eyre::Report>((validator_token.address(), credited))
         })?;
         let hook_calls = Arc::new(Mutex::new(Vec::<EvmState>::new()));
@@ -2753,12 +2782,15 @@ mod tests {
                 U256::ZERO
             );
             assert_eq!(
-                TIP20Token::from_address(token)?.get_balance(validator)?,
+                TIP20Token::from_address(token)?
+                    .balance_of(ITIP20::balanceOfCall { account: validator })?,
                 credited
             );
             // The remainder is LP liquidity, not validator fees.
             assert_eq!(
-                TIP20Token::from_address(token)?.get_balance(TIP_FEE_MANAGER_ADDRESS)?,
+                TIP20Token::from_address(token)?.balance_of(ITIP20::balanceOfCall {
+                    account: TIP_FEE_MANAGER_ADDRESS
+                })?,
                 U256::from(1_000_000_000) - credited
             );
             Ok::<_, eyre::Report>(())
