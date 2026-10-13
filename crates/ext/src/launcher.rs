@@ -6,7 +6,7 @@ use crate::{
         InstallSource, Installer, InstallerError, ResolvedInstall, binary_candidates,
         fallback_bin_dir, find_in_path,
     },
-    registry::{ExtensionState, Registry},
+    registry::{ExtensionState, Registry, RegistryLock},
 };
 use clap::{Parser, Subcommand};
 use std::{
@@ -41,6 +41,9 @@ pub enum LauncherError {
 
     #[error("{0}")]
     Registry(String),
+
+    #[error("{0}")]
+    Lock(String),
 }
 
 /// Parses arguments and dispatches to built-in commands (add/update/remove/list)
@@ -233,7 +236,7 @@ impl Launcher {
             }
         };
         let pinned = args.version.is_some();
-        let _lock = Registry::lock();
+        let _lock = lock_registry(args.dry_run)?;
         let result = installer.install(&args.extension, &source, args.dry_run, false)?;
         if !args.dry_run {
             let mut registry = Registry::load().map_err(LauncherError::Registry)?;
@@ -289,7 +292,7 @@ impl Launcher {
             }
         };
 
-        let _lock = Registry::lock();
+        let _lock = lock_registry(args.dry_run)?;
         let registry = Registry::load().map_err(LauncherError::Registry)?;
         let installed_version = registry
             .extensions
@@ -357,7 +360,7 @@ impl Launcher {
         }
 
         // 2. Update all installed extensions (skip pinned ones).
-        let _lock = Registry::lock();
+        let _lock = lock_registry(dry_run)?;
         let registry = Registry::load().map_err(LauncherError::Registry)?;
         let extensions: Vec<(String, String, bool)> = registry
             .extensions
@@ -425,7 +428,7 @@ impl Launcher {
         }
 
         let installer = Installer::from_env(self.exe_dir.as_deref())?;
-        let _lock = Registry::lock();
+        let _lock = lock_registry(dry_run)?;
         installer.remove(extension, dry_run)?;
 
         if !dry_run {
@@ -515,6 +518,9 @@ impl Launcher {
                 return run_child(binary, child_args, &display_name);
             }
             Ok(None) => {}
+            // A lock failure is not a missing extension; report it instead
+            // of the install hint.
+            Err(err @ LauncherError::Lock(_)) => return Err(err),
             Err(err) => {
                 tracing::debug!("extension auto-install failed: {err}");
             }
@@ -536,7 +542,7 @@ impl Launcher {
         let binary_name = format!("tempo-{extension}");
 
         let installer = Installer::from_env(self.exe_dir.as_deref())?;
-        let _lock = Registry::lock();
+        let _lock = lock_registry(false)?;
         match installer.install(
             extension,
             &InstallSource {
@@ -568,9 +574,9 @@ impl Launcher {
     /// `true` if the caller should start the check with [`spawn_auto_update`]
     /// once the extension has exited.
     ///
-    /// Never waits: if another `tempo` process holds the registry lock, this
-    /// is skipped until the next invocation. A corrupt registry is surfaced
-    /// to the caller.
+    /// Never waits: if the registry lock is held by another `tempo` process
+    /// or cannot be taken, this is skipped until the next invocation. A
+    /// corrupt registry is surfaced to the caller.
     fn maybe_auto_update(&self, extension: &str) -> Result<bool, LauncherError> {
         let disabled = auto_update_disabled(
             env::var_os(NO_AUTO_UPDATE_ENV).as_deref(),
@@ -659,7 +665,13 @@ impl Launcher {
             }
         };
 
-        let _lock = Registry::lock();
+        let _lock = match Registry::lock() {
+            Ok(lock) => lock,
+            Err(err) => {
+                tracing::debug!("auto-update: {err}, skipping");
+                return Ok(0);
+            }
+        };
         let mut registry = Registry::load().map_err(LauncherError::Registry)?;
         if !is_same_install(&snapshot, registry.extensions.get(extension)) {
             tracing::debug!("auto-update: tempo-{extension} changed during the check, skipping");
@@ -772,6 +784,15 @@ fn manifest_url(extension: &str, version: Option<&str>) -> String {
         }
         None => format!("{base}/extensions/tempo-{extension}/manifest.json"),
     }
+}
+
+/// Takes the registry lock for a command that writes the registry or the
+/// install. Dry runs write nothing and skip it.
+fn lock_registry(dry_run: bool) -> Result<Option<RegistryLock>, LauncherError> {
+    if dry_run {
+        return Ok(None);
+    }
+    Registry::lock().map(Some).map_err(LauncherError::Lock)
 }
 
 /// Returns `true` if automatic updates are disabled, either explicitly via

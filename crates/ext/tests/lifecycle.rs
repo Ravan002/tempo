@@ -1088,6 +1088,60 @@ fn auto_update_after_remove_is_noop() {
 }
 
 #[test]
+fn unusable_registry_lock_blocks_writers() {
+    let _lock = lock();
+    let fix = Fixture::new();
+    fix.publish_extension("testpkg", "1.0.0");
+    fix.run(&["tempo", "add", "testpkg"]).unwrap();
+    fix.publish_extension("testpkg", "2.0.0");
+    fix.publish_extension("otherpkg", "1.0.0");
+    let binary = fs::read(fix.binary_path("testpkg")).unwrap();
+
+    // A directory in place of the lock file cannot be opened for writing,
+    // even by root.
+    let lock_path = fix.home.join("extensions.lock");
+    fs::remove_file(&lock_path).unwrap();
+    fs::create_dir(&lock_path).unwrap();
+
+    let writers: &[&[&str]] = &[
+        &["tempo", "add", "otherpkg"],
+        &["tempo", "add", "testpkg", "2.0.0"],
+        &["tempo", "update", "testpkg"],
+        &["tempo", "remove", "testpkg"],
+        &["tempo", "otherpkg"],
+    ];
+    for args in writers {
+        let err = fix.run(args).unwrap_err();
+        assert!(
+            matches!(err, tempo_ext::LauncherError::Lock(_)),
+            "{args:?}: expected lock error, got: {err}"
+        );
+        assert!(
+            err.to_string().contains(&lock_path.display().to_string()),
+            "{args:?}: error should name the lock file, got: {err}"
+        );
+    }
+
+    let dry_runs: &[&[&str]] = &[
+        &["tempo", "add", "otherpkg", "--dry-run"],
+        &["tempo", "update", "testpkg", "--dry-run"],
+        &["tempo", "remove", "testpkg", "--dry-run"],
+    ];
+    for args in dry_runs {
+        assert_eq!(fix.run(args).unwrap(), 0, "{args:?}: dry runs need no lock");
+    }
+
+    // The background updater skips instead of writing unlocked.
+    assert_eq!(fix.run(&["tempo", "__auto-update", "testpkg"]).unwrap(), 0);
+
+    assert!(!fix.binary_path("otherpkg").exists());
+    assert_eq!(fs::read(fix.binary_path("testpkg")).unwrap(), binary);
+    assert_eq!(fix.installed_version("testpkg").as_deref(), Some("1.0.0"));
+    assert_eq!(fix.installed_version("otherpkg"), None);
+    assert_eq!(fix.notice("testpkg"), None);
+}
+
+#[test]
 fn update_clears_pending_notice() {
     let _lock = lock();
     let fix = Fixture::new();

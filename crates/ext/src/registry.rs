@@ -2,8 +2,10 @@
 //!
 //! Writers hold [`Registry::lock`] across load-modify-save, and across any
 //! install or removal whose result they record, so concurrent `tempo`
-//! invocations and background updates never interleave. Saves go through a
-//! unique temp file and an atomic rename, so readers never need the lock.
+//! invocations and background updates never interleave. A writer that
+//! cannot take the lock fails or skips; it never writes unlocked. Saves go
+//! through a unique temp file and an atomic rename, so readers never need
+//! the lock.
 
 use serde::{Deserialize, Serialize};
 use std::{
@@ -19,6 +21,8 @@ const UPDATE_CHECK_INTERVAL_SECS: u64 = 6 * 60 * 60; // 6 hours
 /// Exclusive advisory lock on the registry, released on drop.
 #[derive(Debug)]
 pub(crate) struct RegistryLock {
+    /// `None` only when there is no registry location at all, in which case
+    /// nothing is ever written.
     _file: Option<fs::File>,
 }
 
@@ -108,31 +112,34 @@ impl Registry {
         }
     }
 
-    /// Blocks until this process holds the registry lock. Runs unlocked
-    /// (with a warning) if the lock file cannot be opened or locked.
-    pub(crate) fn lock() -> RegistryLock {
-        let file = open_lock_file().filter(|file| match file.lock() {
-            Ok(()) => true,
-            Err(err) => {
-                tracing::warn!("registry lock failed: {err}");
-                false
-            }
-        });
-        RegistryLock { _file: file }
+    /// Blocks until this process holds the registry lock.
+    ///
+    /// Returns an error naming the lock file and the cause if it cannot be
+    /// opened or locked. Callers must not write the registry without it.
+    pub(crate) fn lock() -> Result<RegistryLock, String> {
+        let Some(path) = lock_path() else {
+            return Ok(RegistryLock { _file: None });
+        };
+        let file = open_lock_file(&path)?;
+        file.lock().map_err(|err| lock_error(&path, err))?;
+        Ok(RegistryLock { _file: Some(file) })
     }
 
-    /// Like [`Self::lock`], but returns `None` instead of waiting when
-    /// another process holds the lock.
+    /// Like [`Self::lock`], but never waits or fails: returns `None` if the
+    /// lock is held by another process or cannot be taken at all.
     pub(crate) fn try_lock() -> Option<RegistryLock> {
-        let Some(file) = open_lock_file() else {
+        let Some(path) = lock_path() else {
             return Some(RegistryLock { _file: None });
         };
+        let file = open_lock_file(&path)
+            .inspect_err(|err| tracing::debug!("{err}"))
+            .ok()?;
         match file.try_lock() {
             Ok(()) => Some(RegistryLock { _file: Some(file) }),
             Err(fs::TryLockError::WouldBlock) => None,
             Err(fs::TryLockError::Error(err)) => {
-                tracing::warn!("registry lock failed: {err}");
-                Some(RegistryLock { _file: None })
+                tracing::debug!("{}", lock_error(&path, err));
+                None
             }
         }
     }
@@ -208,9 +215,13 @@ impl Registry {
     }
 }
 
-/// Opens (creating if needed) the lock file next to the registry.
-fn open_lock_file() -> Option<fs::File> {
-    let path = state_path()?.with_extension("lock");
+/// Path of the lock file next to the registry.
+fn lock_path() -> Option<PathBuf> {
+    state_path().map(|path| path.with_extension("lock"))
+}
+
+/// Opens (creating if needed) the registry lock file.
+fn open_lock_file(path: &Path) -> Result<fs::File, String> {
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
@@ -218,9 +229,12 @@ fn open_lock_file() -> Option<fs::File> {
         .create(true)
         .truncate(false)
         .write(true)
-        .open(&path)
-        .inspect_err(|err| tracing::warn!("registry lock open failed: {}: {err}", path.display()))
-        .ok()
+        .open(path)
+        .map_err(|err| lock_error(path, err))
+}
+
+fn lock_error(path: &Path, err: impl std::fmt::Display) -> String {
+    format!("cannot lock extension registry {}: {err}", path.display())
 }
 
 fn now_secs() -> u64 {
@@ -477,13 +491,33 @@ mod tests {
         let _lock = ENV_MUTEX.lock().unwrap();
         let _home = TempHome::new();
 
-        let held = Registry::lock();
+        let held = Registry::lock().unwrap();
         assert!(Registry::try_lock().is_none(), "lock is exclusive");
         drop(held);
 
         let held = Registry::try_lock().expect("lock is free after drop");
         assert!(Registry::try_lock().is_none(), "try_lock is exclusive too");
         drop(held);
+    }
+
+    #[test]
+    fn unusable_lock_file_fails_lock_and_skips_try_lock() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let home = TempHome::new();
+        // A directory in place of the lock file cannot be opened for
+        // writing, even by root.
+        let lock_path = home._tmp.path().join("extensions.lock");
+        fs::create_dir(&lock_path).unwrap();
+
+        let err = Registry::lock().unwrap_err();
+        assert!(
+            err.contains(&lock_path.display().to_string()),
+            "error should name the lock file, got: {err}"
+        );
+        assert!(
+            Registry::try_lock().is_none(),
+            "try_lock skips, never unlocked"
+        );
     }
 
     #[test]
