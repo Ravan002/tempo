@@ -285,17 +285,6 @@ impl TIP20Token {
             .and_then(|control| control.inline_currency().map(str::to_string)))
     }
 
-    /// Returns the currency for diagnostics, eliding external strings longer than 31 bytes.
-    pub fn currency_summary(&self) -> Result<String> {
-        if let Some(currency) = self.load_currency()? {
-            return Ok(currency);
-        }
-        match self.currency.len()? {
-            len if len > 31 => Ok(format!("<{len} bytes>")),
-            _ => self.currency.read(),
-        }
-    }
-
     /// Returns whether the currency is [`USD_CURRENCY`].
     pub fn is_usd(&self) -> Result<bool> {
         match self.packed_is_usd()? {
