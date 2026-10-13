@@ -488,10 +488,18 @@ where
         }
     }
 
-    /// Installs the pause-gated refund and settlement runtime at T14.
-    fn upgrade_zone_portal_at_boundary(&mut self) -> Result<(), BlockExecutionError> {
-        let [_, portal, _, _] = t14_zone_factory_state(INITIAL_FACTORY_OWNER);
-        self.install_zone_runtimes_at_boundary([portal])
+    /// Installs T14 runtimes, catching up T13 unless its runtimes were supplied at genesis.
+    fn upgrade_zone_runtimes_at_t14(&mut self) -> Result<(), BlockExecutionError> {
+        let [_, portal, verifier, messenger] = t14_zone_factory_state(INITIAL_FACTORY_OWNER);
+        if self
+            .inner
+            .spec
+            .is_t13_active_at_timestamp(self.inner.spec.genesis().timestamp)
+        {
+            self.install_zone_runtimes_at_boundary([portal])
+        } else {
+            self.install_zone_runtimes_at_boundary([portal, verifier, messenger])
+        }
     }
 }
 
@@ -553,7 +561,7 @@ where
         let genesis_timestamp = spec.genesis().timestamp;
         if spec.is_t14_active_at_timestamp(timestamp) {
             if !spec.is_t14_active_at_timestamp(genesis_timestamp) {
-                self.upgrade_zone_portal_at_boundary()?;
+                self.upgrade_zone_runtimes_at_t14()?;
             }
         } else if spec.is_t13_active_at_timestamp(timestamp)
             && !spec.is_t13_active_at_timestamp(genesis_timestamp)
@@ -2518,6 +2526,80 @@ mod tests {
                 assert_eq!(state.len(), 1);
                 assert!(state.contains_key(&ZONE_PORTAL_IMPL_ADDRESS));
             }
+        }
+    }
+
+    #[test]
+    fn zone_runtime_upgrade_to_t14_catches_up_t13() {
+        // Cover simultaneous activation and a first post-T13 block arriving after T14.
+        for activation in [10, 20] {
+            let mut genesis = DEV.genesis().clone();
+            for (key, timestamp) in [("t13Time", 10), ("t14Time", activation)] {
+                genesis
+                    .config
+                    .extra_fields
+                    .insert_value(key.into(), timestamp)
+                    .unwrap();
+            }
+            let chainspec = Arc::new(TempoChainSpec::from_genesis(genesis));
+            let mut db = State::builder().with_bundle_update().build();
+            for runtime in initial_zone_factory_state(INITIAL_FACTORY_OWNER) {
+                let code = Bytecode::new_legacy(runtime.code);
+                db.insert_account_with_storage(
+                    runtime.address,
+                    AccountInfo {
+                        balance: U256::from(42),
+                        nonce: 7,
+                        code_hash: code.hash_slow(),
+                        code: Some(code),
+                        ..Default::default()
+                    },
+                    [(U256::from(9), U256::from(123))].into_iter().collect(),
+                );
+            }
+            let hook_calls = Arc::new(Mutex::new(Vec::<EvmState>::new()));
+            let hook_calls_clone = hook_calls.clone();
+            db.set_state_hook(Some(Box::new(move |state: EvmState| {
+                if state.contains_key(&ZONE_PORTAL_IMPL_ADDRESS) {
+                    hook_calls_clone.lock().unwrap().push(state);
+                }
+            })));
+            for timestamp in [9, activation, activation + 1] {
+                let active = timestamp >= activation;
+                let mut executor = TestExecutorBuilder::default()
+                    .with_spec(if active {
+                        TempoHardfork::T14
+                    } else {
+                        TempoHardfork::T12
+                    })
+                    .with_parent_beacon_block_root(B256::ZERO)
+                    .build(&mut db, &chainspec);
+                executor.evm_mut().ctx_mut().block.timestamp = U256::from(timestamp);
+                executor.apply_pre_execution_changes().unwrap();
+                drop(executor);
+                let expected = if active {
+                    t14_zone_factory_state(INITIAL_FACTORY_OWNER)
+                } else {
+                    initial_zone_factory_state(INITIAL_FACTORY_OWNER)
+                };
+                for runtime in expected {
+                    let info = db
+                        .load_cache_account(runtime.address)
+                        .unwrap()
+                        .account_info()
+                        .unwrap();
+                    assert_eq!(info.code.unwrap().original_bytes(), runtime.code);
+                    assert_eq!(info.balance, U256::from(42));
+                    assert_eq!(info.nonce, 7);
+                    assert_eq!(
+                        revm::Database::storage(&mut db, runtime.address, U256::from(9)).unwrap(),
+                        U256::from(123)
+                    );
+                }
+            }
+            let calls = hook_calls.lock().unwrap();
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].len(), 3);
         }
     }
 }
