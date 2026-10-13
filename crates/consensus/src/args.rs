@@ -391,13 +391,13 @@ pub struct Args {
     #[arg(long = "consensus.datadir", value_name = "PATH")]
     pub storage_dir: Option<PathBuf>,
 
-    /// JSON registry of operators with privileged top-of-block access.
+    /// Address of the `TopOfBlockRegistry` contract (TIP-1147).
     ///
-    /// Listed operators may connect as secondary peers and submit
-    /// transactions that this node executes first in the blocks it proposes.
-    /// See `tempo_consensus::top_of_block::Registry` for the format.
-    #[arg(long = "consensus.top-of-block-operators", value_name = "PATH")]
-    pub top_of_block_operators: Option<PathBuf>,
+    /// Operators listed in the contract may connect as secondary peers and
+    /// submit transactions that this node executes first in the blocks it
+    /// proposes. The registry is read from the latest finalized state.
+    #[arg(long = "consensus.top-of-block-registry", value_name = "ADDRESS")]
+    pub top_of_block_registry: Option<alloy_primitives::Address>,
 
     /// Number of recently finalized blocks the marshal actor keeps in its
     /// prunable archive. Anything older is served from reth's database

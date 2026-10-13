@@ -196,11 +196,10 @@ where
         )
         .wrap_err("failed initialization executor actor")?;
 
-        let top_of_block_operators = self
+        let top_of_block_registry = self
             .top_of_block
             .as_ref()
-            .map(|config| config.registry.peers())
-            .unwrap_or_default();
+            .map(|config| (config.registry_address, config.registry.clone()));
         let (top_of_block, top_of_block_mailbox) = self
             .top_of_block
             .map(|config| crate::top_of_block::init(context.child("top_of_block"), config))
@@ -213,7 +212,7 @@ where
                 oracle: self.peer_manager.clone(),
                 epoch_strategy: epoch_strategy.clone(),
                 finalized_tip: (finalized_tip.1, finalized_tip.2),
-                top_of_block_operators,
+                top_of_block_registry,
             },
         )
         .wrap_err("failed initializing peer manager")?;
