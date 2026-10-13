@@ -1003,7 +1003,8 @@ def txgen-run-preset-pipeline [
     } else {
         print $"  Streaming up to ($tx_count) txgen transaction\(s\) over ($txgen_duration) into bench send..."
     }
-    let vault_start_block = if $is_vault {
+    let check_receipts = $is_vault or $preset_name == "tip20-policy"
+    let workload_start_block = if $check_receipts {
         (txgen-rpc-call $generate_rpc_url '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}').result | into int
     } else { 0 }
     let result = (bash -lc $pipeline | complete)
@@ -1022,14 +1023,15 @@ def txgen-run-preset-pipeline [
         print $"ERROR: ($preset_name) workload contains sender failures; see ($report_path)"
         return { ok: false, exit_code: 1, report_path: $report_path }
     }
-    if $is_vault {
+    if $check_receipts {
         # Check block receipts after bench drains the pool, without polling every transaction.
         let report = (open $report_path)
+        let expected = if $is_vault { $tx_count } else { $report.sent }
         let deadline = (date now) + 60sec
-        mut next_block = $vault_start_block + 1
+        mut next_block = $workload_start_block + 1
         mut included = 0
         mut reverted = 0
-        while $included < $tx_count and (date now) < $deadline {
+        while $included < $expected and (date now) < $deadline {
             let last = (txgen-rpc-call $generate_rpc_url '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}').result | into int
             while $next_block <= $last {
                 let block = ($next_block | format number | get lowerhex)
@@ -1040,11 +1042,11 @@ def txgen-run-preset-pipeline [
                 $next_block = $next_block + 1
             }
             # An empty pool can precede canonical inclusion of the last built block.
-            if $included < $tx_count { sleep 200ms }
+            if $included < $expected { sleep 200ms }
         }
-        print $"  Vault receipts: ($included) included, ($reverted) reverted, ($report.sent) submitted"
-        if $included != $tx_count or $reverted != 0 {
-            error make { msg: "Vault workload did not include the full transaction count successfully" }
+        print $"  ($preset_name) receipts: ($included) included, ($reverted) reverted, ($report.sent) submitted"
+        if $expected == 0 or $included != $expected or $reverted != 0 {
+            error make { msg: $"($preset_name) workload did not include the full transaction count successfully" }
         }
     }
     print $"  Report saved: ($report_path)"
