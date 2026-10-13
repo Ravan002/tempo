@@ -1,47 +1,40 @@
 //! The validator side of the top-of-block channel.
 
-use std::{collections::HashSet, time::SystemTime};
+use std::time::SystemTime;
 
-use alloy_consensus::transaction::{SignerRecoverable as _, TxHashRef as _};
+use alloy_consensus::transaction::SignerRecoverable as _;
 use alloy_eips::eip2718::Decodable2718 as _;
-use alloy_primitives::B256;
 use commonware_codec::{Encode as _, ReadExt as _};
-use commonware_consensus::{Heightable as _, types::Round};
+use commonware_consensus::types::Round;
 use commonware_cryptography::ed25519::PublicKey;
 use commonware_p2p::{Receiver, Recipients, Sender};
 use commonware_runtime::{Clock, ContextCell, Handle, Spawner, spawn_cell};
-use futures::{StreamExt as _, channel::mpsc};
 use tempo_payload_types::{TopOfBlockLane, TopOfBlockSubmission, TopOfBlockSubmitError};
 use tempo_primitives::TempoTxEnvelope;
 use tracing::{debug, warn};
 
 use super::{
     Config, RegistryHandle,
-    wire::{Ack, AckStatus, Built, Message, Submit},
+    wire::{Ack, AckStatus, Message, Submit},
 };
-use crate::{consensus::block::Block, utils::public_key_to_b256};
+use crate::utils::public_key_to_b256;
 
 pub(super) fn init<TContext>(context: TContext, config: Config) -> (Actor<TContext>, Mailbox) {
-    let (tx, rx) = mpsc::unbounded();
-    let registry = config.registry;
     let mailbox = Mailbox {
-        tx,
         lane: config.lane.clone(),
-        registry: registry.clone(),
+        registry: config.registry.clone(),
     };
     let actor = Actor {
         context: ContextCell::new(context),
-        registry,
+        registry: config.registry,
         lane: config.lane,
-        mailbox: rx,
     };
     (actor, mailbox)
 }
 
-/// Opens the lane when this node proposes and reports the built proposal.
+/// Opens the lane when this node proposes.
 #[derive(Clone)]
 pub(crate) struct Mailbox {
-    tx: mpsc::UnboundedSender<Message>,
     lane: TopOfBlockLane,
     registry: RegistryHandle,
 }
@@ -62,36 +55,12 @@ impl Mailbox {
         self.lane
             .open(round.epoch().get(), round.view().get(), registry.window);
     }
-
-    /// Reports which lane transactions made it into `proposal` for `round`.
-    pub(crate) fn built(&self, round: Round, proposal: &Block) {
-        let (epoch, view) = (round.epoch().get(), round.view().get());
-        let Some(taken) = self.lane.taken(epoch, view) else {
-            return;
-        };
-        let taken: HashSet<B256> = taken.into_iter().collect();
-        let transactions = &proposal.block().body().transactions;
-        let top_of_block = transactions
-            .iter()
-            .map(|tx| *tx.tx_hash())
-            .filter(|hash| taken.contains(hash))
-            .collect();
-        let _ = self.tx.unbounded_send(Message::Built(Built {
-            epoch,
-            view,
-            height: proposal.height().get(),
-            block_hash: proposal.digest().0,
-            tx_count: transactions.len() as u32,
-            top_of_block,
-        }));
-    }
 }
 
 pub(crate) struct Actor<TContext> {
     context: ContextCell<TContext>,
     registry: RegistryHandle,
     lane: TopOfBlockLane,
-    mailbox: mpsc::UnboundedReceiver<Message>,
 }
 
 impl<TContext: Clock + Spawner> Actor<TContext> {
@@ -106,42 +75,23 @@ impl<TContext: Clock + Spawner> Actor<TContext> {
     }
 
     async fn run(
-        mut self,
+        self,
         (mut sender, mut receiver): (
             impl Sender<PublicKey = PublicKey>,
             impl Receiver<PublicKey = PublicKey>,
         ),
     ) {
-        loop {
-            tokio::select! {
-                biased;
-
-                message = self.mailbox.next() => {
-                    let Some(message) = message else { break };
-                    // Build reports go to every operator. The leader is
-                    // authenticated by the connection.
-                    let operators = self.registry.get().active(self.context.current());
-                    if !operators.is_empty() {
-                        sender.send(Recipients::Some(operators), message.encode(), true);
-                    }
+        while let Ok((peer, mut bytes)) = receiver.recv().await {
+            match Message::read(&mut bytes) {
+                Ok(Message::Submit(submit)) => {
+                    let ack = self.submit(&peer, submit);
+                    sender.send(Recipients::One(peer), Message::Ack(ack).encode(), true);
                 }
-
-                message = receiver.recv() => {
-                    let Ok((peer, mut bytes)) = message else {
-                        warn!("top-of-block channel closed");
-                        break;
-                    };
-                    match Message::read(&mut bytes) {
-                        Ok(Message::Submit(submit)) => {
-                            let ack = self.submit(&peer, submit);
-                            sender.send(Recipients::One(peer), Message::Ack(ack).encode(), true);
-                        }
-                        Ok(_) => debug!(%peer, "ignoring unexpected top-of-block message"),
-                        Err(error) => debug!(%peer, %error, "failed decoding top-of-block message"),
-                    }
-                }
+                Ok(_) => debug!(%peer, "ignoring unexpected top-of-block message"),
+                Err(error) => debug!(%peer, %error, "failed decoding top-of-block message"),
             }
         }
+        warn!("top-of-block channel closed");
     }
 
     fn submit(&self, operator: &PublicKey, submit: Submit) -> Ack {

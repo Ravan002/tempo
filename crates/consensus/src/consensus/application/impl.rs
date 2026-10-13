@@ -245,9 +245,6 @@ impl Inner {
             block,
             execution_block_encoded,
         );
-        if let Some(top_of_block) = &self.top_of_block {
-            top_of_block.built(round, &proposal);
-        }
         let proposal_elapsed = propose_start.elapsed();
         // Pace proposal return from the propose start. Validators still need
         // to repeat replayable build work, so leave room for it before

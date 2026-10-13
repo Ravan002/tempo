@@ -23,8 +23,8 @@
 //!    executes its transactions after the start-of-block system work and
 //!    before any pool transaction. Invalid or late transactions are skipped,
 //!    and an empty lane builds a normal block.
-//! 4. The leader sends [`wire::Built`] with the lane transactions in the
-//!    proposal.
+//! 4. Operators read the lane transactions back from the proposed block,
+//!    which validators broadcast to every connected peer.
 //!
 //! The ordering is the proposer's policy: validators verify these blocks like
 //! any other block.
@@ -98,6 +98,9 @@ pub struct OperatorChannels {
     /// Consensus certificates broadcast by the validators; decode them with
     /// [`leader::decode_certificate`].
     pub certificates: lookup::Receiver<PublicKey>,
+    /// Blocks broadcast by their proposers; decode them with
+    /// [`decode_proposal`].
+    pub proposals: lookup::Receiver<PublicKey>,
 }
 
 /// Starts an operator's network and returns its channels.
@@ -134,10 +137,10 @@ pub fn start_operator_network(
 
     let (_sender, certificates) =
         network.register(crate::config::CERTIFICATES_CHANNEL_IDENT, drained);
+    let (_sender, proposals) = network.register(crate::config::BROADCASTER_CHANNEL_IDENT, drained);
     for channel in [
         crate::config::VOTES_CHANNEL_IDENT,
         crate::config::RESOLVER_CHANNEL_IDENT,
-        crate::config::BROADCASTER_CHANNEL_IDENT,
         crate::config::MARSHAL_CHANNEL_IDENT,
         crate::config::DKG_CHANNEL_IDENT,
     ] {
@@ -166,7 +169,21 @@ pub fn start_operator_network(
     Ok(OperatorChannels {
         top_of_block,
         certificates,
+        proposals,
     })
+}
+
+/// Decodes a block received on the consensus broadcast channel.
+///
+/// Its header's consensus context names the round and the proposer. The block
+/// is the proposer's claim until the round is notarized.
+pub fn decode_proposal(
+    mut message: commonware_runtime::IoBuf,
+) -> Option<reth_primitives_traits::SealedBlock<tempo_primitives::Block>> {
+    use commonware_codec::ReadExt as _;
+    crate::consensus::block::Block::read(&mut message)
+        .ok()
+        .map(|block| block.block().clone())
 }
 
 /// Parses `<hex ed25519 public key>@<ip:port>`.
