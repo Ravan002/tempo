@@ -670,43 +670,87 @@ def txgen-prepare-zones-preset [spec_path: string, count: int, accounts: int, zo
     $output
 }
 
-# Genesis TIP-20s always start in the legacy layout. On TIP-1145 nodes, activating their
-# token-specific policy (`changeTransferPolicyId(type(uint64).max)`) converts them to the packed
-# layout, so runs measure converted tokens. Activation reverts on nodes without TIP-1145, which
-# keep the spec unchanged. The genesis admin is account 0 of the benchmark mnemonic.
-def txgen-prepare-tip1145-activation [spec_path: string, rpc_url: string, token_count: int] {
+# Empty, distinct blacklists exercise every successful authorization lookup without
+# requiring per-member setup. Policy IDs come from the live counter on legacy nodes.
+def txgen-tip20-policy-calls [packed: bool, token_count: int, policy_start: int] {
+    let registry_call = {|function, args| {to: $TXGEN_HELPER_TIP403_REGISTRY, abi: TIP1145, function: $function, args: $args} }
+    let blacklist = {|| do $registry_call createPolicy [{pool: {pool: tip1145_admin, select: {index: 0}}} 1] }
+    let issuer_calls = (0..<$token_count | each { |id|
+        let token = (txgen-tip20-token-address $id)
+        let start = $policy_start + 4 * $id
+        let calls = if $packed {
+            [ (do $registry_call setTokenPolicyModes [$token 3 3 3]) ]
+        } else {
+            (0..<3 | each { do $blacklist })
+                | append (do $registry_call createCompoundPolicy [$start ($start + 1) ($start + 2)])
+        }
+        let policy_id = if $packed { "0xffffffffffffffff" } else { ($start + 3) | into string }
+        $calls | append {to: $token, abi: TIP1145, function: changeTransferPolicyId, args: [$policy_id]}
+    } | flatten)
+    let receive_start = $policy_start + 4 * $token_count
+    {
+        admin_calls: (if $packed { $issuer_calls } else { $issuer_calls | append (0..<2 | each { do $blacklist }) })
+        receive_call: (if $packed {
+            do $registry_call setReceiveConfig [3 3 "0x0000000000000000000000000000000000000000"]
+        } else {
+            do $registry_call setReceivePolicy [$receive_start ($receive_start + 1) "0x0000000000000000000000000000000000000000"]
+        })
+    }
+}
+
+# Genesis TIP-20s start in the legacy layout. Probe TIP-1145 before converting them.
+# The policy preset uses equivalent compound/receive lists on legacy nodes and flat
+# lists on TIP-1145 nodes. All setup is confirmed before the measured workload.
+def txgen-prepare-tip1145-activation [spec_path: string, rpc_url: string, token_count: int, accounts: int = 0, with_policies: bool = false] {
     let path_usd = (txgen-tip20-token-address 0)
     let probe_data = $"($TXGEN_HELPER_TIP1145_TOKEN_POLICY_SELECTOR)000000000000000000000000($path_usd | str substring 2..)"
     let probe = $"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_call\",\"params\":[{\"to\":\"($TXGEN_HELPER_TIP403_REGISTRY)\",\"data\":\"($probe_data)\"},\"latest\"]}"
-    if not (try { txgen-rpc-call $rpc_url $probe | ignore; true } catch { false }) {
-        return $spec_path
+    let packed = (try { txgen-rpc-call $rpc_url $probe | ignore; true } catch { false })
+    if not $packed and not $with_policies { return $spec_path }
+    if $with_policies and ($token_count < 2 or $accounts < 1) {
+        error make { msg: "tip20-policy requires at least two TIP20 tokens and one user account" }
     }
-
-    let calls = (0..<$token_count | each { |id|
-        {to: (txgen-tip20-token-address $id), abi: TIP1145, function: changeTransferPolicyId, args: ["0xffffffffffffffff"]}
-    })
+    let policy_start = if $with_policies and not $packed {
+        let counter = (txgen-rpc-call $rpc_url $'{"jsonrpc":"2.0","id":1,"method":"eth_call","params":[{"to":"($TXGEN_HELPER_TIP403_REGISTRY)","data":"0x3cc32f9c"},"latest"]}')
+        $counter.result | into int
+    } else { 0 }
+    let policy = if $with_policies { txgen-tip20-policy-calls $packed $token_count $policy_start } else { null }
+    let calls = if $with_policies { $policy.admin_calls } else {
+        0..<$token_count | each { |id|
+            {to: (txgen-tip20-token-address $id), abi: TIP1145, function: changeTransferPolicyId, args: ["0xffffffffffffffff"]}
+        }
+    }
+    let setup_tx = {
+        type: tempo
+        from: {pool: tip1145_admin, select: {index: 0}}
+        gas_limit: $TXGEN_HELPER_TIP1145_ACTIVATION_GAS_LIMIT
+        fee_token: $path_usd
+        calls: $calls
+    }
+    mut steps = [{id: tip1145_activate, tx: $setup_tx}]
+    if $with_policies {
+        $steps = ($steps | append (0..<$accounts | each { |index|
+            {id: $"receive_policy_($index)", depends_on: [tip1145_activate], tx: ($setup_tx | merge {
+                from: {pool: policy_receivers, select: {index: $index}}
+                calls: [$policy.receive_call]
+            })}
+        }))
+    }
     let output_dir = ([ (txgen-repo-root) $TXGEN_HELPER_DEFAULT_RENDERED_SPECS_DIR (random uuid) ] | path join)
     mkdir $output_dir
     let fragment = ($output_dir | path join "tip1145-activation.yml")
+    let setup_accounts = {tip1145_admin: {mnemonic: $TXGEN_HELPER_ACCOUNT_MNEMONIC, range: [0 1]}}
+        | merge (if $with_policies { {policy_receivers: {mnemonic: $TXGEN_HELPER_ACCOUNT_MNEMONIC, range: [$accounts ($accounts * 2)]}} } else { {} })
     {
         merge: {
             artifacts: {TIP1145: ([ (txgen-repo-root) $TXGEN_HELPER_TIP1145_ABI ] | path join)}
-            accounts: {tip1145_admin: {mnemonic: $TXGEN_HELPER_ACCOUNT_MNEMONIC, range: [0 1]}}
+            accounts: $setup_accounts
         }
-        append: {setup: {steps: [{
-            id: tip1145_activate
-            tx: {
-                type: tempo
-                from: {pool: tip1145_admin, select: {index: 0}}
-                gas_limit: $TXGEN_HELPER_TIP1145_ACTIVATION_GAS_LIMIT
-                fee_token: $path_usd
-                calls: $calls
-            }
-        }]}}
+        append: {setup: {steps: $steps}}
     } | to json | save -f $fragment
     let output = ($output_dir | path join ($spec_path | path basename))
     {include: [($spec_path | path expand) $fragment]} | to json | save -f $output
-    print $"  TIP-1145 supported: activating ($token_count) TIP20 token\(s\) during setup"
+    print $"  TIP20 setup: packed=($packed), policies=($with_policies), tokens=($token_count)"
     $output
 }
 
@@ -841,7 +885,9 @@ def txgen-run-preset-pipeline [
     let existing_recipient_start = ($env | get --optional TXGEN_EXISTING_RECIPIENTS_START | default "0" | into int)
     let existing_recipient_end = ($env | get --optional TXGEN_EXISTING_RECIPIENTS_END | default "0" | into int)
     let uses_existing_recipients = (txgen-spec-effective-text $spec_path) =~ '(?m)^\s*existing_recipients:\s*$'
-    let recipient_accounts = if $uses_existing_recipients and $existing_recipient_end > $existing_recipient_start {
+    let recipient_accounts = if $preset_name == "tip20-policy" {
+        $accounts
+    } else if $uses_existing_recipients and $existing_recipient_end > $existing_recipient_start {
         $existing_recipient_end - $existing_recipient_start
     } else {
         0
@@ -849,7 +895,7 @@ def txgen-run-preset-pipeline [
     let total_accounts = $accounts + $recipient_accounts
     let workload_metadata = (txgen-workload-metadata-args $preset_name $spec_path)
     if not ($is_vault or $preset_name == "zones") {
-        $spec_path = (txgen-prepare-tip1145-activation $spec_path $generate_rpc_url $tx_token_count)
+        $spec_path = (txgen-prepare-tip1145-activation $spec_path $generate_rpc_url $tx_token_count $accounts ($preset_name == "tip20-policy"))
     }
     if not $skip_faucet_funding {
         txgen-fund-accounts $txgen_tempo_bin $spec_path $generate_rpc_url
@@ -971,7 +1017,7 @@ def txgen-run-preset-pipeline [
         return { ok: false, exit_code: 1, report_path: $report_path }
     }
 
-    if $preset_name in ["zones" "vault-deposit" "vault-withdraw"] and (open $report_path).failed > 0 {
+    if $preset_name in ["zones" "vault-deposit" "vault-withdraw" "tip20-policy"] and (open $report_path).failed > 0 {
         print $"ERROR: ($preset_name) workload contains sender failures; see ($report_path)"
         return { ok: false, exit_code: 1, report_path: $report_path }
     }

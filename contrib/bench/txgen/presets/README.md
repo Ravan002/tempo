@@ -38,3 +38,14 @@ also keeps the transfer-only series under its existing state key.
 Reports resolve aliases to the concrete scenario and record the selected preset.
 The original alias is retained separately as `requested_preset`; workload category
 metadata describes the mix without changing historical transfer-only labels.
+
+`tip20-policy` isolates the successful policy-heavy payment case: pathUSD transfers
+to configured receivers in a disjoint account pool, paid in AlphaUSD through the FeeAMM, with expiring nonces.
+It requires at least two selected tokens. Setup installs distinct blacklist leaves
+under a separate compound issuer policy per token and both receiver filters on legacy nodes; TIP-1145
+nodes use equivalent token-specific and receiver blacklist modes. Empty blacklists
+allow every user while forcing membership reads. Setup runs outside measurement.
+For example: `derek bench preset=tip20-policy bloat=100` (E2E), or
+`nu tempo.nu bench --preset tip20-policy` (local). Compare the same preset on
+`tip/1145` and the packed-storage branch; snapshots establish access savings, while
+benchmark timings measure their effect with normal node caches.
