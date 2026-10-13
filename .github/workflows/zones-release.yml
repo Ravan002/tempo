@@ -33,7 +33,7 @@ env:
   RUST_BACKTRACE: full
 
 concurrency:
-  group: zones-release-${{ inputs.tag || github.ref }}
+  group: zones-release-${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -239,7 +239,7 @@ jobs:
         run: |
           # Determine if this is a prerelease
           PRERELEASE=""
-          if echo "$VERSION" | grep -qE '(alpha|beta|rc)'; then
+          if [[ "$VERSION" == *-* ]]; then
             PRERELEASE="--prerelease"
           fi
 

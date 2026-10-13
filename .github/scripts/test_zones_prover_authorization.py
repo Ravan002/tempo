@@ -1,4 +1,4 @@
-"""Run with python3 -m unittest discover -s .github/tests (requires PyYAML and Node)."""
+"""Run with uv run --with pyyaml python -m unittest discover -s .github/scripts -p 'test_zones_*.py'."""
 
 import json
 from pathlib import Path

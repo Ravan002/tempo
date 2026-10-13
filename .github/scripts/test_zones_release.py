@@ -58,3 +58,18 @@ class ZonesReleaseTests(unittest.TestCase):
                                                      PATH=f'{tmp}:{os.environ["PATH"]}'),
                                             capture_output=True)
                     self.assertEqual(result.returncode == 0, allowed)
+
+    def test_all_accepted_prerelease_suffixes_create_prerelease_drafts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            gh = Path(tmp) / 'gh'
+            gh.write_text("#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$ARGS_FILE\"\n")
+            gh.chmod(0o755)
+            args = Path(tmp) / 'args'
+            for version in ('v0.3.5', 'v0.3.5-rc.1', 'v0.3.5-preview.1'):
+                with self.subTest(version=version):
+                    subprocess.run(['bash', '-eu', '-c', script('create-release', 'Create Release')
+                                    .replace('${{ github.repository }}', 'tempoxyz/tempo')],
+                                   env=dict(os.environ, VERSION=version, TAG='zones/' + version,
+                                            ARGS_FILE=str(args), PATH=f'{tmp}:{os.environ["PATH"]}'),
+                                   check=True, capture_output=True)
+                    self.assertEqual('--prerelease' in args.read_text().splitlines(), '-' in version)

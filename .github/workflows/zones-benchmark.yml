@@ -169,8 +169,7 @@ jobs:
       contents: read
       id-token: write
     name: Resolve benchmark request
-    # Scheduled benchmarks use upstream-only infrastructure and credentials.
-    # Private copies can still run an explicitly dispatched benchmark.
+    # Enable after the Tempo benchmark runner and credentials are provisioned.
     if: github.repository == 'tempoxyz/tempo' && vars.ZONES_BENCHMARK_ENABLED == 'true'
     runs-on: ubuntu-latest
     outputs:
@@ -201,7 +200,6 @@ jobs:
       drain-timeout: ${{ steps.config.outputs.drain-timeout }}
       seed: ${{ steps.config.outputs.seed }}
       tempo-hardfork: ${{ steps.config.outputs.tempo-hardfork }}
-      tempo-ref: ${{ steps.config.outputs.tempo-ref }}
       txgen-ref: ${{ steps.config.outputs.txgen-ref }}
     steps:
       - name: Secure runner
@@ -246,8 +244,6 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Tempo and Zones now share the same source revision.
-          INPUT_TEMPO_REF="$EVENT_SHA"
           INPUT_TEMPO_HARDFORK="${INPUT_TEMPO_HARDFORK,,}"
           if [[ "$INPUT_TEMPO_HARDFORK" != latest && ! "$INPUT_TEMPO_HARDFORK" =~ ^t[0-9]+[a-z]*$ ]]; then
             echo "::error::tempo-hardfork must be latest or a hardfork such as t11"
@@ -410,7 +406,7 @@ jobs:
             echo "::error::par pool liquidity must cover $required_swap_uses swap(s) of withdrawal-amount=$withdrawal_amount for $neobank_preset"
             exit 1
           fi
-          for name in INPUT_TEMPO_REF INPUT_TXGEN_REF; do
+          for name in EVENT_SHA INPUT_TXGEN_REF; do
             if ! [[ "${!name}" =~ ^[0-9a-fA-F]{40}$ ]]; then
               echo "::error::$name must be an exact 40-character commit SHA"
               exit 1
@@ -445,7 +441,6 @@ jobs:
             echo "drain-timeout=$INPUT_DRAIN_TIMEOUT"
             echo "seed=$INPUT_SEED"
             echo "tempo-hardfork=$INPUT_TEMPO_HARDFORK"
-            echo "tempo-ref=$INPUT_TEMPO_REF"
             echo "txgen-ref=$INPUT_TXGEN_REF"
           } >> "$GITHUB_OUTPUT"
 
@@ -485,7 +480,7 @@ jobs:
       ZONES_BENCH_DRAIN_TIMEOUT: ${{ needs.authorize.outputs.drain-timeout }}
       ZONES_BENCH_SEED: ${{ needs.authorize.outputs.seed }}
       ZONES_BENCH_TEMPO_HARDFORK: ${{ needs.authorize.outputs.tempo-hardfork }}
-      ZONES_BENCH_TEMPO_REF: ${{ needs.authorize.outputs.tempo-ref }}
+      ZONES_BENCH_TEMPO_REF: ${{ needs.authorize.outputs.sha }}
       ZONES_BENCH_TXGEN_REF: ${{ needs.authorize.outputs.txgen-ref }}
       ZONES_BENCH_ZONES_REF: ${{ needs.authorize.outputs.sha }}
       ZONES_BENCH_GIT_REF: ${{ github.ref_name }}
@@ -508,7 +503,7 @@ jobs:
       ZONES_BENCH_SPF_RANGE: target/zones-benchmark/spf-range.env
       ZONES_BENCH_TOPOLOGY_ENV: target/zones-benchmark/topology.env
       ZONES_BENCH_TOPOLOGY_DIR: target/zones-benchmark/topology
-      TEMPO_ROOT: ${{ github.workspace }}/_benchmark-tempo
+      TEMPO_ROOT: ${{ github.workspace }}
     steps:
       - name: Secure runner
         uses: tempoxyz/gh-actions/actions/secure-runner@55fe3b63d9612623cc51e6c62d9d62fbcb175fb0 # 2026-09-29T01-25-15Z-55fe3b63
@@ -570,15 +565,6 @@ jobs:
           echo "::add-mask::$CLICKHOUSE_USER"
           echo "::add-mask::$CLICKHOUSE_PASSWORD"
 
-      - name: Check out pinned Tempo L1
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          repository: tempoxyz/tempo
-          ref: ${{ needs.authorize.outputs.tempo-ref }}
-          path: _benchmark-tempo
-          persist-credentials: false
-          submodules: recursive
-
       - uses: tempoxyz/gh-actions/vendor/dtolnay/rust-toolchain@55fe3b63d9612623cc51e6c62d9d62fbcb175fb0 # 2026-09-29T01-25-15Z-55fe3b63
         with:
           toolchain: stable
@@ -622,13 +608,9 @@ jobs:
           build_key="$({ rustc -vV; printf '%s\n' "$RUSTFLAGS" profiling; } \
             | sha256sum | awk '{print $1}')"
           cache_root="$cache_base/zones-benchmark/cargo"
-          zones_target="$cache_root/zones/$build_key"
-          tempo_target="$cache_root/tempo/$ZONES_BENCH_TEMPO_REF/$build_key"
-          mkdir -p "$zones_target" "$tempo_target"
-          {
-            echo "ZONES_BENCH_ZONES_TARGET_DIR=$zones_target"
-            echo "ZONES_BENCH_TEMPO_TARGET_DIR=$tempo_target"
-          } >> "$GITHUB_ENV"
+          target_dir="$cache_root/workspace/$build_key"
+          mkdir -p "$target_dir"
+          echo "ZONES_BENCH_TARGET_DIR=$target_dir" >> "$GITHUB_ENV"
 
       - name: Restore isolated benchmark volumes
         run: |
@@ -685,22 +667,17 @@ jobs:
       - name: Build real L1 and Zone binaries
         run: |
           set -euo pipefail
-          cargo build --target-dir "$ZONES_BENCH_ZONES_TARGET_DIR" \
-            --locked --profile profiling -p tempo-zone -p tempo-zone-prover-utils -p tempo-xtask \
-            --bin tempo-zone --bin tempo-zone-prover-utils --bin tempo-zone-xtask
-          nu -c "source '$TEMPO_ROOT/tempo.nu'; build-in-worktree --no-default-features \
-            '$TEMPO_ROOT' '$ZONES_BENCH_TEMPO_REF' profiling \
-            'jemalloc,asm-keccak,keccak-cache-global,otlp' \
-            '$ZONES_BENCH_TEMPO_REF'"
-          cargo build --target-dir "$ZONES_BENCH_TEMPO_TARGET_DIR" \
-            --locked --manifest-path "$TEMPO_ROOT/Cargo.toml" --profile profiling -p tempo-xtask \
-            --bin tempo-xtask
+          cargo build --target-dir "$ZONES_BENCH_TARGET_DIR" \
+            --locked --profile profiling \
+            -p tempo -p tempo-zone -p tempo-zone-prover-utils -p tempo-xtask \
+            --bin tempo --bin tempo-zone --bin tempo-zone-prover-utils \
+            --bin tempo-xtask --bin tempo-zone-xtask
           {
-            echo "ZONE_BIN=$ZONES_BENCH_ZONES_TARGET_DIR/profiling/tempo-zone"
-            echo "SPF_BIN=$ZONES_BENCH_ZONES_TARGET_DIR/profiling/tempo-zone-prover-utils"
-            echo "ZONES_XTASK_BIN=$ZONES_BENCH_ZONES_TARGET_DIR/profiling/tempo-zone-xtask"
-            echo "TEMPO_BIN=$TEMPO_ROOT/target/profiling/tempo"
-            echo "TEMPO_XTASK_BIN=$ZONES_BENCH_TEMPO_TARGET_DIR/profiling/tempo-xtask"
+            echo "ZONE_BIN=$ZONES_BENCH_TARGET_DIR/profiling/tempo-zone"
+            echo "SPF_BIN=$ZONES_BENCH_TARGET_DIR/profiling/tempo-zone-prover-utils"
+            echo "ZONES_XTASK_BIN=$ZONES_BENCH_TARGET_DIR/profiling/tempo-zone-xtask"
+            echo "TEMPO_BIN=$ZONES_BENCH_TARGET_DIR/profiling/tempo"
+            echo "TEMPO_XTASK_BIN=$ZONES_BENCH_TARGET_DIR/profiling/tempo-xtask"
           } >> "$GITHUB_ENV"
 
       - name: Build neobank fixture contracts

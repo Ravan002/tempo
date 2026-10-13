@@ -75,14 +75,15 @@ jobs:
           head: ${{ steps.candidate.outputs.sha }}
           filters: |
             prover:
-              - 'crates/zones/sequencer/**'
-              - 'crates/zones/prover/**'
-              - 'crates/zones/precompiles/**'
-              - 'crates/zones/spf/**'
-              - 'crates/zones/evm/**'
+              - 'crates/**'
               - 'bin/prover/**'
+              - 'zones/docker/**'
+              - 'zones/scripts/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
+              - 'rust-toolchain.toml'
+              - '.cargo/**'
+              - '.github/workflows/zones-docker*.yml'
               - '.github/workflows/zones-prover-e2e.yml'
       - name: Publish prover E2E event
         id: publish

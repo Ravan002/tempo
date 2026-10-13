@@ -6,7 +6,29 @@ on:
       - main
     tags:
       - "zones/v*.*.*"
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - '.cargo/**'
+      - 'crates/**'
+      - 'bin/**'
+      - 'xtask/**'
+      - 'zones/docker/**'
+      - 'zones/scripts/**'
+      - '.github/workflows/zones-docker*.yml'
   pull_request:
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - '.cargo/**'
+      - 'crates/**'
+      - 'bin/**'
+      - 'xtask/**'
+      - 'zones/docker/**'
+      - 'zones/scripts/**'
+      - '.github/workflows/zones-docker*.yml'
   merge_group:
   workflow_dispatch:
     inputs:
@@ -82,6 +104,7 @@ jobs:
       build-definition-paths: |
         .dockerignore
         zones/docker/Dockerfile.reproducible
+        zones/docker/Dockerfile.reproducible.dockerignore
         zones/docker/docker-bake.hcl
         zones/scripts/reproducible-build.sh
       depot-project: 0c6tg19qsp
@@ -139,7 +162,7 @@ jobs:
             type=semver,pattern={{version}},value=${{ steps.release-version.outputs.version }},enable=${{ startsWith(github.ref, 'refs/tags/zones/v') }}
             type=semver,pattern={{major}}.{{minor}},value=${{ steps.release-version.outputs.version }},enable=${{ startsWith(github.ref, 'refs/tags/zones/v') }}
             type=semver,pattern={{major}},value=${{ steps.release-version.outputs.version }},enable=${{ startsWith(github.ref, 'refs/tags/zones/v') }}
-            type=raw,value=stable,enable=${{ github.ref_type == 'tag' }}
+            type=raw,value=stable,enable=${{ github.ref_type == 'tag' && !contains(github.ref_name, '-') }}
             type=raw,value=latest,enable={{is_default_branch}}
             type=edge,branch=main
             type=sha,prefix=sha-
@@ -159,7 +182,7 @@ jobs:
             type=semver,pattern={{version}},value=${{ steps.release-version.outputs.version }},enable=${{ startsWith(github.ref, 'refs/tags/zones/v') }}
             type=semver,pattern={{major}}.{{minor}},value=${{ steps.release-version.outputs.version }},enable=${{ startsWith(github.ref, 'refs/tags/zones/v') }}
             type=semver,pattern={{major}},value=${{ steps.release-version.outputs.version }},enable=${{ startsWith(github.ref, 'refs/tags/zones/v') }}
-            type=raw,value=stable,enable=${{ github.ref_type == 'tag' }}
+            type=raw,value=stable,enable=${{ github.ref_type == 'tag' && !contains(github.ref_name, '-') }}
             type=raw,value=latest,enable={{is_default_branch}}
             type=edge,branch=main
             type=sha,prefix=sha-
@@ -179,7 +202,7 @@ jobs:
             type=semver,pattern={{version}},value=${{ steps.release-version.outputs.version }},enable=${{ startsWith(github.ref, 'refs/tags/zones/v') }}
             type=semver,pattern={{major}}.{{minor}},value=${{ steps.release-version.outputs.version }},enable=${{ startsWith(github.ref, 'refs/tags/zones/v') }}
             type=semver,pattern={{major}},value=${{ steps.release-version.outputs.version }},enable=${{ startsWith(github.ref, 'refs/tags/zones/v') }}
-            type=raw,value=stable,enable=${{ github.ref_type == 'tag' }}
+            type=raw,value=stable,enable=${{ github.ref_type == 'tag' && !contains(github.ref_name, '-') }}
             type=raw,value=latest,enable={{is_default_branch}}
             type=edge,branch=main
             type=sha,prefix=sha-
@@ -199,7 +222,7 @@ jobs:
             type=semver,pattern={{version}},value=${{ steps.release-version.outputs.version }},enable=${{ startsWith(github.ref, 'refs/tags/zones/v') }}
             type=semver,pattern={{major}}.{{minor}},value=${{ steps.release-version.outputs.version }},enable=${{ startsWith(github.ref, 'refs/tags/zones/v') }}
             type=semver,pattern={{major}},value=${{ steps.release-version.outputs.version }},enable=${{ startsWith(github.ref, 'refs/tags/zones/v') }}
-            type=raw,value=stable,enable=${{ github.ref_type == 'tag' }}
+            type=raw,value=stable,enable=${{ github.ref_type == 'tag' && !contains(github.ref_name, '-') }}
             type=raw,value=latest,enable={{is_default_branch}}
             type=edge,branch=main
             type=sha,prefix=sha-
@@ -487,7 +510,7 @@ jobs:
             --arg digest "$digest" \
             '{
               repository: "tempoxyz/tempo",
-              event: "registry_package",
+              event: "zones_registry_package",
               data: {
                 tag: $tag,
                 sha: $sha,
