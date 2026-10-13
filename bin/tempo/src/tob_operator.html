@@ -50,7 +50,7 @@
 <main>
   <section class="stats">
     <div class="stat"><div class="v" id="genRate">–</div><div class="k">maker quotes signed / s (replaceable per maker)</div></div>
-    <div class="stat"><div class="v" id="streamRate">–</div><div class="k">quotes delivered to leaders / s (stream while a lane is open + flush at announce)</div></div>
+    <div class="stat"><div class="v" id="streamRate">–</div><div class="k">quotes delivered to leaders / s (flush when the leader is known, then stream until it builds)</div></div>
     <div class="stat"><div class="v" id="pubRate">–</div><div class="k">public high-tip txs / s (mempool)</div></div>
     <div class="stat"><div class="v" id="verified">–</div><div class="k">blocks with lane txs at index 0 (verified via another validator's RPC)</div></div>
   </section>
@@ -61,8 +61,8 @@
     <div id="current"></div>
     <h2 style="margin-top:22px">How a round works</h2>
     <ol class="how">
-      <li>The VRF picks the leader of view <i>v</i> from the certificate of view <i>v</i>−1. As soon as the leader starts proposing, it opens its lane and announces itself to the operator over the authenticated top-of-block channel.</li>
-      <li>The operator immediately flushes the latest quote of every maker to that leader, then streams each new quote the moment it is signed, until the lane window closes.</li>
+      <li>The VRF picks the leader of view <i>v</i> from the certificate of view <i>v</i>−1. Validators broadcast that certificate to the operator too, so the operator verifies it and computes the leader itself, as early as the validators do. No validator announces anything.</li>
+      <li>The operator immediately flushes the latest quote of every maker to that leader over the authenticated top-of-block channel, then streams each new quote the moment it is signed, until the leader reports its block. The leader keeps submissions that arrive before its round starts.</li>
       <li>A newer quote from a maker replaces its older one at the leader, keeping the maker's slot. Validators that do not lead receive nothing.</li>
       <li>After its start-of-block system work, the builder executes the lane first, then fills from the pool. Public transactions pay a far higher tip (<span id="tips"></span>) and still come after.</li>
       <li>The dashboard reads every block back from a <i>different</i> validator's RPC and checks that the lane transactions are the block's first transactions.</li>
@@ -118,14 +118,13 @@ function topology(state) {
 function current(state) {
   const c = state.current;
   const el = document.getElementById("current");
-  if (!c) { el.innerHTML = `<div class="muted">waiting for a leader announcement…</div>`; return; }
-  const age = Date.now() - c.announced_at_ms;
+  if (!c) { el.innerHTML = `<div class="muted">waiting for a consensus certificate…</div>`; return; }
+  const age = Date.now() - c.leader_known_at_ms;
   el.innerHTML = [
     ["round (epoch / view)", `${c.epoch} / ${c.view}`],
-    ["building height", c.height],
+    ["building height", c.height ?? "–"],
     ["leader", `<span class="dot" style="background:${colors[c.leader % colors.length]}"></span>V${c.leader}`],
-    ["lane window", `${c.window_ms} ms`],
-    ["announced", `${age} ms ago`],
+    ["leader computed", `${age} ms ago`],
     ["first ack RTT", fmtUs(c.first_ack_rtt_us)],
   ].map(([k, v]) => `<div><div class="k">${k}</div><div class="v">${v}</div></div>`).join("");
 }
@@ -145,10 +144,10 @@ function rounds(state) {
         : `<span class="bad">✗ prefix mismatch</span>`;
     }
     return `<tr>
-      <td class="mono">${r.height}</td><td class="mono">${r.view}</td>
+      <td class="mono">${r.height ?? "–"}</td><td class="mono">${r.view}</td>
       <td><span class="dot" style="background:${colors[r.leader % colors.length]}"></span>V${r.leader}</td>
       <td class="mono">${fmtUs(r.first_ack_rtt_us)}</td>
-      <td class="mono">${r.first_since_open_us != null ? "+" + fmtUs(r.first_since_open_us) : "–"}</td>
+      <td class="mono">${r.first_since_open_us == null ? "–" : r.first_since_open_us === 0 ? "before open" : "+" + fmtUs(r.first_since_open_us)}</td>
       <td class="mono">${r.sent} / ${top}</td>
       <td><div class="bar">${cells}</div></td>
       <td>${verdict}</td></tr>`;

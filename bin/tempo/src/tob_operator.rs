@@ -1,8 +1,9 @@
 //! Demo top-of-block operator.
 //!
-//! Connects to the validators as an authenticated secondary peer, streams
-//! replaceable maker transactions straight to each round's leader, verifies the
-//! resulting blocks over RPC, and serves a live dashboard.
+//! Connects to the validators as an authenticated secondary peer, computes
+//! each round's leader from the consensus certificates the validators
+//! broadcast, streams replaceable maker transactions straight to that leader,
+//! verifies the resulting blocks over RPC, and serves a live dashboard.
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -22,6 +23,7 @@ use alloy_rlp::Encodable as _;
 use alloy_signer_local::{MnemonicBuilder, PrivateKeySigner};
 use clap::Parser;
 use commonware_codec::{Encode as _, ReadExt as _};
+use commonware_consensus::{Epochable as _, Viewable as _};
 use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
 use commonware_p2p::{Receiver as _, Recipients};
 use commonware_runtime::Runner as _;
@@ -29,15 +31,15 @@ use eyre::WrapErr as _;
 use parking_lot::Mutex;
 use serde::Serialize;
 use tempo_consensus::top_of_block::{
-    self, OperatorNetwork,
+    self, OperatorChannels, OperatorNetwork,
+    leader::{self, EpochLeaders},
     wire::{AckStatus, Message, Submit, SubmitTx},
 };
+use tempo_dkg_onchain_artifacts::OnchainDkgOutcome;
 use tempo_primitives::TempoTxEnvelope;
 
 /// Makers send their quotes here; the address has no code.
 const BOOK: Address = address!("0x000000000000000000000000000000000000b00c");
-/// Stop streaming to a leader this long before its lane closes.
-const CUTOFF_MARGIN: Duration = Duration::from_millis(5);
 const ROUNDS_KEPT: usize = 40;
 
 #[derive(Debug, Parser)]
@@ -133,11 +135,11 @@ struct ValidatorView {
 struct RoundView {
     epoch: u64,
     view: u64,
-    height: u64,
+    /// Height of the built block; known once the leader reports it.
+    height: Option<u64>,
     leader: usize,
-    window_ms: u64,
-    /// Unix ms when the announcement arrived.
-    announced_at_ms: u64,
+    /// Unix ms when the operator computed the leader from a certificate.
+    leader_known_at_ms: u64,
     /// Transactions streamed to the leader for this round.
     sent: u64,
     accepted: u64,
@@ -146,7 +148,8 @@ struct RoundView {
     late: u64,
     /// Round trip of the first submission.
     first_ack_rtt_us: Option<u64>,
-    /// Time between the leader opening its lane and receiving our first submission.
+    /// Time between the leader opening its lane and receiving our first
+    /// submission; zero if it arrived before the lane opened.
     first_since_open_us: Option<u64>,
     built: Option<BuiltView>,
     verification: Option<Verification>,
@@ -247,15 +250,49 @@ struct Accepted {
     nonce_key: U256,
     seq: u64,
     expires_at: u64,
-    /// The validator the transaction was streamed to, if a lane was open.
+    /// The leader the transaction was streamed to, if its lane was not
+    /// known to be closed.
     streamed_to: Option<usize>,
 }
 
+/// The next round and its leader.
 struct Target {
     leader: usize,
     epoch: u64,
     view: u64,
-    cutoff: Instant,
+    /// The leader's builder took the lane; later submissions would be late.
+    closed: bool,
+}
+
+/// Chain parameters needed to elect leaders.
+struct Election {
+    epoch_length: u64,
+    t12_time: Option<u64>,
+}
+
+impl Election {
+    /// Reads the DKG outcome of `epoch` from its boundary block.
+    async fn leaders(&self, provider: &RootProvider, epoch: u64) -> eyre::Result<EpochLeaders> {
+        let boundary = (epoch * self.epoch_length).saturating_sub(1);
+        let block: serde_json::Value = provider
+            .raw_request(
+                "eth_getBlockByNumber".into(),
+                (format!("{boundary:#x}"), false),
+            )
+            .await?;
+        let extra_data: Bytes = serde_json::from_value(block["extraData"].clone())?;
+        let timestamp: alloy_primitives::U64 = serde_json::from_value(block["timestamp"].clone())?;
+        let outcome = OnchainDkgOutcome::read(&mut extra_data.as_ref())?;
+        eyre::ensure!(
+            outcome.epoch().get() == epoch,
+            "block {boundary} carries the outcome of epoch {}, not {epoch}",
+            outcome.epoch()
+        );
+        let t12 = self
+            .t12_time
+            .is_some_and(|t12_time| timestamp.to::<u64>() >= t12_time);
+        Ok(EpochLeaders::new(&outcome, t12))
+    }
 }
 
 async fn run(
@@ -289,6 +326,14 @@ async fn run(
         .map(|url| Ok(ProviderBuilder::default().connect_http(url.parse()?)))
         .collect::<eyre::Result<_>>()?;
     let chain_id = retry(|| providers[0].get_chain_id()).await;
+    let config: serde_json::Value =
+        retry(|| providers[0].raw_request("debug_chainConfig".into(), ())).await;
+    let election = Arc::new(Election {
+        epoch_length: config["epochLength"]
+            .as_u64()
+            .ok_or_else(|| eyre::eyre!("debug_chainConfig has no epochLength"))?,
+        t12_time: config["t12Time"].as_u64(),
+    });
     let gas_price = retry(|| providers[0].get_gas_price()).await;
     let mut resolved = Vec::with_capacity(validators.len());
     for ((key, address), provider) in validators.into_iter().zip(&providers) {
@@ -349,7 +394,10 @@ async fn run(
         .collect();
     let keys: Vec<_> = validators.iter().map(|(key, _)| key.clone()).collect();
 
-    let (mut sender, mut receiver) = top_of_block::start_operator_network(
+    let OperatorChannels {
+        top_of_block: (mut sender, mut receiver),
+        mut certificates,
+    } = top_of_block::start_operator_network(
         &context,
         OperatorNetwork {
             signer,
@@ -418,6 +466,10 @@ async fn run(
     }
 
     let mut target: Option<Target> = None;
+    let mut leaders: HashMap<u64, EpochLeaders> = HashMap::new();
+    let mut loading: HashSet<u64> = HashSet::new();
+    let (leaders_tx, mut leaders_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut rng: rand::rngs::StdRng = rand::make_rng();
     let mut request_id = 0u64;
     let mut in_flight: HashMap<u64, Instant> = HashMap::new();
     let mut latest: HashMap<(Address, U256), Latest> = HashMap::new();
@@ -435,47 +487,81 @@ async fn run(
 
     loop {
         tokio::select! {
+            message = certificates.recv() => {
+                let (_, bytes) = message.map_err(|error| eyre::eyre!("{error}"))?;
+                let Some(certificate) = leader::decode_certificate(bytes) else { continue };
+                let (epoch, view) = (certificate.epoch().get(), certificate.view().get() + 1);
+                // Every validator broadcasts several certificates per view;
+                // only the first that names a later round matters.
+                if target.as_ref().is_some_and(|target| (target.epoch, target.view) >= (epoch, view)) {
+                    continue;
+                }
+                let Some(epoch_leaders) = leaders.get(&epoch) else {
+                    if loading.insert(epoch) {
+                        let (election, provider, leaders_tx) = (election.clone(), providers[0].clone(), leaders_tx.clone());
+                        tokio::spawn(async move {
+                            let _ = leaders_tx.send((epoch, election.leaders(&provider, epoch).await));
+                        });
+                    }
+                    continue;
+                };
+                let Some((_, key)) = epoch_leaders.next_leader(&mut rng, &certificate) else { continue };
+                let now = Instant::now();
+                let Some(&leader) = index_of.get(&key) else {
+                    // A leader the operator was not given cannot be reached.
+                    target = None;
+                    continue;
+                };
+                target = Some(Target { leader, epoch, view, closed: false });
+                // Flush the latest transaction of every slot at once.
+                let now_ms = unix_ms();
+                latest.retain(|_, latest| !latest.expired(now_ms));
+                let txs: Vec<_> = latest.values().map(Latest::submit_tx).collect();
+                if !txs.is_empty() {
+                    request_id += 1;
+                    in_flight.insert(request_id, now);
+                    submit(&mut sender, &keys[leader], epoch, view, request_id, txs.clone());
+                }
+                let mut dashboard = dashboard.lock();
+                if let Some(previous) = dashboard.current.take() {
+                    push_round(&mut dashboard.rounds, previous);
+                }
+                dashboard.validators[leader].rounds_led += 1;
+                dashboard.streamed += txs.len() as u64;
+                dashboard.current = Some(RoundView {
+                    epoch,
+                    view,
+                    leader,
+                    leader_known_at_ms: now_ms,
+                    sent: txs.len() as u64,
+                    ..Default::default()
+                });
+            }
+
+            Some((epoch, loaded)) = leaders_rx.recv() => {
+                loading.remove(&epoch);
+                match loaded {
+                    Ok(loaded) => {
+                        leaders.insert(epoch, loaded);
+                        leaders.retain(|known, _| known + 1 >= epoch);
+                    }
+                    Err(error) => eprintln!("failed loading the leaders of epoch {epoch}: {error:#}"),
+                }
+            }
+
             message = receiver.recv() => {
                 let (peer, mut bytes) = message.map_err(|error| eyre::eyre!("{error}"))?;
                 let Some(&leader) = index_of.get(&peer) else { continue };
                 let Ok(message) = Message::read(&mut bytes) else { continue };
                 match message {
-                    Message::Leader(announcement) => {
-                        let now = Instant::now();
-                        let window = top_of_block::window(&announcement);
-                        target = Some(Target {
-                            leader,
-                            epoch: announcement.epoch,
-                            view: announcement.view,
-                            cutoff: now + window.saturating_sub(CUTOFF_MARGIN),
-                        });
-                        // Flush the latest transaction of every slot at once.
-                        let now_ms = unix_ms();
-                        latest.retain(|_, latest| !latest.expired(now_ms));
-                        let txs: Vec<_> = latest.values().map(Latest::submit_tx).collect();
-                        if !txs.is_empty() {
-                            request_id += 1;
-                            in_flight.insert(request_id, now);
-                            submit(&mut sender, &keys[leader], announcement.epoch, announcement.view, request_id, txs.clone());
-                        }
-                        let mut dashboard = dashboard.lock();
-                        if let Some(previous) = dashboard.current.take() {
-                            push_round(&mut dashboard.rounds, previous);
-                        }
-                        dashboard.validators[leader].rounds_led += 1;
-                        dashboard.streamed += txs.len() as u64;
-                        dashboard.current = Some(RoundView {
-                            epoch: announcement.epoch,
-                            view: announcement.view,
-                            height: announcement.height,
-                            leader,
-                            window_ms: announcement.window_ms,
-                            announced_at_ms: unix_ms(),
-                            sent: txs.len() as u64,
-                            ..Default::default()
-                        });
-                    }
                     Message::Ack(ack) => {
+                        // The first `Closed` says the builder took the lane;
+                        // stop streaming to it until the next leader.
+                        if ack.status == AckStatus::Closed
+                            && let Some(target) = target.as_mut().filter(|target| (target.epoch, target.view) == (ack.epoch, ack.view))
+                        {
+                            target.closed = true;
+                        }
                         let rtt = in_flight.remove(&ack.id).map(|sent| sent.elapsed().as_micros() as u64);
                         let mut dashboard = dashboard.lock();
                         let dashboard = &mut *dashboard;
@@ -506,8 +592,12 @@ async fn run(
                                 state.bumped_at_ms.store(unix_ms(), Ordering::Relaxed);
                             }
                         }
+                        if let Some(target) = target.as_mut().filter(|target| (target.epoch, target.view) == (built.epoch, built.view)) {
+                            target.closed = true;
+                        }
                         let mut dashboard = dashboard.lock();
                         if let Some(round) = find_round(&mut dashboard, built.epoch, built.view) {
+                            round.height = Some(built.height);
                             round.built = Some(BuiltView {
                                 block_hash: built.block_hash,
                                 tx_count: built.tx_count,
@@ -529,7 +619,7 @@ async fn run(
                 let received = fresh.len() as u64 - generated;
                 let lane = target
                     .as_ref()
-                    .filter(|target| Instant::now() < target.cutoff)
+                    .filter(|target| !target.closed)
                     .map(|target| target.leader);
                 let now_ms = unix_ms();
                 let mut txs = Vec::with_capacity(fresh.len());
