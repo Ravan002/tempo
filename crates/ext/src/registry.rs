@@ -2,8 +2,9 @@
 //!
 //! NOTE: load/save is not file-locked. Concurrent `tempo` invocations may
 //! lose a write (last-writer-wins). This is acceptable today because the
-//! data is limited to `checked_at` timestamps and `installed_version`
-//! strings — the worst outcome is a redundant update check.
+//! data is limited to `checked_at` timestamps, `installed_version` strings
+//! and update notices — the worst outcome is a redundant update check or a
+//! dropped notice.
 
 use serde::{Deserialize, Serialize};
 use std::{
@@ -38,6 +39,10 @@ pub(crate) struct ExtensionState {
     /// Short description from the release manifest.
     #[serde(default)]
     pub(crate) description: String,
+    /// Message left by a background update check, shown and cleared on the
+    /// next invocation whose stderr is a terminal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) notice: Option<String>,
 }
 
 impl Registry {
@@ -121,6 +126,7 @@ impl Registry {
                 installed_version: version.to_string(),
                 pinned,
                 description: description.to_string(),
+                notice: None,
             },
         );
     }
@@ -145,9 +151,29 @@ impl Registry {
                     installed_version: String::new(),
                     pinned: false,
                     description: String::new(),
+                    notice: None,
                 },
             );
         }
+    }
+
+    /// Returns `true` if a background update check left a notice to show.
+    pub(crate) fn has_notice(&self, extension: &str) -> bool {
+        self.extensions
+            .get(extension)
+            .is_some_and(|e| e.notice.is_some())
+    }
+
+    /// Stores a notice for the next interactive invocation of an extension.
+    pub(crate) fn set_notice(&mut self, extension: &str, notice: String) {
+        if let Some(ext) = self.extensions.get_mut(extension) {
+            ext.notice = Some(notice);
+        }
+    }
+
+    /// Removes and returns the pending notice for an extension.
+    pub(crate) fn take_notice(&mut self, extension: &str) -> Option<String> {
+        self.extensions.get_mut(extension)?.notice.take()
     }
 }
 
@@ -321,6 +347,7 @@ mod tests {
                 installed_version: "v1.0.0".to_string(),
                 pinned: false,
                 description: String::new(),
+                notice: None,
             },
         );
         assert!(reg.needs_update_check("wallet"));
@@ -403,6 +430,35 @@ mod tests {
         let json = r#"{"extensions":{"wallet":{"checked_at":0,"installed_version":"1.0.0","pinned":false}}}"#;
         let reg: Registry = serde_json::from_str(json).unwrap();
         assert_eq!(reg.extensions["wallet"].description, "");
+    }
+
+    #[test]
+    fn notice_lifecycle() {
+        let mut reg = Registry::default();
+        reg.set_notice("wallet", "ignored".to_string());
+        assert!(!reg.has_notice("wallet"), "no notice without a record");
+
+        reg.record_check("wallet", "1.0.0", false, "");
+        reg.set_notice("wallet", "updated".to_string());
+        reg.touch_check("wallet");
+        assert!(reg.has_notice("wallet"), "touch keeps the notice");
+
+        assert_eq!(reg.take_notice("wallet").as_deref(), Some("updated"));
+        assert!(
+            reg.take_notice("wallet").is_none(),
+            "take clears the notice"
+        );
+
+        reg.set_notice("wallet", "stale".to_string());
+        reg.record_check("wallet", "2.0.0", false, "");
+        assert!(!reg.has_notice("wallet"), "a new install clears the notice");
+    }
+
+    #[test]
+    fn notice_omitted_from_json_when_absent() {
+        let mut reg = Registry::default();
+        reg.record_check("wallet", "1.0.0", false, "");
+        assert!(!serde_json::to_string(&reg).unwrap().contains("notice"));
     }
 
     #[test]

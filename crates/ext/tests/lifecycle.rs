@@ -314,6 +314,16 @@ impl Fixture {
             .map(|s| s.to_string())
     }
 
+    /// Read the pending update notice from the registry.
+    fn notice(&self, extension: &str) -> Option<String> {
+        let reg: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(self.home.join("extensions.json")).unwrap())
+                .unwrap();
+        reg["extensions"][extension]["notice"]
+            .as_str()
+            .map(|s| s.to_string())
+    }
+
     fn run(&self, args: &[&str]) -> Result<i32, tempo_ext::LauncherError> {
         tempo_ext::run(args.iter().map(|s| s.to_string()))
     }
@@ -955,6 +965,65 @@ fn add_records_version_in_registry() {
         Some("1.0.0"),
         "add should record installed version in registry"
     );
+}
+
+// ── Background auto-update ─────────────────────────────────────────
+
+#[test]
+fn auto_update_command_installs_or_reports() {
+    // (pinned, latest published, binary replaced, recorded notice)
+    let cases = [
+        (false, "2.0.0", true, Some("updated tempo-testpkg to 2.0.0")),
+        (
+            true,
+            "2.0.0",
+            false,
+            Some(
+                "tempo-testpkg 2.0.0 available (pinned to 1.0.0; run `tempo update testpkg` to upgrade)",
+            ),
+        ),
+        (false, "1.0.0", false, None),
+        (true, "1.0.0", false, None),
+    ];
+    for (pinned, latest, replaced, notice) in cases {
+        let _lock = lock();
+        let fix = Fixture::new();
+        fix.publish_extension("testpkg", "1.0.0");
+        fix.run(&["tempo", "add", "testpkg"]).unwrap();
+        fix.record_installed_version_inner("testpkg", "1.0.0", pinned);
+        let before = fs::read(fix.binary_path("testpkg")).unwrap();
+
+        fix.publish_extension("testpkg", latest);
+        let code = fix.run(&["tempo", "__auto-update", "testpkg"]).unwrap();
+        assert_eq!(code, 0);
+
+        let after = fs::read(fix.binary_path("testpkg")).unwrap();
+        let case = format!("pinned={pinned} latest={latest}");
+        assert_eq!(before != after, replaced, "{case}");
+        assert_eq!(fix.is_pinned("testpkg"), pinned, "{case}: pin preserved");
+        let expected_version = if replaced { latest } else { "1.0.0" };
+        assert_eq!(
+            fix.installed_version("testpkg").as_deref(),
+            Some(expected_version),
+            "{case}"
+        );
+        assert_eq!(fix.notice("testpkg").as_deref(), notice, "{case}");
+    }
+}
+
+#[test]
+fn update_clears_pending_notice() {
+    let _lock = lock();
+    let fix = Fixture::new();
+    fix.publish_extension("testpkg", "1.0.0");
+    fix.run(&["tempo", "add", "testpkg", "1.0.0"]).unwrap();
+
+    fix.publish_extension("testpkg", "2.0.0");
+    fix.run(&["tempo", "__auto-update", "testpkg"]).unwrap();
+    assert!(fix.notice("testpkg").is_some());
+
+    fix.run(&["tempo", "update", "testpkg"]).unwrap();
+    assert_eq!(fix.notice("testpkg"), None);
 }
 
 // ── List command ───────────────────────────────────────────────────
