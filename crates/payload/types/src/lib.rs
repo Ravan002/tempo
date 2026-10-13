@@ -17,7 +17,8 @@ use std::{
     time::Duration,
 };
 pub use top_of_block::{
-    TopOfBlockLane, TopOfBlockLimits, TopOfBlockSubmitError, TopOfBlockSubmitOutcome,
+    TopOfBlockLane, TopOfBlockLimits, TopOfBlockSubmission, TopOfBlockSubmitError,
+    TopOfBlockSubmitOutcome, top_of_block_slot,
 };
 
 use alloy_eips::eip7685::Requests;

@@ -6,10 +6,17 @@
 //! lane after its start-of-block system work and executes the taken
 //! transactions before any transaction from the pool.
 //!
-//! Each maker (the recovered transaction signer) holds at most one slot per
-//! round: a newer transaction from the same maker replaces the older one and
-//! keeps its position in the prefix. Slots are ordered by the time the maker
-//! first appeared in the round.
+//! A slot is keyed by the maker (the recovered signer) and the transaction's
+//! nonce key, so a maker can quote several markets independently by using a
+//! nonce key per market. Ethereum transactions use nonce key zero.
+//!
+//! Each submission carries a replacement sequence. It replaces the slot's
+//! transaction only if its sequence is higher, so the latest quote wins
+//! regardless of arrival order, and the slot keeps its position in the prefix.
+//! Slots are ordered by the time they were first filled in the round.
+//!
+//! A submission may carry an expiry. The builder drops it unless the block's
+//! timestamp is before the expiry.
 
 use std::{
     collections::HashMap,
@@ -18,28 +25,45 @@ use std::{
 };
 
 use alloy_consensus::{Transaction as _, transaction::TxHashRef as _};
-use alloy_primitives::{Address, B256};
+use alloy_primitives::{Address, B256, U256};
 use reth_primitives_traits::Recovered;
 use tempo_primitives::TempoTxEnvelope;
 
 /// Limits an operator is held to within one round.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TopOfBlockLimits {
-    /// Maximum number of maker slots the operator may hold.
+    /// Maximum number of slots the operator may hold.
     pub max_txs: usize,
     /// Maximum sum of gas limits over the operator's slots.
     pub max_gas: u64,
 }
 
+/// A transaction submitted to the lane.
+#[derive(Debug, Clone)]
+pub struct TopOfBlockSubmission {
+    pub tx: Recovered<TempoTxEnvelope>,
+    /// Replacement sequence within the transaction's slot; higher wins.
+    pub seq: u64,
+    /// Unix time in milliseconds at which the submission expires; zero never
+    /// expires.
+    pub expires_at_ms: u64,
+}
+
+/// The lane slot of a transaction: its maker and nonce key.
+pub fn top_of_block_slot(tx: &Recovered<TempoTxEnvelope>) -> (Address, U256) {
+    (tx.signer(), tx.nonce_key().unwrap_or_default())
+}
+
 /// Result of a submission to an open round.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TopOfBlockSubmitOutcome {
-    /// Transactions that took a new maker slot.
+    /// Transactions that filled a new slot.
     pub accepted: u32,
-    /// Transactions that replaced the previous transaction of their maker.
+    /// Transactions that replaced their slot's transaction.
     pub replaced: u32,
-    /// Transactions dropped because of the operator's limits or because another
-    /// operator holds the maker's slot.
+    /// Transactions dropped because of the operator's limits, because another
+    /// operator holds the slot, or because the slot already holds an equal or
+    /// higher sequence.
     pub rejected: u32,
     /// Time since the round was opened.
     pub since_open: Duration,
@@ -73,14 +97,14 @@ struct LaneRound {
     /// The hashes the builder took, in prefix order; `None` while open.
     taken: Option<Vec<B256>>,
     slots: Vec<Slot>,
-    slot_by_maker: HashMap<Address, usize>,
+    slot_index: HashMap<(Address, U256), usize>,
     usage_by_operator: HashMap<B256, (usize, u64)>,
 }
 
 #[derive(Debug)]
 struct Slot {
     operator: B256,
-    tx: Recovered<TempoTxEnvelope>,
+    submission: TopOfBlockSubmission,
 }
 
 impl TopOfBlockLane {
@@ -97,19 +121,19 @@ impl TopOfBlockLane {
             deadline: now + window,
             taken: None,
             slots: Vec::new(),
-            slot_by_maker: HashMap::new(),
+            slot_index: HashMap::new(),
             usage_by_operator: HashMap::new(),
         });
     }
 
-    /// Adds `txs` from `operator` to the open round `(epoch, view)`.
+    /// Adds `submissions` from `operator` to the open round `(epoch, view)`.
     pub fn submit(
         &self,
         epoch: u64,
         view: u64,
         operator: B256,
         limits: TopOfBlockLimits,
-        txs: impl IntoIterator<Item = Recovered<TempoTxEnvelope>>,
+        submissions: impl IntoIterator<Item = TopOfBlockSubmission>,
     ) -> Result<TopOfBlockSubmitOutcome, TopOfBlockSubmitError> {
         let mut guard = self.lock();
         let round = guard
@@ -124,23 +148,26 @@ impl TopOfBlockLane {
             since_open: round.opened_at.elapsed(),
             ..Default::default()
         };
-        for tx in txs {
-            let maker = tx.signer();
-            let gas = tx.gas_limit();
+        for submission in submissions {
+            let key = top_of_block_slot(&submission.tx);
+            let gas = submission.tx.gas_limit();
             let (slots, used_gas) = round
                 .usage_by_operator
                 .get(&operator)
                 .copied()
                 .unwrap_or_default();
-            match round.slot_by_maker.get(&maker).copied() {
+            match round.slot_index.get(&key).copied() {
                 Some(index) => {
                     let slot = &mut round.slots[index];
-                    let old_gas = slot.tx.gas_limit();
-                    if slot.operator != operator || used_gas - old_gas + gas > limits.max_gas {
+                    let old_gas = slot.submission.tx.gas_limit();
+                    if slot.operator != operator
+                        || submission.seq <= slot.submission.seq
+                        || used_gas - old_gas + gas > limits.max_gas
+                    {
                         outcome.rejected += 1;
                         continue;
                     }
-                    slot.tx = tx;
+                    slot.submission = submission;
                     round
                         .usage_by_operator
                         .insert(operator, (slots, used_gas - old_gas + gas));
@@ -151,8 +178,11 @@ impl TopOfBlockLane {
                         outcome.rejected += 1;
                         continue;
                     }
-                    round.slot_by_maker.insert(maker, round.slots.len());
-                    round.slots.push(Slot { operator, tx });
+                    round.slot_index.insert(key, round.slots.len());
+                    round.slots.push(Slot {
+                        operator,
+                        submission,
+                    });
                     round
                         .usage_by_operator
                         .insert(operator, (slots + 1, used_gas + gas));
@@ -164,10 +194,16 @@ impl TopOfBlockLane {
     }
 
     /// Waits until the window of round `(epoch, view)` elapses, then closes the
-    /// round and returns its transactions in prefix order.
+    /// round and returns its transactions in prefix order, without those
+    /// expired at `block_timestamp_ms`.
     ///
     /// Returns nothing if the lane is not open for this round.
-    pub fn take(&self, epoch: u64, view: u64) -> Vec<Recovered<TempoTxEnvelope>> {
+    pub fn take(
+        &self,
+        epoch: u64,
+        view: u64,
+        block_timestamp_ms: u64,
+    ) -> Vec<Recovered<TempoTxEnvelope>> {
         let deadline = match self.lock().as_ref() {
             Some(round) if round.epoch == epoch && round.view == view && round.taken.is_none() => {
                 round.deadline
@@ -183,7 +219,15 @@ impl TopOfBlockLane {
         else {
             return Vec::new();
         };
-        let txs: Vec<_> = round.slots.drain(..).map(|slot| slot.tx).collect();
+        let txs: Vec<_> = round
+            .slots
+            .drain(..)
+            .map(|slot| slot.submission)
+            .filter(|submission| {
+                submission.expires_at_ms == 0 || block_timestamp_ms < submission.expires_at_ms
+            })
+            .map(|submission| submission.tx)
+            .collect();
         round.taken = Some(txs.iter().map(|tx| *tx.tx_hash()).collect());
         txs
     }
@@ -208,47 +252,71 @@ impl TopOfBlockLane {
 mod tests {
     use super::*;
     use alloy_consensus::{Signed, TxLegacy};
-    use alloy_primitives::{Signature, U256};
+    use alloy_primitives::Signature;
 
     const LIMITS: TopOfBlockLimits = TopOfBlockLimits {
         max_txs: 2,
         max_gas: 100_000,
     };
 
-    fn tx(maker: u8, nonce: u64, gas: u64) -> Recovered<TempoTxEnvelope> {
+    fn quote(maker: u8, gas: u64, seq: u64) -> TopOfBlockSubmission {
         let tx = TxLegacy {
-            nonce,
             gas_limit: gas,
-            value: U256::from(nonce),
+            value: U256::from(seq),
             ..Default::default()
         };
-        Recovered::new_unchecked(
-            TempoTxEnvelope::Legacy(Signed::new_unhashed(tx, Signature::test_signature())),
-            Address::repeat_byte(maker),
-        )
+        TopOfBlockSubmission {
+            tx: Recovered::new_unchecked(
+                TempoTxEnvelope::Legacy(Signed::new_unhashed(tx, Signature::test_signature())),
+                Address::repeat_byte(maker),
+            ),
+            seq,
+            expires_at_ms: 0,
+        }
     }
 
     #[test]
-    fn newest_transaction_of_a_maker_keeps_the_makers_first_position() {
+    fn highest_sequence_wins_and_keeps_the_slots_first_position() {
         let lane = TopOfBlockLane::default();
         let operator = B256::repeat_byte(1);
         lane.open(0, 7, Duration::ZERO);
 
-        lane.submit(0, 7, operator, LIMITS, [tx(1, 0, 21_000), tx(2, 0, 21_000)])
-            .unwrap();
+        lane.submit(
+            0,
+            7,
+            operator,
+            LIMITS,
+            [quote(1, 21_000, 5), quote(2, 21_000, 1)],
+        )
+        .unwrap();
+        // A newer quote replaces maker 1's; an older one arriving later does
+        // not; maker 3 exceeds the slot limit.
         let outcome = lane
-            .submit(0, 7, operator, LIMITS, [tx(1, 5, 21_000), tx(3, 0, 21_000)])
+            .submit(
+                0,
+                7,
+                operator,
+                LIMITS,
+                [
+                    quote(1, 21_000, 7),
+                    quote(1, 21_000, 6),
+                    quote(3, 21_000, 1),
+                ],
+            )
             .unwrap();
         assert_eq!(
             (outcome.accepted, outcome.replaced, outcome.rejected),
-            (0, 1, 1)
+            (0, 1, 2)
         );
 
-        let taken = lane.take(0, 7);
-        let got: Vec<_> = taken.iter().map(|tx| (tx.signer(), tx.nonce())).collect();
+        let taken = lane.take(0, 7, 0);
+        let got: Vec<_> = taken.iter().map(|tx| (tx.signer(), tx.value())).collect();
         assert_eq!(
             got,
-            [(Address::repeat_byte(1), 5), (Address::repeat_byte(2), 0)]
+            [
+                (Address::repeat_byte(1), U256::from(7)),
+                (Address::repeat_byte(2), U256::from(1))
+            ]
         );
         assert_eq!(
             lane.taken(0, 7).unwrap(),
@@ -257,36 +325,58 @@ mod tests {
     }
 
     #[test]
+    fn submissions_expire_at_the_block_timestamp() {
+        let lane = TopOfBlockLane::default();
+        let operator = B256::repeat_byte(1);
+        lane.open(0, 7, Duration::ZERO);
+        let (mut expiring, mut live) = (quote(1, 21_000, 1), quote(2, 21_000, 1));
+        expiring.expires_at_ms = 1_000;
+        live.expires_at_ms = 1_001;
+        lane.submit(0, 7, operator, LIMITS, [expiring, live])
+            .unwrap();
+
+        let taken = lane.take(0, 7, 1_000);
+        assert_eq!(taken.len(), 1);
+        assert_eq!(taken[0].signer(), Address::repeat_byte(2));
+    }
+
+    #[test]
     fn lane_only_accepts_its_round_until_taken() {
         let lane = TopOfBlockLane::default();
         let (operator, other) = (B256::repeat_byte(1), B256::repeat_byte(2));
         assert_eq!(
-            lane.submit(0, 7, operator, LIMITS, [tx(1, 0, 21_000)]),
+            lane.submit(0, 7, operator, LIMITS, [quote(1, 21_000, 1)]),
             Err(TopOfBlockSubmitError::NotOpen)
         );
-        assert!(lane.take(0, 7).is_empty());
+        assert!(lane.take(0, 7, 0).is_empty());
 
         lane.open(0, 7, Duration::ZERO);
         assert_eq!(
-            lane.submit(0, 6, operator, LIMITS, [tx(1, 0, 21_000)]),
+            lane.submit(0, 6, operator, LIMITS, [quote(1, 21_000, 1)]),
             Err(TopOfBlockSubmitError::NotOpen)
         );
-        // Gas is limited per operator, and a maker slot belongs to the operator
-        // that took it.
+        // Gas is limited per operator, and a slot belongs to the operator that
+        // filled it.
         let outcome = lane
-            .submit(0, 7, operator, LIMITS, [tx(1, 0, 90_000), tx(2, 0, 21_000)])
+            .submit(
+                0,
+                7,
+                operator,
+                LIMITS,
+                [quote(1, 90_000, 1), quote(2, 21_000, 1)],
+            )
             .unwrap();
         assert_eq!((outcome.accepted, outcome.rejected), (1, 1));
         let outcome = lane
-            .submit(0, 7, other, LIMITS, [tx(1, 1, 21_000)])
+            .submit(0, 7, other, LIMITS, [quote(1, 21_000, 2)])
             .unwrap();
         assert_eq!((outcome.replaced, outcome.rejected), (0, 1));
 
-        assert_eq!(lane.take(0, 7).len(), 1);
+        assert_eq!(lane.take(0, 7, 0).len(), 1);
         assert_eq!(
-            lane.submit(0, 7, operator, LIMITS, [tx(3, 0, 21_000)]),
+            lane.submit(0, 7, operator, LIMITS, [quote(3, 21_000, 1)]),
             Err(TopOfBlockSubmitError::Closed)
         );
-        assert!(lane.take(0, 7).is_empty(), "a round is taken once");
+        assert!(lane.take(0, 7, 0).is_empty(), "a round is taken once");
     }
 }

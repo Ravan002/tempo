@@ -556,7 +556,8 @@ where
         let top_of_block_wait_start = Instant::now();
         let top_of_block = match attributes.consensus_context() {
             Some(context) if take_top_of_block => {
-                self.top_of_block.take(context.epoch, context.view)
+                self.top_of_block
+                    .take(context.epoch, context.view, attributes.timestamp_millis())
             }
             _ => Vec::new(),
         };
