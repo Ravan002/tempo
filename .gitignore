@@ -51,3 +51,4 @@ __pycache__/
 crates/zones/contracts/cache/
 crates/zones/contracts/out/
 crates/zones/contracts/benchmark-out/
+.tob-devnet/
