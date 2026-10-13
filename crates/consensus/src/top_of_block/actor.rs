@@ -1,0 +1,211 @@
+//! The validator side of the top-of-block channel.
+
+use std::{collections::HashSet, sync::Arc};
+
+use alloy_consensus::transaction::{SignerRecoverable as _, TxHashRef as _};
+use alloy_eips::eip2718::Decodable2718 as _;
+use alloy_primitives::B256;
+use commonware_codec::{Encode as _, ReadExt as _};
+use commonware_consensus::{Heightable as _, types::Round};
+use commonware_cryptography::ed25519::PublicKey;
+use commonware_p2p::{Receiver, Recipients, Sender};
+use commonware_runtime::{Clock, ContextCell, Handle, Spawner, spawn_cell};
+use futures::{StreamExt as _, channel::mpsc};
+use tempo_payload_types::{TopOfBlockLane, TopOfBlockSubmitError};
+use tempo_primitives::TempoTxEnvelope;
+use tracing::{debug, warn};
+
+use super::{
+    Config, Registry,
+    wire::{Ack, AckStatus, Built, Leader, Message, Submit},
+};
+use crate::{
+    consensus::{Digest, block::Block},
+    utils::public_key_to_b256,
+};
+
+pub(super) fn init<TContext>(context: TContext, config: Config) -> (Actor<TContext>, Mailbox) {
+    let (tx, rx) = mpsc::unbounded();
+    let registry = Arc::new(config.registry);
+    let mailbox = Mailbox {
+        tx,
+        lane: config.lane.clone(),
+        window: registry.window,
+    };
+    let actor = Actor {
+        context: ContextCell::new(context),
+        registry,
+        lane: config.lane,
+        mailbox: rx,
+    };
+    (actor, mailbox)
+}
+
+/// Opens the lane when this node proposes and reports the built proposal.
+#[derive(Clone)]
+pub(crate) struct Mailbox {
+    tx: mpsc::UnboundedSender<Message>,
+    lane: TopOfBlockLane,
+    window: std::time::Duration,
+}
+
+impl Mailbox {
+    /// Opens the lane for `round`, in which this node builds the block at
+    /// `height` on `parent`, and announces it to the operators.
+    pub(crate) fn open(&self, round: Round, height: u64, parent: Digest) {
+        let (epoch, view) = (round.epoch().get(), round.view().get());
+        self.lane.open(epoch, view, self.window);
+        let _ = self.tx.unbounded_send(Message::Leader(Leader {
+            epoch,
+            view,
+            height,
+            parent: parent.0,
+            window_ms: self.window.as_millis() as u64,
+        }));
+    }
+
+    /// Reports which lane transactions made it into `proposal` for `round`.
+    pub(crate) fn built(&self, round: Round, proposal: &Block) {
+        let (epoch, view) = (round.epoch().get(), round.view().get());
+        let Some(taken) = self.lane.taken(epoch, view) else {
+            return;
+        };
+        let taken: HashSet<B256> = taken.into_iter().collect();
+        let transactions = &proposal.block().body().transactions;
+        let top_of_block = transactions
+            .iter()
+            .map(|tx| *tx.tx_hash())
+            .filter(|hash| taken.contains(hash))
+            .collect();
+        let _ = self.tx.unbounded_send(Message::Built(Built {
+            epoch,
+            view,
+            height: proposal.height().get(),
+            block_hash: proposal.digest().0,
+            tx_count: transactions.len() as u32,
+            top_of_block,
+        }));
+    }
+}
+
+pub(crate) struct Actor<TContext> {
+    context: ContextCell<TContext>,
+    registry: Arc<Registry>,
+    lane: TopOfBlockLane,
+    mailbox: mpsc::UnboundedReceiver<Message>,
+}
+
+impl<TContext: Clock + Spawner> Actor<TContext> {
+    pub(crate) fn start(
+        mut self,
+        channel: (
+            impl Sender<PublicKey = PublicKey>,
+            impl Receiver<PublicKey = PublicKey>,
+        ),
+    ) -> Handle<()> {
+        spawn_cell!(self.context, self.run(channel))
+    }
+
+    async fn run(
+        mut self,
+        (mut sender, mut receiver): (
+            impl Sender<PublicKey = PublicKey>,
+            impl Receiver<PublicKey = PublicKey>,
+        ),
+    ) {
+        loop {
+            tokio::select! {
+                biased;
+
+                message = self.mailbox.next() => {
+                    let Some(message) = message else { break };
+                    // Leader announcements and build reports go to every
+                    // operator. The leader is authenticated by the connection.
+                    let operators = self.registry.active(self.context.current());
+                    if !operators.is_empty() {
+                        sender.send(Recipients::Some(operators), message.encode(), true);
+                    }
+                }
+
+                message = receiver.recv() => {
+                    let Ok((peer, mut bytes)) = message else {
+                        warn!("top-of-block channel closed");
+                        break;
+                    };
+                    match Message::read(&mut bytes) {
+                        Ok(Message::Submit(submit)) => {
+                            let ack = self.submit(&peer, submit);
+                            sender.send(Recipients::One(peer), Message::Ack(ack).encode(), true);
+                        }
+                        Ok(_) => debug!(%peer, "ignoring unexpected top-of-block message"),
+                        Err(error) => debug!(%peer, %error, "failed decoding top-of-block message"),
+                    }
+                }
+            }
+        }
+    }
+
+    fn submit(&self, operator: &PublicKey, submit: Submit) -> Ack {
+        let Submit {
+            epoch,
+            view,
+            seq,
+            txs,
+        } = submit;
+        let mut ack = Ack {
+            epoch,
+            view,
+            seq,
+            status: AckStatus::Ok,
+            accepted: 0,
+            replaced: 0,
+            rejected: 0,
+            since_open_us: 0,
+        };
+        let Some(policy) = self.registry.authorize(operator, self.context.current()) else {
+            ack.status = AckStatus::Unauthorized;
+            return ack;
+        };
+
+        let submitted = txs.len();
+        let txs: Vec<_> = txs
+            .iter()
+            .filter_map(|bytes| {
+                TempoTxEnvelope::decode_2718_exact(bytes)
+                    .ok()?
+                    .try_into_recovered()
+                    .ok()
+            })
+            .collect();
+        let malformed = (submitted - txs.len()) as u32;
+
+        match self.lane.submit(
+            epoch,
+            view,
+            public_key_to_b256(operator),
+            policy.limits,
+            txs,
+        ) {
+            Ok(outcome) => {
+                ack.accepted = outcome.accepted;
+                ack.replaced = outcome.replaced;
+                ack.rejected = outcome.rejected + malformed;
+                ack.since_open_us = outcome.since_open.as_micros() as u64;
+                debug!(
+                    %operator,
+                    epoch,
+                    view,
+                    seq,
+                    accepted = ack.accepted,
+                    replaced = ack.replaced,
+                    rejected = ack.rejected,
+                    since_open_us = ack.since_open_us,
+                    "accepted top-of-block submission",
+                );
+            }
+            Err(TopOfBlockSubmitError::NotOpen) => ack.status = AckStatus::NotOpen,
+            Err(TopOfBlockSubmitError::Closed) => ack.status = AckStatus::Closed,
+        }
+        ack
+    }
+}

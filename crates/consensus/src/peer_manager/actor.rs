@@ -55,6 +55,8 @@ where
 
     peers: Gauge,
 
+    top_of_block_operators: ordered::Map<PublicKey, Address>,
+
     last_tracked_peer_set: Option<LastTrackedPeerSet>,
 
     peer_update_timer: Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
@@ -73,6 +75,7 @@ where
             execution_node,
             epoch_strategy,
             finalized_tip,
+            top_of_block_operators,
         }: super::Config<TPeerManager, TExecutionNode>,
         mailbox: mpsc::UnboundedReceiver<MessageWithCause>,
     ) -> eyre::Result<Self> {
@@ -90,6 +93,7 @@ where
             latest_observed_finalized_tip: finalized_tip,
             mailbox,
             peers,
+            top_of_block_operators,
             last_tracked_peer_set: None,
 
             peer_update_timer,
@@ -222,12 +226,13 @@ where
                     )
                 })?;
 
-        let peers = PeersBuilder::with_dkg_outcome(&onchain_outcome)
+        let mut peers = PeersBuilder::with_dkg_outcome(&onchain_outcome)
             .resolve_at_hash(
                 self.execution_node.as_ref(),
                 highest_finalized_header.hash_slow(),
             )
             .wrap_err("failed reading peer set from execution layer")?;
+        peers.add_secondary(&self.top_of_block_operators);
 
         debug!(
             boundary.height = latest_boundary_header.number(),
@@ -319,6 +324,20 @@ impl Peers {
 
     fn len(&self) -> usize {
         self.primary.len().saturating_add(self.secondary.len())
+    }
+
+    /// Adds `peers` that are not primary to the secondary peers.
+    fn add_secondary(&mut self, peers: &ordered::Map<PublicKey, Address>) {
+        if peers.is_empty() {
+            return;
+        }
+        self.secondary = ordered::Map::from_iter_dedup(
+            self.secondary
+                .iter_pairs()
+                .chain(peers.iter_pairs())
+                .filter(|(key, _)| self.primary.position(key).is_none())
+                .map(|(key, address)| (key.clone(), address.clone())),
+        );
     }
 
     fn to_flat_map(&self) -> ordered::Map<PublicKey, Address> {
@@ -765,6 +784,8 @@ mod tests {
                 execution.finalized = finalized;
                 let execution = Arc::new(execution);
                 let oracle = RecordingOracle::default();
+                // An operator that is also a primary peer stays primary only.
+                let (operator, primary) = (peer(9), peer(1));
                 let (_actor, _mailbox) = crate::peer_manager::init(
                     context,
                     crate::peer_manager::Config {
@@ -775,6 +796,10 @@ mod tests {
                             Height::new(consensus_tip),
                             Digest(B256::repeat_byte(0xFF)),
                         ),
+                        top_of_block_operators: ordered::Map::from_iter_dedup([
+                            (operator.public_key.clone(), operator.p2p_address.clone()),
+                            (primary.public_key.clone(), operator.p2p_address.clone()),
+                        ]),
                     },
                 )
                 .unwrap();
@@ -784,6 +809,8 @@ mod tests {
                 assert_eq!(tracked[0].0, available);
                 assert_peer(&tracked[0].1.primary, &peer(1));
                 assert_peer(&tracked[0].1.secondary, &peer(2));
+                assert_peer(&tracked[0].1.secondary, &operator);
+                assert_no_peer(&tracked[0].1.secondary, &primary);
                 assert!(
                     execution
                         .header_reads
@@ -809,6 +836,7 @@ mod tests {
                     oracle: oracle.clone(),
                     epoch_strategy: FixedEpocher::new(commonware_utils::NZU64!(10)),
                     finalized_tip: (Height::new(100), Digest(B256::ZERO)),
+                    top_of_block_operators: Default::default(),
                 },
             );
             let error = result
@@ -831,6 +859,7 @@ mod tests {
                     oracle: oracle.clone(),
                     epoch_strategy: FixedEpocher::new(commonware_utils::NZU64!(10)),
                     finalized_tip: (Height::new(100), Digest(B256::ZERO)),
+                    top_of_block_operators: Default::default(),
                 },
             )
             .unwrap();
