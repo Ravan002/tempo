@@ -30,7 +30,7 @@ use parking_lot::Mutex;
 use serde::Serialize;
 use tempo_consensus::top_of_block::{
     self, OperatorNetwork,
-    wire::{AckStatus, Message, Submit},
+    wire::{AckStatus, Message, Submit, SubmitTx},
 };
 use tempo_primitives::TempoTxEnvelope;
 
@@ -184,6 +184,8 @@ struct Dashboard {
     current: Option<RoundView>,
     rounds: VecDeque<RoundView>,
     generated: u64,
+    /// Transactions received through `tempo_sendTobTransaction`.
+    rpc_received: u64,
     streamed: u64,
     public_sent: u64,
     public_failed: u64,
@@ -198,12 +200,55 @@ struct Maker {
     bumped_at_ms: AtomicU64,
 }
 
-/// A freshly signed maker quote.
+/// A transaction to stream to leaders: a maker quote signed here, or one
+/// submitted through `tempo_sendTobTransaction`.
 struct Quote {
-    maker: usize,
-    nonce: u64,
+    /// The lane slot: signer and nonce key.
+    slot: (Address, U256),
+    /// Maker index and nonce of quotes signed here, to track their nonces.
+    maker: Option<(usize, u64)>,
     hash: B256,
     raw: Bytes,
+    /// Replacement sequence within the slot; `None` takes the next one.
+    seq: Option<u64>,
+    /// Unix ms at which the transaction expires; zero never expires.
+    expires_at_ms: u64,
+    reply: Option<tokio::sync::oneshot::Sender<Result<Accepted, String>>>,
+}
+
+/// The latest transaction of a slot.
+struct Latest {
+    hash: B256,
+    raw: Bytes,
+    seq: u64,
+    expires_at_ms: u64,
+}
+
+impl Latest {
+    fn submit_tx(&self) -> SubmitTx {
+        SubmitTx {
+            tx: self.raw.0.clone(),
+            seq: self.seq,
+            expires_at_ms: self.expires_at_ms,
+        }
+    }
+
+    fn expired(&self, now_ms: u64) -> bool {
+        self.expires_at_ms != 0 && now_ms >= self.expires_at_ms
+    }
+}
+
+/// What `tempo_sendTobTransaction` returns.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Accepted {
+    hash: B256,
+    maker: Address,
+    nonce_key: U256,
+    seq: u64,
+    expires_at: u64,
+    /// The validator the transaction was streamed to, if a lane was open.
+    streamed_to: Option<usize>,
 }
 
 struct Target {
@@ -231,7 +276,12 @@ async fn run(
         public_rate: args.public_rate,
         ..Default::default()
     }));
-    tokio::spawn(serve_dashboard(args.http, dashboard.clone()));
+    let (quotes_tx, mut quotes_rx) = tokio::sync::mpsc::unbounded_channel::<Quote>();
+    tokio::spawn(serve_dashboard(
+        args.http,
+        dashboard.clone(),
+        quotes_tx.clone(),
+    ));
 
     let providers: Vec<RootProvider> = args
         .rpcs
@@ -327,7 +377,6 @@ async fn run(
         public_hashes,
     ));
 
-    let (quotes_tx, mut quotes_rx) = tokio::sync::mpsc::unbounded_channel();
     let per_maker = Duration::from_secs_f64(f64::from(args.makers) / args.rate.max(1) as f64);
     for index in 0..makers.len() {
         let (makers, quotes_tx) = (makers.clone(), quotes_tx.clone());
@@ -350,10 +399,13 @@ async fn run(
                 };
                 if quotes_tx
                     .send(Quote {
-                        maker: index,
-                        nonce,
+                        slot: (maker.signer.address(), U256::ZERO),
+                        maker: Some((index, nonce)),
                         hash,
                         raw,
+                        seq: None,
+                        expires_at_ms: 0,
+                        reply: None,
                     })
                     .is_err()
                 {
@@ -366,9 +418,12 @@ async fn run(
     }
 
     let mut target: Option<Target> = None;
-    let mut seq = 0u64;
+    let mut request_id = 0u64;
     let mut in_flight: HashMap<u64, Instant> = HashMap::new();
-    let mut latest: Vec<Option<(B256, Bytes)>> = vec![None; makers.len()];
+    let mut latest: HashMap<(Address, U256), Latest> = HashMap::new();
+    // The highest sequence seen per slot, kept after the slot's transaction
+    // lands so sequences only grow.
+    let mut last_seq: HashMap<(Address, U256), u64> = HashMap::new();
     // Recently signed quotes, to map included hashes back to makers.
     let mut signed: HashMap<B256, (usize, u64)> = HashMap::new();
     let mut signed_order: VecDeque<B256> = VecDeque::new();
@@ -394,15 +449,14 @@ async fn run(
                             view: announcement.view,
                             cutoff: now + window.saturating_sub(CUTOFF_MARGIN),
                         });
-                        // Flush the latest quote of every maker at once.
-                        let txs: Vec<_> = latest
-                            .iter()
-                            .filter_map(|quote| quote.as_ref().map(|(_, raw)| raw.clone()))
-                            .collect();
+                        // Flush the latest transaction of every slot at once.
+                        let now_ms = unix_ms();
+                        latest.retain(|_, latest| !latest.expired(now_ms));
+                        let txs: Vec<_> = latest.values().map(Latest::submit_tx).collect();
                         if !txs.is_empty() {
-                            seq += 1;
-                            in_flight.insert(seq, now);
-                            submit(&mut sender, &keys[leader], announcement.epoch, announcement.view, seq, txs.clone());
+                            request_id += 1;
+                            in_flight.insert(request_id, now);
+                            submit(&mut sender, &keys[leader], announcement.epoch, announcement.view, request_id, txs.clone());
                         }
                         let mut dashboard = dashboard.lock();
                         if let Some(previous) = dashboard.current.take() {
@@ -422,7 +476,7 @@ async fn run(
                         });
                     }
                     Message::Ack(ack) => {
-                        let rtt = in_flight.remove(&ack.seq).map(|sent| sent.elapsed().as_micros() as u64);
+                        let rtt = in_flight.remove(&ack.id).map(|sent| sent.elapsed().as_micros() as u64);
                         let mut dashboard = dashboard.lock();
                         let dashboard = &mut *dashboard;
                         let validator = &mut dashboard.validators[leader];
@@ -443,13 +497,14 @@ async fn run(
                         }
                     }
                     Message::Built(built) => {
+                        let included: HashSet<_> = built.top_of_block.iter().copied().collect();
+                        latest.retain(|_, latest| !included.contains(&latest.hash));
                         for hash in &built.top_of_block {
                             let Some(&(maker, nonce)) = signed.get(hash) else { continue };
                             let state = &makers[maker];
                             if state.nonce.fetch_max(nonce + 1, Ordering::Relaxed) <= nonce {
                                 state.bumped_at_ms.store(unix_ms(), Ordering::Relaxed);
                             }
-                            latest[maker] = None;
                         }
                         let mut dashboard = dashboard.lock();
                         if let Some(round) = find_round(&mut dashboard, built.epoch, built.view) {
@@ -470,17 +525,47 @@ async fn run(
                 while let Ok(quote) = quotes_rx.try_recv() {
                     fresh.push(quote);
                 }
-                let generated = fresh.len() as u64;
+                let generated = fresh.iter().filter(|quote| quote.maker.is_some()).count() as u64;
+                let received = fresh.len() as u64 - generated;
+                let lane = target
+                    .as_ref()
+                    .filter(|target| Instant::now() < target.cutoff)
+                    .map(|target| target.leader);
+                let now_ms = unix_ms();
                 let mut txs = Vec::with_capacity(fresh.len());
-                for Quote { maker, nonce, hash, raw } in fresh {
+                for quote in fresh {
+                    let Quote { slot, maker, hash, raw, seq, expires_at_ms, reply } = quote;
                     // Quotes signed before a nonce bump are already stale.
-                    if nonce < makers[maker].nonce.load(Ordering::Relaxed) {
-                        continue;
+                    if let Some((maker, nonce)) = maker {
+                        if nonce < makers[maker].nonce.load(Ordering::Relaxed) {
+                            continue;
+                        }
+                        signed.insert(hash, (maker, nonce));
+                        signed_order.push_back(hash);
                     }
-                    signed.insert(hash, (maker, nonce));
-                    signed_order.push_back(hash);
-                    latest[maker] = Some((hash, raw.clone()));
-                    txs.push(raw);
+                    let last = last_seq.get(&slot).copied().unwrap_or_default();
+                    let seq = seq.unwrap_or(last + 1);
+                    let outcome = if seq <= last {
+                        Err(format!("sequence {seq} is not above the slot's sequence {last}"))
+                    } else if expires_at_ms != 0 && now_ms >= expires_at_ms {
+                        Err("transaction already expired".to_string())
+                    } else {
+                        last_seq.insert(slot, seq);
+                        let entry = Latest { hash, raw, seq, expires_at_ms };
+                        txs.push(entry.submit_tx());
+                        latest.insert(slot, entry);
+                        Ok(Accepted {
+                            hash,
+                            maker: slot.0,
+                            nonce_key: slot.1,
+                            seq,
+                            expires_at: expires_at_ms,
+                            streamed_to: lane,
+                        })
+                    };
+                    if let Some(reply) = reply {
+                        let _ = reply.send(outcome);
+                    }
                 }
                 while signed_order.len() > 50_000 {
                     if let Some(hash) = signed_order.pop_front() {
@@ -488,18 +573,19 @@ async fn run(
                     }
                 }
                 let mut streamed = 0;
-                if let Some(target) = target.as_ref().filter(|target| Instant::now() < target.cutoff)
+                if let Some(target) = target.as_ref().filter(|_| lane.is_some())
                     && !txs.is_empty()
                 {
-                    // Stream fresh quotes to the leader immediately.
+                    // Stream fresh transactions to the leader immediately.
                     streamed = txs.len() as u64;
-                    seq += 1;
-                    in_flight.insert(seq, Instant::now());
+                    request_id += 1;
+                    in_flight.insert(request_id, Instant::now());
                     in_flight.retain(|_, sent| sent.elapsed() < Duration::from_secs(5));
-                    submit(&mut sender, &keys[target.leader], target.epoch, target.view, seq, txs);
+                    submit(&mut sender, &keys[target.leader], target.epoch, target.view, request_id, txs);
                 }
                 let mut dashboard = dashboard.lock();
                 dashboard.generated += generated;
+                dashboard.rpc_received += received;
                 dashboard.streamed += streamed;
                 if let Some(current) = dashboard.current.as_mut() {
                     current.sent += streamed;
@@ -558,14 +644,14 @@ fn submit(
     leader: &commonware_cryptography::ed25519::PublicKey,
     epoch: u64,
     view: u64,
-    seq: u64,
-    txs: Vec<Bytes>,
+    id: u64,
+    txs: Vec<SubmitTx>,
 ) {
     let message = Message::Submit(Submit {
         epoch,
         view,
-        seq,
-        txs: txs.into_iter().map(|tx| tx.0).collect(),
+        id,
+        txs,
     });
     sender.send(Recipients::One(leader.clone()), message.encode(), true);
 }
@@ -784,15 +870,22 @@ async fn verify_blocks(
     }
 }
 
+/// Serves the dashboard on `GET /` and JSON-RPC on `POST /`.
 async fn serve_dashboard(
     address: SocketAddr,
     dashboard: Arc<Mutex<Dashboard>>,
+    quotes: tokio::sync::mpsc::UnboundedSender<Quote>,
 ) -> eyre::Result<()> {
     use axum::{Json, Router, response::Html, routing::get};
     let app = Router::new()
         .route(
             "/",
-            get(|| async { Html(include_str!("tob_operator.html")) }),
+            get(|| async { Html(include_str!("tob_operator.html")) }).post(
+                move |Json(request): Json<serde_json::Value>| {
+                    let quotes = quotes.clone();
+                    async move { Json(rpc(request, &quotes).await) }
+                },
+            ),
         )
         .route(
             "/state",
@@ -809,4 +902,71 @@ async fn serve_dashboard(
         .wrap_err_with(|| format!("failed binding dashboard to {address}"))?;
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// Handles one JSON-RPC 2.0 request.
+///
+/// `tempo_sendTobTransaction(rawTx, { seq?, expiresAt? })` queues a signed
+/// transaction for the top of the next block. It replaces the transaction in
+/// its slot (signer and nonce key) if `seq` is higher than the slot's; without
+/// `seq`, it takes the slot's next sequence. `expiresAt` is unix time in
+/// milliseconds; the leader drops the transaction unless the block is earlier.
+async fn rpc(
+    request: serde_json::Value,
+    quotes: &tokio::sync::mpsc::UnboundedSender<Quote>,
+) -> serde_json::Value {
+    use alloy_consensus::transaction::SignerRecoverable as _;
+    use alloy_eips::eip2718::Decodable2718 as _;
+
+    let id = request.get("id").cloned().unwrap_or_default();
+    let error = |code: i64, message: String| serde_json::json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}});
+    if request["method"] != "tempo_sendTobTransaction" {
+        return error(-32601, "method not found".into());
+    }
+    let params = &request["params"];
+    let Some(raw) = params[0]
+        .as_str()
+        .and_then(|raw| alloy_primitives::hex::decode(raw).ok())
+    else {
+        return error(-32602, "expected a hex-encoded signed transaction".into());
+    };
+    let options = &params[1];
+    let number = |field: &str| -> Result<Option<u64>, String> {
+        match &options[field] {
+            serde_json::Value::Null => Ok(None),
+            value => value
+                .as_u64()
+                .map(Some)
+                .ok_or_else(|| format!("`{field}` must be an unsigned integer")),
+        }
+    };
+    let (seq, expires_at_ms) = match (number("seq"), number("expiresAt")) {
+        (Ok(seq), Ok(expires_at)) => (seq, expires_at.unwrap_or_default()),
+        (Err(message), _) | (_, Err(message)) => return error(-32602, message),
+    };
+    let tx = match TempoTxEnvelope::decode_2718_exact(&raw)
+        .map_err(|error| error.to_string())
+        .and_then(|tx| tx.try_into_recovered().map_err(|error| error.to_string()))
+    {
+        Ok(tx) => tx,
+        Err(message) => return error(-32602, format!("invalid transaction: {message}")),
+    };
+    let (reply, accepted) = tokio::sync::oneshot::channel();
+    let quote = Quote {
+        slot: tempo_payload_types::top_of_block_slot(&tx),
+        maker: None,
+        hash: *tx.tx_hash(),
+        raw: raw.into(),
+        seq,
+        expires_at_ms,
+        reply: Some(reply),
+    };
+    if quotes.send(quote).is_err() {
+        return error(-32603, "operator is shutting down".into());
+    }
+    match accepted.await {
+        Ok(Ok(accepted)) => serde_json::json!({"jsonrpc": "2.0", "id": id, "result": accepted}),
+        Ok(Err(message)) => error(-32000, message),
+        Err(_) => error(-32603, "operator dropped the request".into()),
+    }
 }
