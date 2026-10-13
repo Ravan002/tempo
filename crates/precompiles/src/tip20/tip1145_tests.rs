@@ -107,7 +107,7 @@ fn new_tokens_use_packed_layout_and_allow_all_policy() -> eyre::Result<()> {
         let token = TIP20Setup::create("Test", "TST", admin).apply()?;
         let address = token.address;
 
-        assert!(token.is_packed()?);
+        assert!(token.token_control()?.is_some());
         assert_eq!(token.transfer_policy_id()?, TOKEN_POLICY_ID);
         assert_eq!(token.transfer_policy()?, TokenPolicy::ALLOW_ALL);
         let policy = TIP403Registry::new().token_policy(address)?;
@@ -143,7 +143,7 @@ fn new_tokens_use_packed_layout_and_allow_all_policy() -> eyre::Result<()> {
 
         // pathUSD itself is packed and reports no quote token.
         let path_usd = TIP20Token::from_address(PATH_USD_ADDRESS)?;
-        assert!(path_usd.is_packed()?);
+        assert!(path_usd.token_control()?.is_some());
         assert_eq!(path_usd.quote_token()?, Address::ZERO);
 
         // Creation emits `TransferPolicyUpdated` with three `ALLOW` modes.
@@ -169,7 +169,7 @@ fn long_currencies_stay_external() -> eyre::Result<()> {
         let token = TIP20Setup::create("Test", "TST", admin)
             .currency(long)
             .apply()?;
-        assert!(token.is_packed()?);
+        assert!(token.token_control()?.is_some());
         assert_eq!(token.currency()?, long);
         assert!(!token.is_usd()?);
         assert_ne!(word(token.address, slots::CURRENCY), U256::ZERO);
@@ -230,13 +230,7 @@ fn packed_admin_operations_preserve_unrelated_fields() -> eyre::Result<()> {
         );
 
         token.burn(admin, ITIP20::burnCall { amount: U256::ZERO })?;
-        token.transfer(
-            user,
-            ITIP20::transferCall {
-                to: admin,
-                amount: U256::from(100),
-            },
-        )?;
+        transfer(&mut token, user, admin, 100)?;
         token.burn(
             admin,
             ITIP20::burnCall {
@@ -472,6 +466,17 @@ fn receive_configs_filter_tokens_then_senders() -> eyre::Result<()> {
         let address = token.address;
         let mut registry = TIP403Registry::new();
 
+        // Unconfigured receivers report allow-all with originator recovery.
+        assert_eq!(
+            receive_config(receiver),
+            ITIP403Registry::receiveConfigReturn {
+                hasReceivePolicy: false,
+                tokenMode: MODE_ALLOW,
+                senderMode: MODE_ALLOW,
+                recoveryAuthority: Address::ZERO,
+            }
+        );
+
         // Opt into a token whitelist with third-party recovery.
         registry.set_receive_config(
             receiver,
@@ -647,24 +652,6 @@ fn receive_configs_filter_tokens_then_senders() -> eyre::Result<()> {
     })
 }
 
-#[test]
-fn unconfigured_receivers_report_allow_all() -> eyre::Result<()> {
-    let mut storage = t14();
-    StorageCtx::enter(&mut storage, || {
-        let receiver = Address::random();
-        assert_eq!(
-            receive_config(receiver),
-            ITIP403Registry::receiveConfigReturn {
-                hasReceivePolicy: false,
-                tokenMode: MODE_ALLOW,
-                senderMode: MODE_ALLOW,
-                recoveryAuthority: Address::ZERO,
-            }
-        );
-        Ok(())
-    })
-}
-
 /// Creates a legacy token before T14 with a generic blacklist, then switches to T14.
 fn legacy_token(admin: Address, blocked: Address) -> Result<(TIP20Token, u64)> {
     StorageCtx.set_spec(TempoHardfork::T13);
@@ -699,7 +686,7 @@ fn activation_converts_legacy_tokens() -> eyre::Result<()> {
         let (mut token, policy_id) = legacy_token(admin, blocked)?;
         let address = token.address;
         mint(&mut token, admin, alice, 1_000)?;
-        assert!(!token.is_packed()?);
+        assert!(token.token_control()?.is_none());
         assert_eq!(token.transfer_policy_id()?, policy_id);
         assert_eq!(
             transfer(&mut token, alice, blocked, 1).unwrap_err(),
@@ -743,7 +730,7 @@ fn activation_converts_legacy_tokens() -> eyre::Result<()> {
                 .encode_log_data()
             ]
         );
-        assert!(token.is_packed()?);
+        assert!(token.token_control()?.is_some());
         assert_eq!(
             before,
             (
@@ -875,7 +862,7 @@ fn registry_mirrors_resolve_token_specific_policies() -> eyre::Result<()> {
         token.grant_role_internal(admin, ISSUER_ROLE)?;
         let mut registry = TIP403Registry::new();
         registry.token_transfer_policies[address].delete()?;
-        assert!(!token.is_packed()?);
+        assert!(token.token_control()?.is_none());
 
         // No active token-specific policy: reject all.
         assert_eq!(mint(&mut token, admin, alice, 10).unwrap_err(), forbids());
@@ -904,7 +891,7 @@ fn pre_t14_tokens_keep_the_legacy_layout() -> eyre::Result<()> {
 
     StorageCtx::enter(&mut storage, || {
         let token = TIP20Setup::create("Test", "TST", admin).apply()?;
-        assert!(!token.is_packed()?);
+        assert!(token.token_control()?.is_none());
         assert_eq!(token.transfer_policy_id()?, ALLOW_ALL_POLICY_ID);
         assert_eq!(word(token.address, slots::SUPPLY_CAP), U128_MAX);
         assert!(!TIP403Registry::new().token_policy(token.address)?.is_set);
