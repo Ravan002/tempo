@@ -1,6 +1,6 @@
 use alloy::{
     genesis::{Genesis, GenesisAccount},
-    primitives::{Address, U256, address},
+    primitives::{Address, U256},
     signers::{local::MnemonicBuilder, utils::secret_key_to_address},
 };
 use alloy_eips::eip2935::{HISTORY_STORAGE_ADDRESS, HISTORY_STORAGE_CODE};
