@@ -1231,7 +1231,8 @@ contract FeeAMMInvariantTest is InvariantBaseTest {
 
         // User must be authorised to send userToken (otherwise transfer reverts).
         vm.assume(
-            _isAuthorized(ctx.userToken, ctx.user) && _isAuthorized(ctx.validatorToken, ctx.validator)
+            _isAuthorized(ctx.userToken, ctx.user)
+                && _isAuthorized(ctx.validatorToken, ctx.validator)
         );
 
         ctx.directPool = amm.getPool(ctx.userToken, ctx.validatorToken);

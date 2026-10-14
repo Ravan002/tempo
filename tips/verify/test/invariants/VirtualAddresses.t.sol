@@ -905,13 +905,16 @@ contract VirtualAddressesInvariantTest is InvariantBaseTest {
             ITIP20 token = _tokens[i];
             if (_tip1145) {
                 registry.setTokenPolicyModes(
-                    address(token), ITIP403Registry.PolicyMode.ALLOW,
-                    ITIP403Registry.PolicyMode.BLACKLIST, ITIP403Registry.PolicyMode.BLACKLIST
+                    address(token),
+                    ITIP403Registry.PolicyMode.ALLOW,
+                    ITIP403Registry.PolicyMode.BLACKLIST,
+                    ITIP403Registry.PolicyMode.BLACKLIST
                 );
             } else {
                 uint64 recipientPolicyId =
                     registry.createPolicy(admin, ITIP403Registry.PolicyType.BLACKLIST);
-                uint64 mintPolicyId = registry.createPolicy(admin, ITIP403Registry.PolicyType.BLACKLIST);
+                uint64 mintPolicyId =
+                    registry.createPolicy(admin, ITIP403Registry.PolicyType.BLACKLIST);
                 uint64 compoundPolicyId =
                     registry.createCompoundPolicy(1, recipientPolicyId, mintPolicyId);
 
@@ -1047,13 +1050,21 @@ contract VirtualAddressesInvariantTest is InvariantBaseTest {
 
     function _setTransferAllowed(ITIP20 token, address master, bool allowed) internal {
         _setPolicyAllowed(
-            token, master, allowed, ITIP403Registry.AuthRole.RECIPIENT, _recipientPolicyIds[address(token)]
+            token,
+            master,
+            allowed,
+            ITIP403Registry.AuthRole.RECIPIENT,
+            _recipientPolicyIds[address(token)]
         );
     }
 
     function _setMintAllowed(ITIP20 token, address master, bool allowed) internal {
         _setPolicyAllowed(
-            token, master, allowed, ITIP403Registry.AuthRole.MINT_RECIPIENT, _mintPolicyIds[address(token)]
+            token,
+            master,
+            allowed,
+            ITIP403Registry.AuthRole.MINT_RECIPIENT,
+            _mintPolicyIds[address(token)]
         );
     }
 
@@ -1063,7 +1074,9 @@ contract VirtualAddressesInvariantTest is InvariantBaseTest {
         bool allowed,
         ITIP403Registry.AuthRole role,
         uint64 policyId
-    ) internal {
+    )
+        internal
+    {
         if (_tip1145) {
             address[] memory accounts = new address[](1);
             accounts[0] = master;

@@ -401,12 +401,18 @@ abstract contract InvariantBaseTest is TempoTest {
         if (_tip1145) {
             address[] memory accounts = new address[](1);
             accounts[0] = actor;
-            if (blacklisted) registry.addTokenMembers(token, accounts, ITIP403Registry.AuthRole.ALL);
-            else registry.removeTokenMembers(token, accounts, ITIP403Registry.AuthRole.ALL);
+            if (blacklisted) {
+                registry.addTokenMembers(token, accounts, ITIP403Registry.AuthRole.ALL);
+            } else {
+                registry.removeTokenMembers(token, accounts, ITIP403Registry.AuthRole.ALL);
+            }
         } else {
             registry.modifyPolicyBlacklist(
-                token == address(pathUSD) ? _pathUsdPolicyId : _tokenPolicyIds[token], actor, blacklisted
+                token == address(pathUSD) ? _pathUsdPolicyId : _tokenPolicyIds[token],
+                actor,
+                blacklisted
             );
         }
     }
+
 }

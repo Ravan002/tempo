@@ -1257,10 +1257,14 @@ contract StablecoinDEXTest is TempoTest {
     /// @dev This test ensures TIP403 blacklist enforcement on internal balance operations
     function test_BlacklistedUser_CannotUseInternalBalance() public {
         // Set the policy on token1
-        _setTransferPolicy(token1, ITIP403Registry.PolicyMode.BLACKLIST, ITIP403Registry.AuthRole.ALL);
+        _setTransferPolicy(
+            token1, ITIP403Registry.PolicyMode.BLACKLIST, ITIP403Registry.AuthRole.ALL
+        );
 
         // Also set the policy on pathUSD (quote token) for bid orders
-        _setTransferPolicy(pathUSD, ITIP403Registry.PolicyMode.BLACKLIST, ITIP403Registry.AuthRole.ALL);
+        _setTransferPolicy(
+            pathUSD, ITIP403Registry.PolicyMode.BLACKLIST, ITIP403Registry.AuthRole.ALL
+        );
 
         // Give alice some internal balance by placing and canceling an order
         uint128 orderAmount = exchange.MIN_ORDER_AMOUNT() * 2;
@@ -1279,7 +1283,10 @@ contract StablecoinDEXTest is TempoTest {
         _setPolicyMember(pathUSD, alice, true, ITIP403Registry.AuthRole.ALL);
 
         // Verify alice is blacklisted
-        assertFalse(_policyAuthorized(token1, alice, ITIP403Registry.AuthRole.ALL), "Alice should be blacklisted");
+        assertFalse(
+            _policyAuthorized(token1, alice, ITIP403Registry.AuthRole.ALL),
+            "Alice should be blacklisted"
+        );
 
         // Try to place an order using internal balance - should fail
         vm.prank(alice);
@@ -1303,7 +1310,9 @@ contract StablecoinDEXTest is TempoTest {
         _placeAskOrder(bob, 1000e18, 100);
 
         // Set the policy on pathUSD
-        _setTransferPolicy(pathUSD, ITIP403Registry.PolicyMode.BLACKLIST, ITIP403Registry.AuthRole.ALL);
+        _setTransferPolicy(
+            pathUSD, ITIP403Registry.PolicyMode.BLACKLIST, ITIP403Registry.AuthRole.ALL
+        );
 
         // Give alice some internal pathUSD balance by placing and canceling a bid order
         uint128 bidAmount = exchange.MIN_ORDER_AMOUNT() * 10;
@@ -1337,7 +1346,9 @@ contract StablecoinDEXTest is TempoTest {
     }
 
     function test_FlipOrder_BlacklistedMakerDoesNotRevertSwap() public {
-        _setTransferPolicy(token1, ITIP403Registry.PolicyMode.BLACKLIST, ITIP403Registry.AuthRole.ALL);
+        _setTransferPolicy(
+            token1, ITIP403Registry.PolicyMode.BLACKLIST, ITIP403Registry.AuthRole.ALL
+        );
 
         uint128 orderAmount = 100e18;
         int16 bidTick = 100;
@@ -1448,13 +1459,18 @@ contract StablecoinDEXTest is TempoTest {
     /// @dev This tests the new check that verifies authorization on both base and quote tokens
     function test_BlacklistedInBuyToken_CannotPlaceBidOrder() public {
         // Set the policy on token1
-        _setTransferPolicy(token1, ITIP403Registry.PolicyMode.BLACKLIST, ITIP403Registry.AuthRole.ALL);
+        _setTransferPolicy(
+            token1, ITIP403Registry.PolicyMode.BLACKLIST, ITIP403Registry.AuthRole.ALL
+        );
 
         // Blacklist alice in token1
         _setPolicyMember(token1, alice, true, ITIP403Registry.AuthRole.ALL);
 
         // Verify alice is blacklisted in token1
-        assertFalse(_policyAuthorized(token1, alice, ITIP403Registry.AuthRole.ALL), "Alice should be blacklisted in token1");
+        assertFalse(
+            _policyAuthorized(token1, alice, ITIP403Registry.AuthRole.ALL),
+            "Alice should be blacklisted in token1"
+        );
 
         // Alice tries to place a bid order to BUY token1 with pathUSD
         // Even though alice is authorized in pathUSD (the escrow token), she is blacklisted in token1
@@ -1471,14 +1487,17 @@ contract StablecoinDEXTest is TempoTest {
     /// @dev This tests the new check that verifies authorization on both base and quote tokens
     function test_BlacklistedInReceiveToken_CannotPlaceAskOrder() public {
         // Set the policy on pathUSD
-        _setTransferPolicy(pathUSD, ITIP403Registry.PolicyMode.BLACKLIST, ITIP403Registry.AuthRole.ALL);
+        _setTransferPolicy(
+            pathUSD, ITIP403Registry.PolicyMode.BLACKLIST, ITIP403Registry.AuthRole.ALL
+        );
 
         // Blacklist alice in pathUSD
         _setPolicyMember(pathUSD, alice, true, ITIP403Registry.AuthRole.ALL);
 
         // Verify alice is blacklisted in pathUSD
         assertFalse(
-            _policyAuthorized(pathUSD, alice, ITIP403Registry.AuthRole.ALL), "Alice should be blacklisted in pathUSD"
+            _policyAuthorized(pathUSD, alice, ITIP403Registry.AuthRole.ALL),
+            "Alice should be blacklisted in pathUSD"
         );
 
         // Alice tries to place an ask order to SELL token1 for pathUSD
@@ -1495,7 +1514,9 @@ contract StablecoinDEXTest is TempoTest {
     /// @notice Test that a maker blacklisted in either token cannot place a flip order
     function test_BlacklistedUser_CannotPlaceFlipOrder() public {
         // Set the policy on token1
-        _setTransferPolicy(token1, ITIP403Registry.PolicyMode.BLACKLIST, ITIP403Registry.AuthRole.ALL);
+        _setTransferPolicy(
+            token1, ITIP403Registry.PolicyMode.BLACKLIST, ITIP403Registry.AuthRole.ALL
+        );
 
         // Blacklist alice in token1
         _setPolicyMember(token1, alice, true, ITIP403Registry.AuthRole.ALL);
@@ -1526,7 +1547,9 @@ contract StablecoinDEXTest is TempoTest {
     /// @notice Test that a stale ask order can be canceled when maker is blacklisted
     function test_CancelStaleOrder_Ask_Succeeds_WhenMakerBlacklisted() public {
         // Set the policy on token1 (base token for asks)
-        _setTransferPolicy(token1, ITIP403Registry.PolicyMode.BLACKLIST, ITIP403Registry.AuthRole.ALL);
+        _setTransferPolicy(
+            token1, ITIP403Registry.PolicyMode.BLACKLIST, ITIP403Registry.AuthRole.ALL
+        );
 
         // Alice places an ask order (escrows base token)
         uint128 orderAmount = exchange.MIN_ORDER_AMOUNT() * 2;
@@ -1541,7 +1564,10 @@ contract StablecoinDEXTest is TempoTest {
         _setPolicyMember(token1, alice, true, ITIP403Registry.AuthRole.ALL);
 
         // Verify alice is blacklisted
-        assertFalse(_policyAuthorized(token1, alice, ITIP403Registry.AuthRole.ALL), "Alice should be blacklisted");
+        assertFalse(
+            _policyAuthorized(token1, alice, ITIP403Registry.AuthRole.ALL),
+            "Alice should be blacklisted"
+        );
 
         // Anyone (bob) can cancel the stale order
         vm.expectEmit(true, true, true, true);
@@ -1568,7 +1594,9 @@ contract StablecoinDEXTest is TempoTest {
     /// @notice Test that a stale bid order can be canceled when maker is blacklisted
     function test_CancelStaleOrder_Bid_Succeeds_WhenMakerBlacklisted() public {
         // Set the policy on pathUSD (quote token for bids)
-        _setTransferPolicy(pathUSD, ITIP403Registry.PolicyMode.BLACKLIST, ITIP403Registry.AuthRole.ALL);
+        _setTransferPolicy(
+            pathUSD, ITIP403Registry.PolicyMode.BLACKLIST, ITIP403Registry.AuthRole.ALL
+        );
 
         // Alice places a bid order (escrows quote token)
         uint128 orderAmount = exchange.MIN_ORDER_AMOUNT() * 2;
@@ -1609,13 +1637,18 @@ contract StablecoinDEXTest is TempoTest {
     /// @notice Test that cancelStaleOrder reverts when maker is still authorized
     function test_CancelStaleOrder_RevertsIf_MakerNotBlacklisted() public {
         // Set the policy on token1
-        _setTransferPolicy(token1, ITIP403Registry.PolicyMode.BLACKLIST, ITIP403Registry.AuthRole.ALL);
+        _setTransferPolicy(
+            token1, ITIP403Registry.PolicyMode.BLACKLIST, ITIP403Registry.AuthRole.ALL
+        );
 
         // Alice places an ask order
         uint128 orderId = _placeAskOrder(alice, exchange.MIN_ORDER_AMOUNT() * 2, 100);
 
         // Alice is NOT blacklisted, so she's still authorized
-        assertTrue(_policyAuthorized(token1, alice, ITIP403Registry.AuthRole.ALL), "Alice should be authorized");
+        assertTrue(
+            _policyAuthorized(token1, alice, ITIP403Registry.AuthRole.ALL),
+            "Alice should be authorized"
+        );
 
         // Try to cancel as stale - should fail
         vm.prank(bob);
@@ -1641,7 +1674,9 @@ contract StablecoinDEXTest is TempoTest {
     /// @notice Test that cancelStaleOrder works with whitelist policy (maker removed from whitelist)
     function test_CancelStaleOrder_Succeeds_WhenMakerRemovedFromWhitelist() public {
         // Set the whitelist policy on token1.
-        _setTransferPolicy(token1, ITIP403Registry.PolicyMode.WHITELIST, ITIP403Registry.AuthRole.ALL);
+        _setTransferPolicy(
+            token1, ITIP403Registry.PolicyMode.WHITELIST, ITIP403Registry.AuthRole.ALL
+        );
 
         // Whitelist alice and the exchange initially
         _setPolicyMember(token1, alice, true, ITIP403Registry.AuthRole.ALL);
@@ -1655,7 +1690,10 @@ contract StablecoinDEXTest is TempoTest {
         _setPolicyMember(token1, alice, false, ITIP403Registry.AuthRole.ALL);
 
         // Verify alice is no longer authorized
-        assertFalse(_policyAuthorized(token1, alice, ITIP403Registry.AuthRole.ALL), "Alice should not be authorized");
+        assertFalse(
+            _policyAuthorized(token1, alice, ITIP403Registry.AuthRole.ALL),
+            "Alice should not be authorized"
+        );
 
         // Anyone can cancel the stale order
         vm.prank(bob);
@@ -1672,7 +1710,9 @@ contract StablecoinDEXTest is TempoTest {
     /// @notice Test that the order maker can also cancel their own stale order
     function test_CancelStaleOrder_MakerCanCancelOwnStaleOrder() public {
         // Set the policy on token1
-        _setTransferPolicy(token1, ITIP403Registry.PolicyMode.BLACKLIST, ITIP403Registry.AuthRole.ALL);
+        _setTransferPolicy(
+            token1, ITIP403Registry.PolicyMode.BLACKLIST, ITIP403Registry.AuthRole.ALL
+        );
 
         // Alice places an ask order
         uint128 orderAmount = exchange.MIN_ORDER_AMOUNT() * 2;
@@ -1696,7 +1736,9 @@ contract StablecoinDEXTest is TempoTest {
     /// @notice Test canceling stale order in the middle of a tick level's linked list
     function test_CancelStaleOrder_RemovesFromMiddleOfLinkedList() public {
         // Set the policy on token1
-        _setTransferPolicy(token1, ITIP403Registry.PolicyMode.BLACKLIST, ITIP403Registry.AuthRole.ALL);
+        _setTransferPolicy(
+            token1, ITIP403Registry.PolicyMode.BLACKLIST, ITIP403Registry.AuthRole.ALL
+        );
 
         // Place three ask orders at the same tick: alice, bob, alice
         uint128 order1 = _placeAskOrder(alice, exchange.MIN_ORDER_AMOUNT(), 100);
@@ -2001,9 +2043,10 @@ contract StablecoinDEXTest is TempoTest {
 
     /// @notice Test cancelStaleOrder with compound policy - maker blocked as sender
     function test_CancelStaleOrder_Succeeds_BlockedMaker_CompoundPolicy() public {
-
         // Set sender/recipient policy on token1
-        _setTransferPolicy(token1, ITIP403Registry.PolicyMode.BLACKLIST, ITIP403Registry.AuthRole.SENDER);
+        _setTransferPolicy(
+            token1, ITIP403Registry.PolicyMode.BLACKLIST, ITIP403Registry.AuthRole.SENDER
+        );
 
         // Alice places an ask order (selling token1)
         uint128 orderId = _placeAskOrder(alice, exchange.MIN_ORDER_AMOUNT() * 2, 100);
@@ -2024,9 +2067,10 @@ contract StablecoinDEXTest is TempoTest {
 
     /// @notice Test cancelStaleOrder fails with compound policy when maker only blocked as recipient
     function test_CancelStaleOrder_Fails_MakerOnlyBlockedAsRecipient_CompoundPolicy() public {
-
         // Set sender/recipient policy on token1
-        _setTransferPolicy(token1, ITIP403Registry.PolicyMode.BLACKLIST, ITIP403Registry.AuthRole.RECIPIENT);
+        _setTransferPolicy(
+            token1, ITIP403Registry.PolicyMode.BLACKLIST, ITIP403Registry.AuthRole.RECIPIENT
+        );
 
         // Alice places an ask order
         uint128 orderId = _placeAskOrder(alice, exchange.MIN_ORDER_AMOUNT() * 2, 100);
@@ -2054,7 +2098,13 @@ contract StablecoinDEXTest is TempoTest {
     }
 
     /// @dev Exercise legacy policy IDs on T13 and equivalent token-specific policies on T14.
-    function _setTransferPolicy(ITIP20 token, ITIP403Registry.PolicyMode mode, ITIP403Registry.AuthRole role) internal {
+    function _setTransferPolicy(
+        ITIP20 token,
+        ITIP403Registry.PolicyMode mode,
+        ITIP403Registry.AuthRole role
+    )
+        internal
+    {
         vm.startPrank(address(token) == address(pathUSD) ? pathUSDAdmin : admin);
         if (_tip1145) {
             registry.setTokenPolicyModes(
@@ -2074,14 +2124,25 @@ contract StablecoinDEXTest is TempoTest {
                     ? ITIP403Registry.PolicyType.WHITELIST
                     : ITIP403Registry.PolicyType.BLACKLIST
             );
-            if (role == ITIP403Registry.AuthRole.SENDER) policyId = registry.createCompoundPolicy(policyId, 1, 1);
-            if (role == ITIP403Registry.AuthRole.RECIPIENT) policyId = registry.createCompoundPolicy(1, policyId, 1);
+            if (role == ITIP403Registry.AuthRole.SENDER) {
+                policyId = registry.createCompoundPolicy(policyId, 1, 1);
+            }
+            if (role == ITIP403Registry.AuthRole.RECIPIENT) {
+                policyId = registry.createCompoundPolicy(1, policyId, 1);
+            }
             token.changeTransferPolicyId(policyId);
         }
         vm.stopPrank();
     }
 
-    function _setPolicyMember(ITIP20 token, address account, bool member, ITIP403Registry.AuthRole role) internal {
+    function _setPolicyMember(
+        ITIP20 token,
+        address account,
+        bool member,
+        ITIP403Registry.AuthRole role
+    )
+        internal
+    {
         vm.startPrank(address(token) == address(pathUSD) ? pathUSDAdmin : admin);
         if (_tip1145) {
             address[] memory accounts = new address[](1);
@@ -2090,8 +2151,12 @@ contract StablecoinDEXTest is TempoTest {
             else registry.removeTokenMembers(address(token), accounts, role);
         } else {
             uint64 policyId = token.transferPolicyId();
-            if (role == ITIP403Registry.AuthRole.SENDER) (policyId,,) = registry.compoundPolicyData(policyId);
-            if (role == ITIP403Registry.AuthRole.RECIPIENT) (, policyId,) = registry.compoundPolicyData(policyId);
+            if (role == ITIP403Registry.AuthRole.SENDER) {
+                (policyId,,) = registry.compoundPolicyData(policyId);
+            }
+            if (role == ITIP403Registry.AuthRole.RECIPIENT) {
+                (, policyId,) = registry.compoundPolicyData(policyId);
+            }
             (ITIP403Registry.PolicyType policyType,) = registry.policyData(policyId);
             if (policyType == ITIP403Registry.PolicyType.WHITELIST) {
                 registry.modifyPolicyWhitelist(policyId, account, member);
@@ -2102,15 +2167,24 @@ contract StablecoinDEXTest is TempoTest {
         vm.stopPrank();
     }
 
-    function _policyAuthorized(ITIP20 token, address account, ITIP403Registry.AuthRole role)
+    function _policyAuthorized(
+        ITIP20 token,
+        address account,
+        ITIP403Registry.AuthRole role
+    )
         internal
         view
         returns (bool)
     {
         if (_tip1145) return registry.isTokenAuthorized(address(token), account, role);
         uint64 policyId = token.transferPolicyId();
-        if (role == ITIP403Registry.AuthRole.SENDER) return registry.isAuthorizedSender(policyId, account);
-        if (role == ITIP403Registry.AuthRole.RECIPIENT) return registry.isAuthorizedRecipient(policyId, account);
+        if (role == ITIP403Registry.AuthRole.SENDER) {
+            return registry.isAuthorizedSender(policyId, account);
+        }
+        if (role == ITIP403Registry.AuthRole.RECIPIENT) {
+            return registry.isAuthorizedRecipient(policyId, account);
+        }
         return registry.isAuthorized(policyId, account);
     }
+
 }
