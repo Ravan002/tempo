@@ -346,24 +346,53 @@ impl TIP20Token {
 
 #[cfg(test)]
 mod tests {
+    //! TIP-1145 policy, cache, and storage-conversion tests.
+
     use super::*;
-    use crate::storage::{StorageCtx, hashmap::HashMapStorageProvider};
+    use crate::{
+        Precompile, RECEIVE_POLICY_GUARD_ADDRESS, TIP403_REGISTRY_ADDRESS,
+        storage::{StorageCtx, StorageKey, hashmap::HashMapStorageProvider},
+        test_util::TIP20Setup,
+        tip20::{ISSUER_ROLE, ITIP20},
+        tip403_registry::{
+            AuthRole, ITIP403Registry, MINT_RECIPIENT_FLAG, RECEIVE_CONFIG_KIND,
+            RECEIVE_TOKEN_FLAG, RECIPIENT_FLAG, REJECT_ALL_POLICY_ID, SENDER_FLAG,
+            TIP403RegistryError, TOKEN_POLICY_ID, tip403_registry_slots,
+        },
+    };
+    use alloy::{
+        primitives::B256,
+        sol_types::{SolCall, SolEvent},
+    };
     use tempo_chainspec::hardfork::TempoHardfork;
+    use tempo_contracts::precompiles::ITIP403Registry::{
+        AuthRole as Role, MembershipKind,
+        PolicyMode::{self, ALLOW, BLACKLIST, DENY, WHITELIST},
+    };
+    use tempo_primitives::{MasterId, UserTag};
 
     fn roundtrip(control: TokenControl) -> U256 {
         let mut storage = HashMapStorageProvider::new_with_spec(1, TempoHardfork::T14);
-        let address = Address::repeat_byte(0x20);
+        let address = Address::new_tip20(0x20);
         StorageCtx::enter(&mut storage, || {
-            let mut slot = Slot::<TokenControl>::new(U256::ZERO, address);
+            let mut slot = Slot::<TokenControl>::new(slots::PAUSED, address);
             slot.write(control).unwrap();
             assert_eq!(slot.read().unwrap(), control);
-            StorageCtx.sload(address, U256::ZERO).unwrap()
+            let token = TIP20Token::from_address(address).unwrap();
+            let decoded = control.validate(address);
+            assert_eq!(token.get_token_control(), decoded);
+            StorageCtx.sload(address, slots::PAUSED).unwrap()
         })
     }
 
     #[test]
     fn control_word_layout_and_legacy_compat() {
         let token = Address::repeat_byte(0x20);
+        let fatal = |token| {
+            Err(TempoPrecompileError::Fatal(format!(
+                "invalid TIP-1145 control word for token {token}"
+            )))
+        };
         for paused in [false, true] {
             let legacy = TokenControl::default().with_paused(paused);
             assert_eq!(roundtrip(legacy), U256::from(u8::from(paused)));
@@ -401,9 +430,10 @@ mod tests {
                 ..control
             },
         ] {
-            assert!(malformed.validate(token).is_err());
+            assert_eq!(malformed.validate(token), fatal(token));
+            roundtrip(malformed);
         }
-        assert!(control.validate(PATH_USD_ADDRESS).is_err());
+        assert_eq!(control.validate(PATH_USD_ADDRESS), fatal(PATH_USD_ADDRESS));
     }
 
     #[test]
@@ -421,5 +451,545 @@ mod tests {
             ..inline("")
         };
         assert!(invalid_utf8.inline_currency().is_none());
+    }
+
+    fn set_modes(
+        admin: Address,
+        token: Address,
+        sender: PolicyMode,
+        recipient: PolicyMode,
+        mint_recipient: PolicyMode,
+    ) -> Result<()> {
+        TIP403Registry::new().set_token_policy_modes(
+            admin,
+            ITIP403Registry::setTokenPolicyModesCall {
+                token,
+                senderMode: sender,
+                recipientMode: recipient,
+                mintRecipientMode: mint_recipient,
+            },
+        )
+    }
+
+    fn add_members(admin: Address, token: Address, accounts: &[Address], role: Role) -> Result<()> {
+        TIP403Registry::new().modify_token_members(admin, token, accounts, role, true)
+    }
+
+    fn transfer(token: &mut TIP20Token, from: Address, to: Address, amount: u64) -> Result<bool> {
+        token.transfer(
+            from,
+            ITIP20::transferCall {
+                to,
+                amount: U256::from(amount),
+            },
+        )
+    }
+
+    fn mint(token: &mut TIP20Token, issuer: Address, to: Address, amount: u64) -> Result<()> {
+        token.mint(
+            issuer,
+            ITIP20::mintCall {
+                to,
+                amount: U256::from(amount),
+            },
+        )
+    }
+
+    /// Reads `receiveConfig` through ABI dispatch.
+    fn receive_config(receiver: Address) -> ITIP403Registry::receiveConfigReturn {
+        let call = ITIP403Registry::receiveConfigCall { receiver }.abi_encode();
+        let output = TIP403Registry::new().call(&call, Address::ZERO).unwrap();
+        ITIP403Registry::receiveConfigCall::abi_decode_returns(&output.bytes).unwrap()
+    }
+
+    #[test]
+    fn issuer_modes_and_memberships() -> eyre::Result<()> {
+        let mut storage = HashMapStorageProvider::new_with_spec(1, TempoHardfork::T14);
+        let admin = Address::random();
+        let (alice, bob, carol) = (Address::random(), Address::random(), Address::random());
+
+        StorageCtx::enter(&mut storage, || {
+            let mut token = TIP20Setup::create("Test", "TST", admin)
+                .with_issuer(admin)
+                .with_mint(alice, U256::from(1_000))
+                .apply()?;
+            let address = token.address;
+            let mut registry = TIP403Registry::new();
+
+            assert_eq!(
+                set_modes(alice, address, DENY, ALLOW, ALLOW),
+                Err(TIP403RegistryError::unauthorized().into())
+            );
+            assert_eq!(
+                add_members(alice, address, &[], Role::SENDER),
+                Err(TIP403RegistryError::unauthorized().into())
+            );
+
+            set_modes(admin, address, BLACKLIST, WHITELIST, ALLOW)?;
+            assert_eq!(
+                transfer(&mut token, alice, bob, 10),
+                Err(TIP20Error::policy_forbids().into()),
+                "bob is not whitelisted"
+            );
+            add_members(admin, address, &[bob], Role::RECIPIENT)?;
+            assert!(transfer(&mut token, alice, bob, 10)?);
+            add_members(admin, address, &[alice], Role::SENDER)?;
+            assert_eq!(
+                transfer(&mut token, alice, bob, 10),
+                Err(TIP20Error::policy_forbids().into())
+            );
+            registry.modify_token_members(admin, address, &[alice], Role::SENDER, false)?;
+            assert!(transfer(&mut token, alice, bob, 10)?);
+
+            // `ALL` edits all three lists without touching the receive-token bit.
+            registry.modify_receive_members(
+                carol,
+                MembershipKind::RECEIVE_TOKEN,
+                &[address],
+                true,
+            )?;
+            add_members(admin, address, &[carol], Role::ALL)?;
+            assert_eq!(
+                registry.token_user_flags(address, carol)?,
+                SENDER_FLAG | RECIPIENT_FLAG | MINT_RECIPIENT_FLAG | RECEIVE_TOKEN_FLAG
+            );
+            registry.modify_token_members(admin, address, &[carol], Role::TRANSFER, false)?;
+            assert_eq!(
+                registry.token_user_flags(address, carol)?,
+                MINT_RECIPIENT_FLAG | RECEIVE_TOKEN_FLAG
+            );
+
+            // Mint-recipient rules are independent.
+            set_modes(admin, address, ALLOW, ALLOW, WHITELIST)?;
+            assert_eq!(
+                mint(&mut token, admin, bob, 1),
+                Err(TIP20Error::policy_forbids().into())
+            );
+            mint(&mut token, admin, carol, 1)?;
+            set_modes(admin, address, ALLOW, ALLOW, DENY)?;
+            assert_eq!(
+                mint(&mut token, admin, carol, 1),
+                Err(TIP20Error::policy_forbids().into())
+            );
+            assert!(registry.is_token_authorized(address, carol, Role::TRANSFER)?);
+            assert!(!registry.is_token_authorized(address, carol, Role::ALL)?);
+
+            let virtual_addr = Address::new_virtual(MasterId::ZERO, UserTag::ZERO);
+            assert_eq!(
+                add_members(admin, address, &[virtual_addr], Role::SENDER),
+                Err(TIP403RegistryError::virtual_address_not_allowed().into())
+            );
+            assert_eq!(
+                add_members(admin, Address::random(), &[bob], Role::SENDER),
+                Err(TIP403RegistryError::invalid_token().into())
+            );
+            let undeployed = Address::new_tip20(u64::from_be_bytes([9; 8]));
+            assert_eq!(
+                set_modes(admin, undeployed, ALLOW, ALLOW, ALLOW),
+                Err(TIP403RegistryError::invalid_token().into())
+            );
+            assert_eq!(
+                registry.is_token_authorized(undeployed, bob, Role::SENDER),
+                Err(TIP403RegistryError::invalid_token().into()),
+                "unregistered tokens are rejected"
+            );
+
+            let before = token.get_token_control()?;
+            registry.clear_emitted_events();
+            set_modes(admin, address, DENY, BLACKLIST, WHITELIST)?;
+            assert_eq!(
+                token.get_token_control()?,
+                TokenControl {
+                    modes: registry.token_policy(address)?.modes_byte(),
+                    ..before
+                }
+            );
+
+            // No-op updates still emit, and batches emit per entry including duplicates.
+            set_modes(admin, address, DENY, BLACKLIST, WHITELIST)?;
+            add_members(admin, address, &[alice, bob, alice], Role::TRANSFER)?;
+            add_members(admin, address, &[], Role::SENDER)?;
+
+            let modes_event = ITIP403Registry::TransferPolicyUpdated {
+                token: address,
+                senderMode: DENY,
+                recipientMode: BLACKLIST,
+                mintRecipientMode: WHITELIST,
+            }
+            .encode_log_data();
+            let member = |account| {
+                ITIP403Registry::PolicyMembershipUpdated {
+                    kind: MembershipKind::ISSUER,
+                    owner: address,
+                    account,
+                    role: Role::TRANSFER,
+                    isMember: true,
+                }
+                .encode_log_data()
+            };
+            assert_eq!(
+                registry.emitted_events().as_slice(),
+                &[
+                    modes_event.clone(),
+                    modes_event,
+                    member(alice),
+                    member(bob),
+                    member(alice)
+                ]
+            );
+
+            set_modes(admin, address, DENY, DENY, DENY)?;
+            assert!(token.is_authorized_as(RECEIVE_POLICY_GUARD_ADDRESS, AuthRole::Transfer)?);
+            assert!(!token.is_authorized_as(admin, AuthRole::Sender)?);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn receive_configs_filter_tokens_then_senders() -> eyre::Result<()> {
+        let mut storage = HashMapStorageProvider::new_with_spec(1, TempoHardfork::T14);
+        let admin = Address::random();
+        let (sender, receiver, recovery) =
+            (Address::random(), Address::random(), Address::random());
+
+        StorageCtx::enter(&mut storage, || {
+            let mut token = TIP20Setup::create("Test", "TST", admin)
+                .with_issuer(admin)
+                .with_mint(sender, U256::from(1_000))
+                .apply()?;
+            let address = token.address;
+            let mut registry = TIP403Registry::new();
+
+            assert_eq!(
+                receive_config(receiver),
+                ITIP403Registry::receiveConfigReturn {
+                    hasReceivePolicy: false,
+                    tokenMode: ALLOW,
+                    senderMode: ALLOW,
+                    recoveryAuthority: Address::ZERO,
+                }
+            );
+            registry.set_receive_config(
+                receiver,
+                ITIP403Registry::setReceiveConfigCall {
+                    tokenMode: WHITELIST,
+                    senderMode: BLACKLIST,
+                    recoveryAuthority: recovery,
+                },
+            )?;
+            assert_eq!(
+                receive_config(receiver),
+                ITIP403Registry::receiveConfigReturn {
+                    hasReceivePolicy: true,
+                    tokenMode: WHITELIST,
+                    senderMode: BLACKLIST,
+                    recoveryAuthority: recovery,
+                }
+            );
+            // The config replaces the legacy word: kind, modes, recovery mode, then the authority.
+            let word = StorageCtx.sload(
+                TIP403_REGISTRY_ADDRESS,
+                receiver.mapping_slot(tip403_registry_slots::RECEIVE_POLICIES),
+            )?;
+            assert_eq!(word.byte(0), RECEIVE_CONFIG_KIND);
+            assert_eq!(word.byte(1), WHITELIST as u8);
+            assert_eq!(word.byte(2), BLACKLIST as u8);
+            assert_eq!(Address::from_word(B256::from(word >> 32)), recovery);
+
+            assert_eq!(
+                registry.receive_policy(receiver),
+                Err(TIP403RegistryError::receive_policy_ids_unsupported().into())
+            );
+            assert_eq!(
+                registry.set_receive_policy(
+                    receiver,
+                    ITIP403Registry::setReceivePolicyCall {
+                        senderPolicyId: 1,
+                        tokenFilterId: 1,
+                        recoveryAuthority: Address::ZERO,
+                    },
+                ),
+                Err(TIP403RegistryError::receive_policy_ids_unsupported().into())
+            );
+            assert!(transfer(&mut token, sender, receiver, 10)?);
+            assert_eq!(token.get_balance(receiver)?, U256::ZERO);
+
+            registry.modify_receive_members(
+                receiver,
+                MembershipKind::RECEIVE_TOKEN,
+                &[address],
+                true,
+            )?;
+            assert!(transfer(&mut token, sender, receiver, 10)?);
+            assert_eq!(token.get_balance(receiver)?, U256::from(10));
+
+            registry.modify_receive_members(
+                receiver,
+                MembershipKind::RECEIVE_SENDER,
+                &[sender],
+                true,
+            )?;
+            mint(&mut token, admin, receiver, 5)?;
+            assert_eq!(
+                token.get_balance(receiver)?,
+                U256::from(15),
+                "mints check msg.sender, which is not blacklisted"
+            );
+            assert!(transfer(&mut token, sender, receiver, 10)?);
+            assert_eq!(token.get_balance(receiver)?, U256::from(15));
+
+            assert_eq!(
+                registry.modify_receive_members(
+                    RECEIVE_POLICY_GUARD_ADDRESS,
+                    MembershipKind::RECEIVE_TOKEN,
+                    &[],
+                    true
+                ),
+                Err(TIP403RegistryError::address_reserved().into())
+            );
+            assert_eq!(
+                registry.modify_receive_members(
+                    receiver,
+                    MembershipKind::RECEIVE_TOKEN,
+                    &[Address::random()],
+                    true
+                ),
+                Err(TIP403RegistryError::invalid_token().into())
+            );
+            assert_eq!(
+                registry.set_receive_config(
+                    receiver,
+                    ITIP403Registry::setReceiveConfigCall {
+                        tokenMode: ALLOW,
+                        senderMode: ALLOW,
+                        recoveryAuthority: TIP403_REGISTRY_ADDRESS,
+                    },
+                ),
+                Err(TIP403RegistryError::invalid_recovery_authority().into())
+            );
+            Ok(())
+        })
+    }
+
+    /// Creates a legacy token before T14 with a generic blacklist, then switches to T14.
+    fn legacy_token(admin: Address, blocked: Address) -> Result<(TIP20Token, u64)> {
+        StorageCtx.set_spec(TempoHardfork::T13);
+        let mut token = TIP20Setup::create("Legacy", "LGC", admin)
+            .with_issuer(admin)
+            .apply()?;
+        let policy_id = TIP403Registry::new().create_policy_with_accounts(
+            admin,
+            ITIP403Registry::createPolicyWithAccountsCall {
+                admin,
+                policyType: ITIP403Registry::PolicyType::BLACKLIST,
+                accounts: vec![blocked],
+            },
+        )?;
+        token.change_transfer_policy_id(
+            admin,
+            ITIP20::changeTransferPolicyIdCall {
+                newPolicyId: policy_id,
+            },
+        )?;
+        StorageCtx.set_spec(TempoHardfork::T14);
+        Ok((token, policy_id))
+    }
+
+    #[test]
+    fn activation_converts_legacy_tokens() -> eyre::Result<()> {
+        let mut storage = HashMapStorageProvider::new_with_spec(1, TempoHardfork::T14);
+        let admin = Address::random();
+        let (alice, blocked) = (Address::random(), Address::random());
+
+        StorageCtx::enter(&mut storage, || {
+            let (mut token, policy_id) = legacy_token(admin, blocked)?;
+            let address = token.address;
+            let mut registry = TIP403Registry::new();
+            mint(&mut token, admin, alice, 1_000)?;
+            assert_eq!(
+                transfer(&mut token, alice, blocked, 1),
+                Err(TIP20Error::policy_forbids().into())
+            );
+
+            // Preparing modes and memberships does not activate them.
+            set_modes(admin, address, ALLOW, BLACKLIST, ALLOW)?;
+            assert_eq!(StorageCtx.sload(address, slots::PAUSED)?, U256::ZERO);
+            assert_eq!(token.transfer_policy_id()?, policy_id);
+            assert_eq!(
+                token.transfer_policy(),
+                Err(TIP20Error::invalid_transfer_policy_id().into())
+            );
+
+            let before = (
+                token.metadata()?,
+                token.quote_token()?,
+                token.next_quote_token()?,
+                token.total_supply()?,
+                token.supply_cap()?,
+                token.paused()?,
+            );
+            registry.clear_emitted_events();
+            token.change_transfer_policy_id(
+                admin,
+                ITIP20::changeTransferPolicyIdCall {
+                    newPolicyId: TOKEN_POLICY_ID,
+                },
+            )?;
+            assert_eq!(
+                registry.emitted_events().as_slice(),
+                &[ITIP403Registry::TransferPolicyUpdated {
+                    token: address,
+                    senderMode: ALLOW,
+                    recipientMode: BLACKLIST,
+                    mintRecipientMode: ALLOW,
+                }
+                .encode_log_data()]
+            );
+            assert!(token.token_control()?.is_some());
+            assert_eq!(
+                before,
+                (
+                    token.metadata()?,
+                    token.quote_token()?,
+                    token.next_quote_token()?,
+                    token.total_supply()?,
+                    token.supply_cap()?,
+                    token.paused()?,
+                )
+            );
+            for slot in [
+                slots::CURRENCY,
+                slots::QUOTE_TOKEN,
+                slots::NEXT_QUOTE_TOKEN,
+                slots::SUPPLY_CAP,
+            ] {
+                assert_eq!(StorageCtx.sload(address, slot)?, U256::ZERO);
+            }
+
+            // Lists start empty, so `blocked` passes until it is listed.
+            assert_eq!(token.transfer_policy_id()?, TOKEN_POLICY_ID);
+            assert!(transfer(&mut token, alice, blocked, 1)?);
+            add_members(admin, address, &[blocked], Role::RECIPIENT)?;
+            assert_eq!(
+                transfer(&mut token, alice, blocked, 1),
+                Err(TIP20Error::policy_forbids().into())
+            );
+
+            // Repeating activation is a no-op. Generic IDs are unsupported afterwards.
+            registry.clear_emitted_events();
+            token.change_transfer_policy_id(
+                admin,
+                ITIP20::changeTransferPolicyIdCall {
+                    newPolicyId: TOKEN_POLICY_ID,
+                },
+            )?;
+            assert!(registry.emitted_events().is_empty());
+            assert_eq!(
+                token.change_transfer_policy_id(
+                    admin,
+                    ITIP20::changeTransferPolicyIdCall {
+                        newPolicyId: REJECT_ALL_POLICY_ID,
+                    },
+                ),
+                Err(TIP403RegistryError::token_policy_ids_unsupported().into())
+            );
+            assert_eq!(
+                StorageCtx.sload(
+                    TIP403_REGISTRY_ADDRESS,
+                    address.mapping_slot(tip403_registry_slots::TOKEN_TRANSFER_POLICIES)
+                )?,
+                U256::ZERO
+            );
+            assert_eq!(
+                registry.migrate_transfer_policy_ids(
+                    ITIP403Registry::migrateTransferPolicyIdsCall {
+                        tokens: vec![address]
+                    }
+                )?,
+                U256::ZERO
+            );
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn activation_rejects_null_quote() -> eyre::Result<()> {
+        let mut storage = HashMapStorageProvider::new_with_spec(1, TempoHardfork::T14);
+        let admin = Address::random();
+
+        StorageCtx::enter(&mut storage, || {
+            let (mut token, _) = legacy_token(admin, Address::random())?;
+            let address = token.address;
+            StorageCtx.sstore(address, slots::QUOTE_TOKEN, U256::ZERO)?;
+            assert_eq!(
+                token.change_transfer_policy_id(
+                    admin,
+                    ITIP20::changeTransferPolicyIdCall {
+                        newPolicyId: TOKEN_POLICY_ID,
+                    }
+                ),
+                Err(TIP20Error::invalid_quote_token().into())
+            );
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn registry_mirrors_resolve_token_specific_policies() -> eyre::Result<()> {
+        let admin = Address::random();
+        let (alice, bob) = (Address::random(), Address::random());
+
+        for fork in [TempoHardfork::T13, TempoHardfork::T14] {
+            let mut storage = HashMapStorageProvider::new_with_spec(1, fork);
+            StorageCtx::enter(&mut storage, || -> eyre::Result<()> {
+                // A legacy-layout mirror (as zones create) without a registry binding.
+                TIP20Setup::path_usd(admin).apply()?;
+                let address = Address::new_tip20(0x1145);
+                let mut token = TIP20Token::from_address(address)?;
+                token.initialize_with_mirror(
+                    admin,
+                    "Mirror",
+                    "MIR",
+                    "USD",
+                    PATH_USD_ADDRESS,
+                    admin,
+                    true,
+                )?;
+                assert_eq!(token.legacy_transfer_policy_id()?, REJECT_ALL_POLICY_ID);
+                token.grant_role_internal(admin, ISSUER_ROLE)?;
+                let mut registry = TIP403Registry::new();
+                registry.token_transfer_policies[address].delete()?;
+                if !fork.is_t14() {
+                    StorageCtx.reset_counters();
+                    assert_eq!(token.transfer_policy_id()?, REJECT_ALL_POLICY_ID);
+                    assert_eq!(StorageCtx.counter_sload(), 2);
+                }
+                StorageCtx.set_spec(TempoHardfork::T14);
+                assert!(token.token_control()?.is_none());
+                assert_eq!(
+                    mint(&mut token, admin, alice, 10),
+                    Err(TIP20Error::policy_forbids().into())
+                );
+
+                // The mirrored registry policy applies, including its lists.
+                registry.write_token_policy(
+                    address,
+                    TokenPolicy {
+                        recipient: WHITELIST,
+                        ..TokenPolicy::ALLOW_ALL
+                    },
+                )?;
+                mint(&mut token, admin, alice, 10)?;
+                assert_eq!(
+                    transfer(&mut token, alice, bob, 1),
+                    Err(TIP20Error::policy_forbids().into())
+                );
+                registry.token_user_flags[address][bob].write(RECIPIENT_FLAG)?;
+                assert!(transfer(&mut token, alice, bob, 1)?);
+                assert_eq!(token.transfer_policy_id()?, TOKEN_POLICY_ID);
+                Ok(())
+            })?;
+        }
+        Ok(())
     }
 }

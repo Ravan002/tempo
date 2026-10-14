@@ -1735,9 +1735,6 @@ impl Recipient {
 }
 
 #[cfg(test)]
-mod tip1145_tests;
-
-#[cfg(test)]
 mod recipient_tests {
     use super::*;
     use crate::{
@@ -1989,81 +1986,103 @@ pub(crate) mod tests {
             token_filter_id: u64,
             recovery_address: Address,
         ) -> Result<()> {
-            TIP403Registry::new().set_receive_policy(
-                receiver,
-                ITIP403Registry::setReceivePolicyCall {
-                    senderPolicyId: sender_policy_id,
-                    tokenFilterId: token_filter_id,
-                    recoveryAuthority: recovery_address,
-                },
-            )
+            let mut registry = TIP403Registry::new();
+            if StorageCtx.spec().is_t14() {
+                let mode = |id| match id {
+                    REJECT_ALL_POLICY_ID => ITIP403Registry::PolicyMode::DENY,
+                    ALLOW_ALL_POLICY_ID => ITIP403Registry::PolicyMode::ALLOW,
+                    _ => panic!("receive-policy fixture requires a built-in policy"),
+                };
+                registry.set_receive_config(
+                    receiver,
+                    ITIP403Registry::setReceiveConfigCall {
+                        tokenMode: mode(token_filter_id),
+                        senderMode: mode(sender_policy_id),
+                        recoveryAuthority: recovery_address,
+                    },
+                )
+            } else {
+                registry.set_receive_policy(
+                    receiver,
+                    ITIP403Registry::setReceivePolicyCall {
+                        senderPolicyId: sender_policy_id,
+                        tokenFilterId: token_filter_id,
+                        recoveryAuthority: recovery_address,
+                    },
+                )
+            }
         }
 
         #[test]
         fn test_transfer_blocked_by_receive_policy_guards_funds() -> eyre::Result<()> {
-            let mut storage = HashMapStorageProvider::new_with_spec(1, TempoHardfork::T6);
-            storage.set_timestamp(U256::from(BLOCKED_AT));
             let admin = Address::random();
             let sender = Address::random();
             let receiver = Address::random();
             let amount = U256::from(100u64);
-
-            StorageCtx::enter(&mut storage, || {
-                let mut token = TIP20Setup::create("Test", "TST", admin)
-                    .with_issuer(admin)
-                    .with_mint(sender, amount)
-                    .clear_events()
-                    .apply()?;
-                set_receive_policy(
-                    receiver,
-                    REJECT_ALL_POLICY_ID,
-                    ALLOW_ALL_POLICY_ID,
-                    Address::ZERO,
-                )?;
-
-                token.transfer(
-                    sender,
-                    ITIP20::transferCall {
-                        to: receiver,
-                        amount,
-                    },
-                )?;
-
-                assert_eq!(token.get_balance(sender)?, U256::ZERO);
-                assert_eq!(token.get_balance(receiver)?, U256::ZERO);
-                assert_eq!(token.get_balance(RECEIVE_POLICY_GUARD_ADDRESS)?, amount);
-                token.assert_emitted_events(vec![TIP20Event::Transfer(ITIP20::Transfer {
-                    from: sender,
-                    to: RECEIVE_POLICY_GUARD_ADDRESS,
-                    amount,
-                })]);
-
-                let receipt = IReceivePolicyGuard::ClaimReceiptV1::new(
-                    token.address,
-                    Address::ZERO,
-                    sender,
-                    receiver,
-                    BLOCKED_AT,
-                    1,
-                    ITIP403Registry::BlockedReason::RECEIVE_POLICY as u8,
-                    InboundKind::TRANSFER,
-                    B256::ZERO,
-                );
-                let guard = ReceivePolicyGuard::new();
-                assert_eq!(guard.balance_of(receipt.abi_encode().into())?, amount);
-                guard.assert_emitted_events(vec![ReceivePolicyGuardEvent::TransferBlocked(
-                    IReceivePolicyGuard::TransferBlocked {
-                        token: token.address,
+            for (spec, recovery) in [
+                (TempoHardfork::T6, Address::ZERO),
+                (TempoHardfork::T14, Address::random()),
+            ] {
+                let mut storage = HashMapStorageProvider::new_with_spec(1, spec);
+                storage.set_timestamp(U256::from(BLOCKED_AT));
+                StorageCtx::enter(&mut storage, || -> eyre::Result<()> {
+                    let mut token = TIP20Setup::create("Test", "TST", admin)
+                        .with_issuer(admin)
+                        .with_mint(sender, amount)
+                        .clear_events()
+                        .apply()?;
+                    set_receive_policy(
                         receiver,
-                        blockedNonce: 1,
-                        receiptVersion: BLOCKED_RECEIPT_VERSION,
-                        amount,
-                        receipt: receipt.abi_encode().into(),
-                    },
-                )]);
+                        REJECT_ALL_POLICY_ID,
+                        ALLOW_ALL_POLICY_ID,
+                        recovery,
+                    )?;
 
-                Ok(())
-            })
+                    token.transfer(
+                        sender,
+                        ITIP20::transferCall {
+                            to: receiver,
+                            amount,
+                        },
+                    )?;
+
+                    assert_eq!(token.get_balance(sender)?, U256::ZERO);
+                    assert_eq!(token.get_balance(receiver)?, U256::ZERO);
+                    assert_eq!(token.get_balance(RECEIVE_POLICY_GUARD_ADDRESS)?, amount);
+                    token.assert_emitted_events(vec![TIP20Event::Transfer(ITIP20::Transfer {
+                        from: sender,
+                        to: RECEIVE_POLICY_GUARD_ADDRESS,
+                        amount,
+                    })]);
+
+                    let receipt = IReceivePolicyGuard::ClaimReceiptV1::new(
+                        token.address,
+                        recovery,
+                        sender,
+                        receiver,
+                        BLOCKED_AT,
+                        1,
+                        ITIP403Registry::BlockedReason::RECEIVE_POLICY as u8,
+                        InboundKind::TRANSFER,
+                        B256::ZERO,
+                    );
+                    let guard = ReceivePolicyGuard::new();
+                    assert_eq!(guard.balance_of(receipt.abi_encode().into())?, amount);
+                    guard.assert_emitted_events(vec![ReceivePolicyGuardEvent::TransferBlocked(
+                        IReceivePolicyGuard::TransferBlocked {
+                            token: token.address,
+                            receiver,
+                            blockedNonce: 1,
+                            receiptVersion: BLOCKED_RECEIPT_VERSION,
+                            amount,
+                            receipt: receipt.abi_encode().into(),
+                        },
+                    )]);
+
+                    Ok(())
+                })?;
+            }
+            Ok(())
         }
 
         #[test]
@@ -2189,59 +2208,64 @@ pub(crate) mod tests {
 
         #[test]
         fn test_transfer_blocked_by_token_filter_records_reason() -> eyre::Result<()> {
-            let mut storage = HashMapStorageProvider::new_with_spec(1, TempoHardfork::T6);
-            storage.set_timestamp(U256::from(BLOCKED_AT));
             let admin = Address::random();
             let sender = Address::random();
             let receiver = Address::random();
             let amount = U256::from(40u64);
-
-            StorageCtx::enter(&mut storage, || {
-                let mut token = TIP20Setup::create("Test", "TST", admin)
-                    .with_issuer(admin)
-                    .with_mint(sender, amount)
-                    .apply()?;
-                set_receive_policy(
-                    receiver,
-                    ALLOW_ALL_POLICY_ID,
-                    REJECT_ALL_POLICY_ID,
-                    Address::ZERO,
-                )?;
-
-                token.transfer(
-                    sender,
-                    ITIP20::transferCall {
-                        to: receiver,
-                        amount,
-                    },
-                )?;
-
-                let receipt = IReceivePolicyGuard::ClaimReceiptV1::new(
-                    token.address,
-                    Address::ZERO,
-                    sender,
-                    receiver,
-                    BLOCKED_AT,
-                    1,
-                    ITIP403Registry::BlockedReason::TOKEN_FILTER as u8,
-                    InboundKind::TRANSFER,
-                    B256::ZERO,
-                );
-                let guard = ReceivePolicyGuard::new();
-                assert_eq!(guard.balance_of(receipt.abi_encode().into())?, amount);
-                guard.assert_emitted_events(vec![ReceivePolicyGuardEvent::TransferBlocked(
-                    IReceivePolicyGuard::TransferBlocked {
-                        token: token.address,
+            for (spec, sender_policy) in [
+                (TempoHardfork::T6, ALLOW_ALL_POLICY_ID),
+                (TempoHardfork::T14, REJECT_ALL_POLICY_ID),
+            ] {
+                let mut storage = HashMapStorageProvider::new_with_spec(1, spec);
+                storage.set_timestamp(U256::from(BLOCKED_AT));
+                StorageCtx::enter(&mut storage, || -> eyre::Result<()> {
+                    let mut token = TIP20Setup::create("Test", "TST", admin)
+                        .with_issuer(admin)
+                        .with_mint(sender, amount)
+                        .apply()?;
+                    set_receive_policy(
                         receiver,
-                        blockedNonce: 1,
-                        receiptVersion: BLOCKED_RECEIPT_VERSION,
-                        amount,
-                        receipt: receipt.abi_encode().into(),
-                    },
-                )]);
+                        sender_policy,
+                        REJECT_ALL_POLICY_ID,
+                        Address::ZERO,
+                    )?;
 
-                Ok(())
-            })
+                    token.transfer(
+                        sender,
+                        ITIP20::transferCall {
+                            to: receiver,
+                            amount,
+                        },
+                    )?;
+
+                    let receipt = IReceivePolicyGuard::ClaimReceiptV1::new(
+                        token.address,
+                        Address::ZERO,
+                        sender,
+                        receiver,
+                        BLOCKED_AT,
+                        1,
+                        ITIP403Registry::BlockedReason::TOKEN_FILTER as u8,
+                        InboundKind::TRANSFER,
+                        B256::ZERO,
+                    );
+                    let guard = ReceivePolicyGuard::new();
+                    assert_eq!(guard.balance_of(receipt.abi_encode().into())?, amount);
+                    guard.assert_emitted_events(vec![ReceivePolicyGuardEvent::TransferBlocked(
+                        IReceivePolicyGuard::TransferBlocked {
+                            token: token.address,
+                            receiver,
+                            blockedNonce: 1,
+                            receiptVersion: BLOCKED_RECEIPT_VERSION,
+                            amount,
+                            receipt: receipt.abi_encode().into(),
+                        },
+                    )]);
+
+                    Ok(())
+                })?;
+            }
+            Ok(())
         }
 
         #[test]
@@ -3030,54 +3054,68 @@ pub(crate) mod tests {
 
     #[test]
     fn test_initialize_sets_next_quote_token() -> eyre::Result<()> {
-        let mut storage = HashMapStorageProvider::new(1);
         let admin = Address::random();
+        for spec in [TempoHardfork::T0, TempoHardfork::T13, TempoHardfork::T14] {
+            let mut storage = HashMapStorageProvider::new_with_spec(1, spec);
+            StorageCtx::enter(&mut storage, || -> eyre::Result<()> {
+                let token = TIP20Setup::create("Test", "TST", admin).apply()?;
 
-        StorageCtx::enter(&mut storage, || {
-            let token = TIP20Setup::create("Test", "TST", admin).apply()?;
-
-            // Verify both quoteToken and nextQuoteToken are set to the same value
-            assert_eq!(token.quote_token()?, PATH_USD_ADDRESS);
-            assert_eq!(token.next_quote_token()?, PATH_USD_ADDRESS);
-
-            Ok(())
-        })
+                // Verify both quoteToken and nextQuoteToken are set to the same value
+                assert_eq!(token.quote_token()?, PATH_USD_ADDRESS);
+                assert_eq!(token.next_quote_token()?, PATH_USD_ADDRESS);
+                let path_usd = TIP20Token::from_address(PATH_USD_ADDRESS)?;
+                assert_eq!(path_usd.quote_token()?, Address::ZERO);
+                assert_eq!(path_usd.next_quote_token()?, Address::ZERO);
+                assert_eq!(path_usd.token_control()?.is_some(), spec.is_t14());
+                if spec.is_t14() {
+                    for slot in [slots::QUOTE_TOKEN, slots::NEXT_QUOTE_TOKEN] {
+                        assert_eq!(StorageCtx.sload(token.address, slot)?, U256::ZERO);
+                    }
+                }
+                Ok(())
+            })?;
+        }
+        Ok(())
     }
 
     #[test]
     fn test_update_quote_token() -> eyre::Result<()> {
-        let mut storage = HashMapStorageProvider::new(1);
         let admin = Address::random();
+        for spec in [TempoHardfork::T0, TempoHardfork::T13, TempoHardfork::T14] {
+            let mut storage = HashMapStorageProvider::new_with_spec(1, spec);
+            StorageCtx::enter(&mut storage, || -> eyre::Result<()> {
+                let mut token = TIP20Setup::create("Test", "TST", admin).apply()?;
 
-        StorageCtx::enter(&mut storage, || {
-            let mut token = TIP20Setup::create("Test", "TST", admin).apply()?;
+                // Create a new USD token to use as the new quote token
+                let new_quote_token = TIP20Setup::create("New Quote", "NQ", admin).apply()?;
+                let new_quote_token_address = new_quote_token.address;
 
-            // Create a new USD token to use as the new quote token
-            let new_quote_token = TIP20Setup::create("New Quote", "NQ", admin).apply()?;
-            let new_quote_token_address = new_quote_token.address;
+                // Verify initial quote token is PATH_USD
+                assert_eq!(token.quote_token()?, PATH_USD_ADDRESS);
 
-            // Verify initial quote token is PATH_USD
-            assert_eq!(token.quote_token()?, PATH_USD_ADDRESS);
+                // Set next quote token to the new token
+                token.set_next_quote_token(
+                    admin,
+                    ITIP20::setNextQuoteTokenCall {
+                        newQuoteToken: new_quote_token_address,
+                    },
+                )?;
 
-            // Set next quote token to the new token
-            token.set_next_quote_token(
-                admin,
-                ITIP20::setNextQuoteTokenCall {
-                    newQuoteToken: new_quote_token_address,
-                },
-            )?;
+                // Verify next quote token was set to the new token
+                assert_eq!(token.next_quote_token()?, new_quote_token_address);
+                assert_eq!(token.quote_token()?, PATH_USD_ADDRESS);
 
-            // Verify next quote token was set to the new token
-            assert_eq!(token.next_quote_token()?, new_quote_token_address);
+                // Verify event was emitted
+                assert_eq!(
+                    token.emitted_events().last().unwrap(),
+                    &TIP20Event::next_quote_token_set(admin, new_quote_token_address)
+                        .into_log_data()
+                );
 
-            // Verify event was emitted
-            assert_eq!(
-                token.emitted_events().last().unwrap(),
-                &TIP20Event::next_quote_token_set(admin, new_quote_token_address).into_log_data()
-            );
-
-            Ok(())
-        })
+                Ok(())
+            })?;
+        }
+        Ok(())
     }
 
     #[test]
@@ -3170,35 +3208,38 @@ pub(crate) mod tests {
 
     #[test]
     fn test_finalize_quote_token_update() -> eyre::Result<()> {
-        let mut storage = HashMapStorageProvider::new(1);
         let admin = Address::random();
+        for spec in [TempoHardfork::T0, TempoHardfork::T13, TempoHardfork::T14] {
+            let mut storage = HashMapStorageProvider::new_with_spec(1, spec);
+            StorageCtx::enter(&mut storage, || -> eyre::Result<()> {
+                let mut token = TIP20Setup::create("Test", "TST", admin).apply()?;
+                let quote_token_address = TIP20Setup::create("Quote", "QT", admin).apply()?.address;
 
-        StorageCtx::enter(&mut storage, || {
-            let mut token = TIP20Setup::create("Test", "TST", admin).apply()?;
-            let quote_token_address = token.quote_token()?;
+                // Set next quote token
+                token.set_next_quote_token(
+                    admin,
+                    ITIP20::setNextQuoteTokenCall {
+                        newQuoteToken: quote_token_address,
+                    },
+                )?;
 
-            // Set next quote token
-            token.set_next_quote_token(
-                admin,
-                ITIP20::setNextQuoteTokenCall {
-                    newQuoteToken: quote_token_address,
-                },
-            )?;
+                // Complete the update
+                token
+                    .complete_quote_token_update(admin, ITIP20::completeQuoteTokenUpdateCall {})?;
 
-            // Complete the update
-            token.complete_quote_token_update(admin, ITIP20::completeQuoteTokenUpdateCall {})?;
+                // Verify quote token was updated
+                assert_eq!(token.quote_token()?, quote_token_address);
+                assert_eq!(token.next_quote_token()?, quote_token_address);
 
-            // Verify quote token was updated
-            assert_eq!(token.quote_token()?, quote_token_address);
-
-            // Verify event was emitted
-            assert_eq!(
-                token.emitted_events().last().unwrap(),
-                &TIP20Event::quote_token_update(admin, quote_token_address).into_log_data()
-            );
-
-            Ok(())
-        })
+                // Verify event was emitted
+                assert_eq!(
+                    token.emitted_events().last().unwrap(),
+                    &TIP20Event::quote_token_update(admin, quote_token_address).into_log_data()
+                );
+                Ok(())
+            })?;
+        }
+        Ok(())
     }
 
     #[test]
@@ -3272,29 +3313,31 @@ pub(crate) mod tests {
 
     #[test]
     fn test_arbitrary_currency() -> eyre::Result<()> {
-        let mut storage = HashMapStorageProvider::new(1);
         let admin = Address::random();
-
-        StorageCtx::enter(&mut storage, || {
-            for _ in 0..50 {
-                let currency: String = thread_rng()
-                    .sample_iter(&Alphanumeric)
-                    .take(31)
-                    .map(char::from)
-                    .collect();
-
-                // Initialize token with the random currency
-                let token = TIP20Setup::create("Test", "TST", admin)
-                    .currency(&currency)
-                    .apply()?;
-
-                // Verify the currency was stored and can be retrieved correctly
-                let stored_currency = token.currency()?;
-                assert_eq!(stored_currency, currency,);
-            }
-
-            Ok(())
-        })
+        for spec in [TempoHardfork::T0, TempoHardfork::T13, TempoHardfork::T14] {
+            let mut storage = HashMapStorageProvider::new_with_spec(1, spec);
+            StorageCtx::enter(&mut storage, || -> eyre::Result<()> {
+                for (currency, inline) in [
+                    ("USD", true),
+                    ("EUR", true),
+                    ("", false),
+                    ("1234567890123456789012345678901", false),
+                ] {
+                    let token = TIP20Setup::create("Test", "TST", admin)
+                        .currency(currency)
+                        .apply()?;
+                    assert_eq!(token.currency()?, currency);
+                    assert_eq!(token.is_usd()?, currency == "USD");
+                    assert_eq!(
+                        StorageCtx.sload(token.address, slots::CURRENCY)?.is_zero(),
+                        currency.is_empty() || (spec.is_t14() && inline),
+                        "{spec:?}: {currency:?}"
+                    );
+                }
+                Ok(())
+            })?;
+        }
+        Ok(())
     }
 
     #[test]
@@ -3643,17 +3686,33 @@ pub(crate) mod tests {
 
     #[test]
     fn test_initialize_supply_cap() -> eyre::Result<()> {
-        let mut storage = HashMapStorageProvider::new(1);
         let admin = Address::random();
-
-        StorageCtx::enter(&mut storage, || {
-            let token = TIP20Setup::create("Token", "TKN", admin).apply()?;
-
-            let supply_cap = token.supply_cap()?;
-            assert_eq!(supply_cap, U256::from(u128::MAX));
-
-            Ok(())
-        })
+        for spec in [TempoHardfork::T0, TempoHardfork::T13, TempoHardfork::T14] {
+            let mut storage = HashMapStorageProvider::new_with_spec(1, spec);
+            StorageCtx::enter(&mut storage, || -> eyre::Result<()> {
+                let token = TIP20Setup::create("Token", "TKN", admin).apply()?;
+                StorageCtx.reset_counters();
+                assert_eq!(token.supply_cap()?, U128_MAX);
+                assert_eq!(
+                    StorageCtx.counter_sload(),
+                    if spec.is_t14() { 2 } else { 1 }
+                );
+                assert_eq!(
+                    StorageCtx.sload(token.address, slots::TOTAL_SUPPLY)?,
+                    if spec.is_t14() {
+                        U128_MAX << 128
+                    } else {
+                        U256::ZERO
+                    }
+                );
+                assert_eq!(
+                    StorageCtx.sload(token.address, slots::SUPPLY_CAP)?,
+                    if spec.is_t14() { U256::ZERO } else { U128_MAX }
+                );
+                Ok(())
+            })?;
+        }
+        Ok(())
     }
 
     #[test]
@@ -4738,33 +4797,49 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_new_t9_token_registers_transfer_policy() -> eyre::Result<()> {
+    fn test_new_token_registers_transfer_policy() -> eyre::Result<()> {
         let admin = Address::random();
-        let mut storage = HashMapStorageProvider::new_with_spec(1, TempoHardfork::T9);
-
-        StorageCtx::enter(&mut storage, || {
-            let token = TIP20Setup::create("Token", "TKN", admin).apply()?;
-            let registry = TIP403Registry::new();
-
-            assert!(
-                registry
-                    .registered_token_transfer_policy_id(token.address)?
-                    .is_some()
-            );
-            assert_eq!(
-                registry.token_transfer_policy_id(ITIP403Registry::tokenTransferPolicyIdCall {
-                    token: token.address,
-                },)?,
-                ITIP403Registry::tokenTransferPolicyIdReturn {
-                    isSet: true,
-                    policyId: ALLOW_ALL_POLICY_ID,
+        for spec in [TempoHardfork::T9, TempoHardfork::T13, TempoHardfork::T14] {
+            let mut storage = HashMapStorageProvider::new_with_spec(1, spec);
+            StorageCtx::enter(&mut storage, || -> eyre::Result<()> {
+                let token = TIP20Setup::create("Token", "TKN", admin).apply()?;
+                let registry = TIP403Registry::new();
+                let policy_id = if spec.is_t14() {
+                    TOKEN_POLICY_ID
+                } else {
+                    ALLOW_ALL_POLICY_ID
+                };
+                assert_eq!(
+                    registry.token_transfer_policy_id(
+                        ITIP403Registry::tokenTransferPolicyIdCall {
+                            token: token.address,
+                        }
+                    )?,
+                    ITIP403Registry::tokenTransferPolicyIdReturn {
+                        isSet: true,
+                        policyId: policy_id,
+                    }
+                );
+                assert_eq!(token.transfer_policy_id()?, policy_id);
+                assert_eq!(token.legacy_transfer_policy_id()?, 0);
+                if spec.is_t14() {
+                    assert_eq!(
+                        registry.emitted_events().last(),
+                        Some(
+                            &ITIP403Registry::TransferPolicyUpdated {
+                                token: token.address,
+                                senderMode: ITIP403Registry::PolicyMode::ALLOW,
+                                recipientMode: ITIP403Registry::PolicyMode::ALLOW,
+                                mintRecipientMode: ITIP403Registry::PolicyMode::ALLOW,
+                            }
+                            .encode_log_data()
+                        )
+                    );
                 }
-            );
-            assert_eq!(token.transfer_policy_id()?, ALLOW_ALL_POLICY_ID);
-            assert_eq!(token.legacy_transfer_policy_id()?, 0);
-
-            Ok(())
-        })
+                Ok(())
+            })?;
+        }
+        Ok(())
     }
 
     #[test]
