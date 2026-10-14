@@ -34,19 +34,19 @@ target "docker-metadata" {}
 
 # Base image with all dependencies pre-compiled
 target "chef" {
-  dockerfile = "docker/Dockerfile.chef"
+  dockerfile = "zones/docker/Dockerfile.chef"
   context = "."
   platforms = ["linux/amd64"]
   args = {
     RUST_PROFILE = "profiling"
     RUST_FEATURES = "jemalloc"
     CACHE_FAMILY = "node"
-    RUST_BINARIES = "tempo-zone tempo-xtask"
+    RUST_BINARIES = "tempo-zone tempo-zone-xtask"
   }
 }
 
 target "prover-chef" {
-  dockerfile = "docker/Dockerfile.chef"
+  dockerfile = "zones/docker/Dockerfile.chef"
   context = "."
   platforms = ["linux/amd64"]
   args = {
@@ -60,7 +60,7 @@ target "prover-chef" {
 # Utilities and enclave share the same release dependency graph.
 # Keep its layer and cache mounts reusable across both consumers.
 target "_common" {
-  dockerfile = "docker/Dockerfile"
+  dockerfile = "zones/docker/Dockerfile"
   context = "."
   contexts = {
     chef = "target:chef"
@@ -76,15 +76,26 @@ target "_common" {
 }
 
 target "tempo-zone" {
-  inherits = ["_common", "docker-metadata"]
-  target = "tempo-zone"
+  inherits = ["docker-metadata"]
+  dockerfile = "zones/docker/Dockerfile.reproducible"
+  context = "."
+  target = "tempo-zone-reproducible"
+  args = {
+    SOURCE_DATE_EPOCH = "${SOURCE_DATE_EPOCH}"
+    GIT_SHA = "${GIT_SHA}"
+    VERSION = "${VERSION}"
+  }
+  labels = {
+    "org.opencontainers.image.description" = "Production tempo-zone image verified against an independent clean image build."
+    "org.tempoxyz.reproducible.verification-scope" = "tempo-zone-image-id"
+  }
+  platforms = ["linux/amd64"]
 }
 
-# Non-production candidate image for the manual reproducible-image
-# verification workflow. This uses Dockerfile.reproducible's dedicated build
-# profile and flags, rather than the normal Dockerfile with a profile override.
+# Non-production candidate image for the manual reproducible-image verification
+# workflow. The production target above uses the same binary build contract.
 target "tempo-zone-reproducible" {
-  dockerfile = "docker/Dockerfile.reproducible"
+  dockerfile = "zones/docker/Dockerfile.reproducible"
   context = "."
   target = "tempo-zone-reproducible"
   args = {
@@ -100,22 +111,20 @@ target "tempo-zone-reproducible" {
 }
 
 target "tempo-zone-prover-enclave" {
-  dockerfile = "docker/Dockerfile.prover-enclave"
+  dockerfile = "zones/docker/Dockerfile.prover-package"
   context = "."
   contexts = {
-    chef = "target:prover-chef"
+    prover-binary = "target:tempo-zone-prover-compiled"
   }
   args = {
-    CHEF_IMAGE = "chef"
-    RUST_PROFILE = "release"
-    CACHE_FAMILY = "prover"
+    SOURCE_DATE_EPOCH = "${SOURCE_DATE_EPOCH}"
   }
   platforms = ["linux/amd64"]
 }
 
 target "tempo-zone-prover-utils" {
   inherits = ["docker-metadata"]
-  dockerfile = "docker/Dockerfile.prover-utils"
+  dockerfile = "zones/docker/Dockerfile.prover-utils"
   context = "."
   contexts = {
     chef = "target:prover-chef"
@@ -131,7 +140,7 @@ target "tempo-zone-prover-utils" {
 # Build a hardened, matched set of Nitro bootstrap artifacts from pinned AWS sources. The local
 # wrapper pins the Nix builder and applies the reviewed Zones kernel-config delta.
 target "nitro-enclaves-bootstrap" {
-  dockerfile = "docker/Dockerfile.nitro-enclaves-bootstrap"
+  dockerfile = "zones/docker/Dockerfile.nitro-enclaves-bootstrap"
   context = "."
   contexts = {
     nitro-bootstrap-source = "https://github.com/aws/aws-nitro-enclaves-sdk-bootstrap.git#f718dea60a9d9bb8b8682fd852ad793912f3c5db"
@@ -144,7 +153,7 @@ target "nitro-enclaves-bootstrap" {
 }
 
 target "tempo-zone-prover-eif-builder" {
-  dockerfile = "docker/Dockerfile.prover-eif-builder"
+  dockerfile = "zones/docker/Dockerfile.prover-eif-builder"
   context = "."
   contexts = {
     nitro-bootstrap = "target:nitro-enclaves-bootstrap"
@@ -156,7 +165,7 @@ target "tempo-zone-prover-eif-builder" {
 # built because Nitro CLI requires access to a local Docker image store.
 target "tempo-zone-prover" {
   inherits = ["docker-metadata"]
-  dockerfile = "docker/Dockerfile.prover-host"
+  dockerfile = "zones/docker/Dockerfile.prover-host"
   context = "."
   contexts = {
     prover-eif = "${PROVER_EIF_CONTEXT}"
@@ -169,10 +178,16 @@ target "tempo-zone-xtask" {
   target = "tempo-zone-xtask"
 }
 
-# Compile without genesis or exporting the large builder filesystem. The final
-# enclave target reuses this exact stage after the devnet genesis is available.
+# Export the canonical executable before the deferred genesis is available.
 target "tempo-zone-prover-compiled" {
-  inherits = ["tempo-zone-prover-enclave"]
-  target = "builder"
+  dockerfile = "zones/docker/Dockerfile.reproducible"
+  context = "."
+  target = "prover-artifacts"
+  args = {
+    SOURCE_DATE_EPOCH = "${SOURCE_DATE_EPOCH}"
+    GIT_SHA = "${GIT_SHA}"
+    VERSION = "${VERSION}"
+  }
+  platforms = ["linux/amd64"]
   output = ["type=cacheonly"]
 }

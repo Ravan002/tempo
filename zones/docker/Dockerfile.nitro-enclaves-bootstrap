@@ -10,8 +10,8 @@ ARG TARGET=all
 COPY --from=nitro-bootstrap-source / /build/
 # Keep AWS's pinned kernel expression as the source of truth and apply only the reviewed Zones
 # hardening delta. git apply fails if the pinned source no longer matches the patch.
-COPY docker/nitro/kernel.patch /tmp/kernel.patch
-COPY docker/nitro/zones-hardening-x86_64.config /build/kernel/zones-hardening-x86_64.config
+COPY zones/docker/nitro/kernel.patch /tmp/kernel.patch
+COPY zones/docker/nitro/zones-hardening-x86_64.config /build/kernel/zones-hardening-x86_64.config
 
 WORKDIR /build
 RUN git apply /tmp/kernel.patch
