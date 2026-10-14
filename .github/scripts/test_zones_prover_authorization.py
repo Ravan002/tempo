@@ -1,4 +1,4 @@
-"""Run with uv run --with pyyaml python -m unittest discover -s .github/tests."""
+"""Run with uv run --with pyyaml python -m unittest discover -s .github/scripts -p 'test_zones_*.py'."""
 
 import json
 from pathlib import Path

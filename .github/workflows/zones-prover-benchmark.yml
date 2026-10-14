@@ -63,6 +63,7 @@ jobs:
   authorize:
     if: >-
       github.repository == 'tempoxyz/tempo' &&
+      vars.ZONES_PROVER_BENCHMARK_ENABLED == 'true' &&
       github.ref == 'refs/heads/main' &&
       (github.event_name == 'workflow_dispatch' ||
        (github.event_name == 'issue_comment' && github.event.issue.pull_request &&
