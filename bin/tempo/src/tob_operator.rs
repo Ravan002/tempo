@@ -65,8 +65,8 @@ struct Args {
     #[arg(long = "validator")]
     validators: Vec<String>,
     /// JSON-RPC endpoints of the validators, in the order of `--validator`.
-    /// A single endpoint serves every validator; it must allow
-    /// `debug_chainConfig`.
+    /// A single endpoint serves every validator. Chains without a built-in
+    /// chainspec need `debug_chainConfig`.
     #[arg(long = "rpc")]
     rpcs: Vec<String>,
     /// Number of makers streaming quotes.
@@ -342,14 +342,35 @@ async fn run(
         .map(|url| Ok(ProviderBuilder::default().connect_http(url.parse()?)))
         .collect::<eyre::Result<_>>()?;
     let chain_id = retry(|| providers[0].get_chain_id()).await;
-    let config: serde_json::Value =
-        retry(|| providers[0].raw_request("debug_chainConfig".into(), ())).await;
-    let election = Arc::new(Election {
-        epoch_length: config["epochLength"]
-            .as_u64()
-            .ok_or_else(|| eyre::eyre!("debug_chainConfig has no epochLength"))?,
-        t12_time: config["t12Time"].as_u64(),
-    });
+    // Known chains carry their epoch length and T12 activation in the built-in
+    // chainspec; others (generated devnets) need `debug_chainConfig`.
+    let election = Arc::new(
+        match tempo_chainspec::spec::chainspec_from_chain_id(chain_id) {
+            Some(spec) => {
+                use tempo_chainspec::TempoHardforks as _;
+                Election {
+                    epoch_length: spec
+                        .info
+                        .epoch_length()
+                        .ok_or_else(|| eyre::eyre!("chainspec has no epoch length"))?
+                        .get(),
+                    t12_time: spec
+                        .tempo_fork_activation(tempo_chainspec::TempoHardfork::T12)
+                        .as_timestamp(),
+                }
+            }
+            None => {
+                let config: serde_json::Value =
+                    retry(|| providers[0].raw_request("debug_chainConfig".into(), ())).await;
+                Election {
+                    epoch_length: config["epochLength"]
+                        .as_u64()
+                        .ok_or_else(|| eyre::eyre!("debug_chainConfig has no epochLength"))?,
+                    t12_time: config["t12Time"].as_u64(),
+                }
+            }
+        },
+    );
     let gas_price = retry(|| providers[0].get_gas_price()).await;
     let mut resolved = Vec::with_capacity(validators.len());
     for ((key, address), provider) in validators.into_iter().zip(&providers) {
