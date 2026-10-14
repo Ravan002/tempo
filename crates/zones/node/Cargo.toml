@@ -19,8 +19,7 @@ tempo-precompiles.workspace = true
 tempo-primitives.workspace = true
 tempo-transaction-pool.workspace = true
 tempo-alloy.workspace = true
-tempo-contracts.workspace = true
-tempo-zone-contracts = { workspace = true, features = ["rpc", "serde", "std"] }
+tempo-contracts = { workspace = true, features = ["std", "serde", "rpc"] }
 tempo-state-bloat = { workspace = true, optional = true }
 zone-chainspec.workspace = true
 zone-evm.workspace = true
@@ -175,10 +174,10 @@ keccak-cache-global = [
   "zone-node/keccak-cache-global",
 ]
 test-utils = [
-  "reth-chainspec/test-utils",
   "reth-db-api?/test-utils",
   "reth-trie?/test-utils",
   "reth-trie-db?/test-utils",
+  "reth-chainspec/test-utils",
   "reth-ethereum?/test-utils",
   "reth-node-builder/test-utils",
   "reth-payload-builder/test-utils",
