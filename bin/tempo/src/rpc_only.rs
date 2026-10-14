@@ -3,7 +3,7 @@
 //! This command is reusable by wrappers and development tools. It runs the binary's ordinary EVM
 //! and RPC implementation without consensus, networking, or a transaction pool.
 
-use alloy_primitives::U256;
+use alloy_primitives::{U64, U256};
 use clap::Parser;
 use eyre::{Context, ensure};
 use reth_chainspec::EthChainSpec as _;
@@ -32,13 +32,16 @@ use reth_rpc_server_types::constants::DEFAULT_HTTP_RPC_PORT;
 use std::{net::SocketAddr, path::PathBuf};
 use tempo_chainspec::spec::TempoChainSpecParser;
 use tempo_evm::{TempoEvmConfig, consensus::TempoConsensus};
+use tempo_metabinary::handshake::{
+    EXECUTION_INFO_METHOD, EXECUTION_INFO_PROTOCOL_VERSION, ExecutionInfo,
+};
 use tempo_node::{
     TempoPooledTransaction,
     node::TempoNode,
     rpc::{
         TempoEthApi, TempoEthExt, TempoEthExtApiServer, TempoForkScheduleApiServer,
         TempoForkScheduleRpc, TempoReceiptConverter, TempoSimulate, TempoSimulateApiServer,
-        TempoToken, TempoTokenApiServer, execution_info::install_execution_info,
+        TempoToken, TempoTokenApiServer,
     },
 };
 use tracing::info;
@@ -162,8 +165,8 @@ impl RpcOnly {
         modules.merge_http(TempoForkScheduleRpc::new(provider).into_rpc())?;
         modules.merge_http(eth_config.into_rpc())?;
 
-        // Subscriptions and transaction submission require live node components. Do not advertise
-        // or register these callbacks on the private read-only worker.
+        // Subscriptions and transaction submission require live node components. Do not register
+        // these callbacks on the private read-only worker.
         modules.remove_http_methods([
             "eth_subscribe",
             "eth_unsubscribe",
@@ -184,12 +187,17 @@ impl RpcOnly {
             "debug_standardTraceBadBlockToFile",
             "debug_standardTraceBlockToFile",
         ]);
-        install_execution_info(
-            &mut modules,
-            chain_spec.chain_id(),
-            chain_spec.genesis_hash(),
-            true,
-        )?;
+        let mut execution_info = jsonrpsee::RpcModule::new(ExecutionInfo {
+            protocol_version: EXECUTION_INFO_PROTOCOL_VERSION,
+            chain_id: U64::from(chain_spec.chain_id()),
+            genesis_hash: chain_spec.genesis_hash(),
+            read_only: true,
+            process_id: std::process::id(),
+        });
+        execution_info.register_method(EXECUTION_INFO_METHOD, |_, info, _| {
+            Ok::<_, jsonrpsee::types::ErrorObjectOwned>(info.clone())
+        })?;
+        modules.merge_http(execution_info)?;
 
         // This transport is private. The ordinary node's existing public servers enforce the
         // operator's request, response, and batch limits after routing; avoid imposing a second,
@@ -216,7 +224,6 @@ mod tests {
     use jsonrpsee::{core::client::ClientT, rpc_params};
     use serde_json::{Value, json};
     use tempo_metabinary::handshake::WorkerIdentity;
-    use tempo_node::rpc::execution_info::{EXECUTION_INFO_METHOD, ExecutionInfo};
 
     fn command(datadir: &std::path::Path) -> RpcOnly {
         RpcOnly::parse_from([
@@ -285,23 +292,10 @@ mod tests {
                     WorkerIdentity {
                         chain_id: U64::from(chain.chain_id()),
                         genesis_hash: chain.genesis_hash(),
-                        read_only: true,
                     },
                     std::process::id(),
                 )
                 .unwrap();
-                for method in [
-                    "eth_call",
-                    "debug_traceCall",
-                    "trace_block",
-                    "tempo_simulateV1",
-                ] {
-                    assert!(
-                        info.methods.iter().any(|name| name == method),
-                        "missing {method}"
-                    );
-                }
-                assert!(!info.methods.iter().any(|name| name.starts_with("eth_send")));
                 assert_eq!(
                     client
                         .request::<String, _>("eth_blockNumber", rpc_params![])

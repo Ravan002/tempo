@@ -14,10 +14,9 @@ use tokio::time::Instant;
 /// Private discovery method and wire protocol shared by workers and their launchers.
 pub const EXECUTION_INFO_METHOD: &str = "tempo_executionInfo";
 pub const EXECUTION_INFO_PROTOCOL_VERSION: u32 = 1;
-pub(crate) const MAX_RPC_METHODS: usize = 1024;
-pub(crate) const MAX_RPC_METHOD_NAME_LEN: usize = 256;
 
-/// The actual private transport's registered methods, not a global RPC catalogue.
+/// A private read-only worker's identity. Unsupported methods surface as JSON-RPC
+/// method-not-found errors when forwarded.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ExecutionInfo {
@@ -27,8 +26,6 @@ pub struct ExecutionInfo {
     pub read_only: bool,
     /// Detects another process on the worker's port.
     pub process_id: u32,
-    /// Only these methods are forwarded.
-    pub methods: Vec<String>,
 }
 
 impl ExecutionInfo {
@@ -46,34 +43,20 @@ impl ExecutionInfo {
             self.genesis_hash == identity.genesis_hash,
             "worker genesis mismatch"
         );
-        ensure!(
-            self.read_only == identity.read_only,
-            "worker read-only mode mismatch"
-        );
+        ensure!(self.read_only, "worker is not read-only");
         ensure!(
             self.process_id == process_id,
             "private endpoint belongs to another process"
-        );
-        ensure!(
-            self.methods.len() <= MAX_RPC_METHODS,
-            "worker reports too many RPC methods"
-        );
-        ensure!(
-            self.methods
-                .iter()
-                .all(|method| method.len() <= MAX_RPC_METHOD_NAME_LEN),
-            "worker method name too long"
         );
         Ok(())
     }
 }
 
-/// Expected chain and access mode for a supervised worker.
+/// Expected chain for a supervised worker.
 #[derive(Clone, Copy)]
 pub struct WorkerIdentity {
     pub chain_id: U64,
     pub genesis_hash: B256,
-    pub read_only: bool,
 }
 
 /// Retry transport failures until the original startup deadline, checking child ownership each time.
@@ -84,7 +67,7 @@ pub async fn wait_for_worker(
     process_id: u32,
     deadline: Instant,
     mut check_alive: impl FnMut() -> Result<()>,
-) -> Result<ExecutionInfo> {
+) -> Result<()> {
     loop {
         check_alive()?;
         ensure!(Instant::now() < deadline, "worker startup timed out");
@@ -94,10 +77,7 @@ pub async fn wait_for_worker(
         )
         .await;
         match response {
-            Ok(Ok(info)) => {
-                info.validate(identity, process_id)?;
-                return Ok(info);
-            }
+            Ok(Ok(info)) => return info.validate(identity, process_id),
             Ok(Err(ClientError::Call(error))) if error.code() == METHOD_NOT_FOUND_CODE => {
                 bail!(
                     "executable lacks {EXECUTION_INFO_METHOD}; it needs the private RPC worker protocol"

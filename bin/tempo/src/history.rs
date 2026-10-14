@@ -38,7 +38,7 @@ pub(crate) fn prepare(cli: &TempoCli) -> Result<ControlFlow<(), bool>> {
     if schedule.eras.iter().all(|era| era.checkpoint.is_none()) {
         return Ok(ControlFlow::Continue(false));
     }
-    let [era, _] = schedule.eras.as_slice() else {
+    let [era] = schedule.eras.as_slice() else {
         bail!("network handoff requires one frozen era");
     };
     let checkpoint = era
@@ -61,10 +61,10 @@ pub(crate) fn prepare(cli: &TempoCli) -> Result<ControlFlow<(), bool>> {
         return Ok(ControlFlow::Continue(finalized <= checkpoint.number));
     }
     runner.block_on(async {
-        eprintln!("Syncing {} through block {}", era.name, checkpoint.number);
-        let status = run_child(
+        eprintln!("Syncing {era} through block {}", checkpoint.number);
+        if run_child(
             "historical sync",
-            Command::new(era.binary.as_ref().expect("validated frozen executable"))
+            Command::new(&era.binary)
                 .args(frozen_args(std::env::args_os().skip(1)))
                 .env_remove("TEMPO_FOLLOW")
                 .arg("--history-sync")
@@ -72,11 +72,11 @@ pub(crate) fn prepare(cli: &TempoCli) -> Result<ControlFlow<(), bool>> {
                 .arg(format!("--debug.max-block={}", checkpoint.number))
                 .arg("--debug.terminate"),
         )
-        .await?;
-        let Some(status) = status else {
+        .await?
+        .is_break()
+        {
             return Ok(ControlFlow::Break(()));
-        };
-        ensure!(status.success(), "historical sync exited with {status}");
+        }
         let (head, finalized) = durable_progress(&environment, runner.runtime(), checkpoint)?
             .ok_or_eyre("historical sync did not initialize storage")?;
         ensure!(

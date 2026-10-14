@@ -1,14 +1,12 @@
 //! Ordered binaries and bounded imports for bootstrapping shared execution storage.
 
+use crate::catalog::{FrozenEra, era_boundaries};
 use alloy_primitives::{B256, U64};
-use eyre::{Context, Result, ensure};
+use eyre::{Context, OptionExt, Result, ensure};
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::HashSet,
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
-/// Ordered era executables and bounded imports for a chain's shared storage.
+/// Ordered frozen era executables and bounded imports for a chain's shared storage.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
@@ -19,7 +17,8 @@ pub struct Manifest {
     /// Expected identity, checked against each era's storage before advancing.
     pub chain_id: U64,
     pub genesis_hash: B256,
-    pub eras: Vec<Era>,
+    /// Frozen eras in activation order. The live era is started afterwards with `tempo node`.
+    pub eras: Vec<Bootstrap>,
 }
 
 impl Manifest {
@@ -33,8 +32,8 @@ impl Manifest {
         manifest.validate()?;
         let parent = path.canonicalize()?.with_file_name("");
         resolve_path(&parent, &mut manifest.datadir);
-        for era in &mut manifest.eras {
-            resolve_path(&parent, &mut era.binary);
+        for bootstrap in &mut manifest.eras {
+            resolve_path(&parent, &mut bootstrap.era.binary);
         }
         // Built-in names have no path separator. Explicit spec paths are manifest-relative.
         if manifest.chain.contains(std::path::MAIN_SEPARATOR) || manifest.chain.ends_with(".json") {
@@ -51,66 +50,42 @@ impl Manifest {
             !self.datadir.as_os_str().is_empty(),
             "datadir must not be empty"
         );
-        validate_schedule(
-            self.eras
-                .iter()
-                .map(|era| (era.name.as_str(), era.start_timestamp)),
-        )?;
+        ensure!(!self.eras.is_empty(), "manifest needs a frozen era");
+        self.boundaries()?;
         let mut previous_checkpoint = None;
-        for (index, era) in self.eras.iter().enumerate() {
-            ensure!(
-                !era.binary.as_os_str().is_empty(),
-                "era {} has no binary",
-                era.name
-            );
-            let Some(bootstrap) = &era.bootstrap else {
-                ensure!(
-                    index + 1 == self.eras.len(),
-                    "era {} needs a bootstrap command/checkpoint",
-                    era.name
-                );
-                continue;
-            };
-            ensure!(
-                index + 1 < self.eras.len(),
-                "active era must be started with tempo node, not bootstrap"
-            );
+        for bootstrap in &self.eras {
+            let era = &bootstrap.era;
+            let checkpoint = era
+                .checkpoint
+                .ok_or_eyre(format!("era {era} needs a bootstrap checkpoint"))?;
             bootstrap
                 .validate()
-                .wrap_err_with(|| format!("invalid bootstrap for {}", era.name))?;
+                .wrap_err_with(|| format!("invalid bootstrap for {era}"))?;
             ensure!(
-                previous_checkpoint
-                    .is_none_or(|previous| previous < bootstrap.terminal_block_number),
-                "bootstrap terminal block numbers must strictly increase"
+                previous_checkpoint.is_none_or(|previous| previous < checkpoint.number),
+                "bootstrap checkpoint numbers must strictly increase"
             );
-            previous_checkpoint = Some(bootstrap.terminal_block_number);
+            previous_checkpoint = Some(checkpoint.number);
         }
         Ok(())
     }
+
+    /// Each era's exclusive end timestamp, from its `until` hardfork activation.
+    pub fn boundaries(&self) -> Result<Vec<u64>> {
+        era_boundaries(
+            self.chain_id,
+            self.eras.iter().map(|bootstrap| &bootstrap.era),
+        )
+    }
 }
 
-/// An era's executable, activation timestamp, and optional bootstrap plan.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct Era {
-    pub name: String,
-    /// Inclusive activation timestamp; the next era's activation is the exclusive end.
-    pub start_timestamp: u64,
-    pub binary: PathBuf,
-    /// Optional sequential genesis bootstrap from canonical block files.
-    #[serde(default)]
-    pub bootstrap: Option<Bootstrap>,
-}
-
-/// A finite import command and the canonical checkpoint it must reach.
+/// A frozen era and the finite import command that must reach its required checkpoint.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Bootstrap {
+    pub era: FrozenEra,
     /// Starts with `import`. The wrapper adds shared storage and validation flags.
     pub args: Vec<String>,
-    /// Operator-pinned last canonical block owned by this era.
-    pub terminal_block_number: u64,
-    pub terminal_block_hash: B256,
 }
 
 impl Bootstrap {
@@ -139,24 +114,6 @@ impl Bootstrap {
     }
 }
 
-pub(crate) fn validate_schedule<'a>(eras: impl IntoIterator<Item = (&'a str, u64)>) -> Result<()> {
-    let mut names = HashSet::new();
-    let mut previous = None;
-    for (name, timestamp) in eras {
-        ensure!(
-            !name.trim().is_empty() && names.insert(name),
-            "era names must be unique and nonempty"
-        );
-        ensure!(
-            previous.map_or(timestamp == 0, |start| start < timestamp),
-            "era activations must start at zero and strictly increase"
-        );
-        previous = Some(timestamp);
-    }
-    ensure!(previous.is_some(), "schedule needs at least one era");
-    Ok(())
-}
-
 pub(crate) fn resolve_path(parent: &Path, path: &mut PathBuf) {
     if path.is_relative() {
         *path = parent.join(&*path);
@@ -168,20 +125,28 @@ pub(crate) mod tests {
     use super::*;
 
     pub(crate) fn manifest() -> Manifest {
-        let mut manifest: Manifest =
-            serde_json::from_str(include_str!("../examples/eras-manifest.json")).unwrap();
-        manifest.eras[1].start_timestamp = 100;
-        manifest
+        serde_json::from_str(include_str!("../examples/eras-manifest.json")).unwrap()
     }
 
     #[test]
     fn rejects_invalid_eras_and_bootstrap_options() {
         let mut manifest = manifest();
-        for (era, timestamp) in [(0, 1), (1, 0)] {
-            let mut invalid = manifest.clone();
-            invalid.eras[era].start_timestamp = timestamp;
-            assert!(invalid.validate().is_err());
-        }
+        let error = |manifest: &Manifest| manifest.validate().unwrap_err().to_string();
+        let mut invalid = manifest.clone();
+        invalid.eras.clear();
+        assert_eq!(error(&invalid), "manifest needs a frozen era");
+        invalid.eras.push(manifest.eras[0].clone());
+        invalid.eras[0].era.checkpoint = None;
+        assert_eq!(error(&invalid), "era pre-T11 needs a bootstrap checkpoint");
+        let mut invalid = manifest.clone();
+        invalid.eras.insert(0, manifest.eras[0].clone());
+        invalid.eras[0].era.until = tempo_hardfork::TempoHardfork::T10;
+        assert_eq!(
+            error(&invalid),
+            "bootstrap checkpoint numbers must strictly increase"
+        );
+        invalid.eras[0].era.checkpoint.as_mut().unwrap().number -= 1;
+        invalid.validate().unwrap();
         for args in [
             "node",
             "import --chain=other blocks.rlp",
@@ -194,19 +159,16 @@ pub(crate) mod tests {
             "import --debug.max-block=42 blocks.rlp",
             "import --fail-on-invalid-block=false blocks.rlp",
         ] {
-            manifest.eras[0].bootstrap.as_mut().unwrap().args =
-                args.split_whitespace().map(str::to_owned).collect();
+            manifest.eras[0].args = args.split_whitespace().map(str::to_owned).collect();
             assert!(manifest.validate().is_err(), "accepted {args}");
         }
-        manifest.eras[0].bootstrap.as_mut().unwrap().args = vec![
+        manifest.eras[0].args = vec![
             "import".into(),
             "--chunk-len=67108864".into(),
             "--db.max-size=8TB".into(),
             "blocks.rlp".into(),
         ];
         manifest.validate().unwrap();
-        manifest.eras[0].bootstrap = None;
-        assert!(manifest.validate().is_err());
         let value = serde_json::to_value(&manifest).unwrap();
         for (field, malformed) in [
             ("chain_id", "0x10000000000000000"),
@@ -224,13 +186,13 @@ pub(crate) mod tests {
         let mut manifest = manifest();
         manifest.datadir = "data".into();
         manifest.chain = "./chain.json".into();
-        manifest.eras[0].binary = "frozen".into();
+        manifest.eras[0].era.binary = "frozen".into();
         let path = temp.path().join("eras.json");
         std::fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
         let loaded = Manifest::load(path).unwrap();
         let directory = temp.path().canonicalize().unwrap();
         assert_eq!(loaded.datadir, directory.join("data"));
-        assert_eq!(loaded.eras[0].binary, directory.join("frozen"));
+        assert_eq!(loaded.eras[0].era.binary, directory.join("frozen"));
         assert_eq!(PathBuf::from(loaded.chain), directory.join("./chain.json"));
     }
 }

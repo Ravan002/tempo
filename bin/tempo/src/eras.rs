@@ -54,17 +54,19 @@ pub(crate) fn release_schedule(chain: &TempoChainSpec) -> eyre::Result<Option<Ch
         return Ok(None);
     }
     Ok(release_catalog()?
-        .for_chain(chain.chain_id(), chain.genesis_hash())
-        .filter(|schedule| schedule.eras.len() > 1)
+        .for_chain(chain.chain_id())
+        .filter(|schedule| !schedule.eras.is_empty())
         .cloned())
 }
 
 /// A custom genesis can keep a built-in chain's block hash while changing its fork schedule.
-/// Only apply packaged eras when the runtime rules still match the release's built-in rules.
+/// Only apply packaged eras when the runtime chain and rules match a built-in network, whose
+/// activations are the `tempo-hardfork` constants that define era boundaries.
 pub(crate) fn supports_release_catalog(spec: &TempoChainSpec) -> bool {
-    use tempo_chainspec::spec::{DEV, MODERATO, PRESTO};
-    [&**PRESTO, &**MODERATO, &**DEV].into_iter().any(|known| {
+    use tempo_chainspec::spec::{MODERATO, PRESTO};
+    [&**PRESTO, &**MODERATO].into_iter().any(|known| {
         spec.chain_id() == known.chain_id()
+            && spec.genesis_hash() == known.genesis_hash()
             && spec.genesis().config == known.genesis().config
             && spec.inner.hardforks == known.inner.hardforks
             && spec.info == known.info
@@ -73,7 +75,8 @@ pub(crate) fn supports_release_catalog(spec: &TempoChainSpec) -> bool {
 
 /// Installs era routing on native RPC transports and owns the historical workers' configuration.
 pub(crate) struct EraRuntime {
-    schedule: ChainEras,
+    chain_id: u64,
+    boundaries: Vec<u64>,
     workers: Arc<HistoricalWorkers>,
     // Frozen releases parse exactly the live chain's genesis, including custom fork schedules.
     _chain_file: tempfile::NamedTempFile,
@@ -89,7 +92,7 @@ impl EraRuntime {
         rocksdb_path: Option<std::path::PathBuf>,
         rpc_config: EthConfig,
     ) -> eyre::Result<Arc<Self>> {
-        schedule.validate()?;
+        let boundaries = schedule.boundaries()?;
         let mut chain_file = tempfile::Builder::new().suffix(".json").tempfile()?;
         serde_json::to_writer(chain_file.as_file_mut(), chain.genesis())?;
         let mut rpc_config_file = tempfile::NamedTempFile::new()?;
@@ -105,10 +108,11 @@ impl EraRuntime {
                 genesis_hash: chain.genesis_hash(),
                 startup_timeout: Duration::from_secs(DEFAULT_STARTUP_TIMEOUT_SECS),
             },
-            schedule.eras[..schedule.eras.len() - 1].to_vec(),
+            schedule.eras,
         )?;
         Ok(Arc::new(Self {
-            schedule,
+            chain_id: chain.chain_id(),
+            boundaries,
             workers,
             _chain_file: chain_file,
             _rpc_config_file: rpc_config_file,
@@ -121,12 +125,13 @@ impl EraRuntime {
         eth_api: E,
     ) -> eyre::Result<()> {
         let router = Arc::new(Router::new(
-            self.schedule.clone(),
+            self.chain_id,
+            self.boundaries.clone(),
             Arc::new(NativeBackend {
                 eth_api,
                 runtime: self.clone(),
             }),
-        )?);
+        ));
         // Replace callbacks in-place, retaining the existing server configuration and transports.
         if let Some(methods) = modules.http_methods(|_| true) {
             modules.replace_http(decorate(methods, router.clone())?)?;
@@ -256,6 +261,14 @@ mod tests {
         let custom = TempoChainSpec::from_genesis(genesis);
         assert_eq!(custom.genesis_hash(), known.genesis_hash());
         assert!(!supports_release_catalog(&custom));
+
+        let mut genesis = known.genesis().clone();
+        genesis.timestamp += 1;
+        let custom = TempoChainSpec::from_genesis(genesis);
+        assert_ne!(custom.genesis_hash(), known.genesis_hash());
+        assert!(!supports_release_catalog(&custom));
+        // Dev activations are not hardfork constants, so it has no era boundaries.
+        assert!(!supports_release_catalog(&tempo_chainspec::spec::DEV));
     }
 
     #[test]

@@ -6,10 +6,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
 };
-use tempo_metabinary::{
-    handshake::EXECUTION_INFO_METHOD,
-    routing::{Backend, BlockMetadata, Router, RpcParams, is_execution_method},
-};
+use tempo_metabinary::routing::{Backend, BlockMetadata, Router, RpcParams, is_execution_method};
 
 struct Fixture {
     router: Router,
@@ -22,20 +19,8 @@ impl Fixture {
             live: count - 1,
             resolutions: AtomicUsize::new(0),
         });
-        let eras: Vec<_> = (0..count)
-            .map(|index| {
-                json!({
-                    "name":format!("era{index}"), "start_timestamp":index * 100,
-                    "binary":if index + 1 == count { None } else { Some("/unused/frozen") }
-                })
-            })
-            .collect();
-        let router = Router::new(
-            serde_json::from_value(json!({"chain_id":"0x1", "genesis_hash":hash(0), "eras":eras}))
-                .unwrap(),
-            backend.clone(),
-        )
-        .unwrap();
+        let boundaries = (1..count as u64).map(|era| era * 100).collect();
+        let router = Router::new(1, boundaries, backend.clone());
         Self { router, backend }
     }
 
@@ -190,7 +175,6 @@ async fn optional_execution_methods_cannot_bypass_era_policy() {
         "reth_getBalanceChangesInBlock",
         "ots_hasCode",
         "ots_getBlockDetails",
-        EXECUTION_INFO_METHOD,
         "eth_sendRawTransactionConditional",
     ] {
         assert!(!is_execution_method(method), "{method}");

@@ -1,23 +1,19 @@
 {
-  "chain": "./chain.json",
+  "chain": "mainnet",
   "datadir": "./data",
-  "chain_id": "0x539",
+  "chain_id": "0x1079",
   "genesis_hash": "0x0000000000000000000000000000000000000000000000000000000000000000",
   "eras": [
     {
-      "name": "genesis-to-t10",
-      "start_timestamp": 0,
-      "binary": "./tempo-frozen",
-      "bootstrap": {
-        "args": ["import", "/absolute/path/to/genesis-through-era-boundary.rlp"],
-        "terminal_block_number": 100,
-        "terminal_block_hash": "0x1111111111111111111111111111111111111111111111111111111111111111"
-      }
-    },
-    {
-      "name": "t11-live",
-      "start_timestamp": 1800000000,
-      "binary": "./tempo-live"
+      "era": {
+        "until": "T11",
+        "binary": "./tempo-frozen",
+        "checkpoint": {
+          "number": 100,
+          "hash": "0x1111111111111111111111111111111111111111111111111111111111111111"
+        }
+      },
+      "args": ["import", "/absolute/path/to/genesis-through-era-boundary.rlp"]
     }
   ]
 }

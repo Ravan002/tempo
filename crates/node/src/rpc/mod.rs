@@ -2,7 +2,6 @@ pub mod admin;
 pub mod consensus;
 pub mod error;
 pub mod eth_ext;
-pub mod execution_info;
 pub mod fork_schedule;
 pub mod operator;
 pub mod simulate;

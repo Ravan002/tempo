@@ -20,6 +20,7 @@ jsonrpsee.workspace = true
 libc = "0.2"
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
+tempo-hardfork = { workspace = true, features = ["std", "serde"] }
 tokio.workspace = true
 tokio-util = { workspace = true, features = ["rt"] }
 tracing.workspace = true

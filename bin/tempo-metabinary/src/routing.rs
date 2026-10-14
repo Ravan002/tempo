@@ -2,7 +2,6 @@
 //!
 //! `pending` stays live, cross-era requests fail with `-32004`, and unclassified methods fail.
 
-use crate::{catalog::ChainEras, handshake::EXECUTION_INFO_METHOD};
 use alloy_primitives::{B256, U64};
 use futures::future::BoxFuture;
 use jsonrpsee::{
@@ -23,21 +22,27 @@ const MAX_EXECUTION_OUTCOME_BLOCKS: u64 = 128;
 
 /// Resolve identifiers through the live node. Frozen workers receive pinned historical IDs.
 pub struct Router {
-    schedule: ChainEras,
+    chain_id: u64,
+    /// Strictly increasing exclusive end timestamps of the frozen eras, from
+    /// [`crate::catalog::ChainEras::boundaries`].
+    boundaries: Vec<u64>,
     pub(crate) backend: Arc<dyn Backend>,
 }
 
 impl Router {
-    pub fn new(schedule: ChainEras, backend: Arc<dyn Backend>) -> eyre::Result<Self> {
-        schedule.validate()?;
-        Ok(Self { schedule, backend })
+    pub fn new(chain_id: u64, boundaries: Vec<u64>, backend: Arc<dyn Backend>) -> Self {
+        Self {
+            chain_id,
+            boundaries,
+            backend,
+        }
     }
 
     pub fn live_index(&self) -> usize {
-        self.schedule.eras.len() - 1
+        self.boundaries.len()
     }
     fn era(&self, timestamp: u64) -> usize {
-        self.schedule.era_for_timestamp(timestamp)
+        self.boundaries.partition_point(|end| *end <= timestamp)
     }
 
     pub async fn route(&self, method: &str, mut params: RpcParams) -> RpcResult<Route> {
@@ -368,8 +373,7 @@ impl Router {
             return Ok(era);
         }
         let base = self.backend.block(&selector).await?;
-        let chain_id = self.schedule.chain_id.to::<u64>();
-        let step = alloy_chains::Chain::from(chain_id)
+        let step = alloy_chains::Chain::from(self.chain_id)
             .average_blocktime_hint()
             .map(|d| d.as_secs().saturating_add(u64::from(d.subsec_nanos() > 0)))
             .filter(|s| *s > 0)
@@ -708,7 +712,6 @@ fn policy(method: &str) -> Policy {
         | "token_getTokensByAddress"
         | "tempo_fundAddress"
         | "tempo_forkSchedule"
-        | EXECUTION_INFO_METHOD
         | "debug_getRawHeader"
         | "debug_getRawBlock"
         | "debug_getRawTransaction"

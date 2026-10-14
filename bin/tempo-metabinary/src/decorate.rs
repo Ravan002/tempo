@@ -199,19 +199,11 @@ mod tests {
         timestamp: RpcResult<u64>,
         response: Option<RpcResult<Box<RawValue>>>,
     ) -> Arc<Router> {
-        let schedule = serde_json::from_value(json!({
-            "chain_id":"0x1", "genesis_hash":format!("0x{}", "00".repeat(32)),
-            "eras":[
-                {"name":"old", "start_timestamp":0, "binary":"/unused/frozen"},
-                {"name":"live", "start_timestamp":100}
-            ]
-        }))
-        .unwrap();
         let backend = Arc::new(FakeBackend {
             timestamp,
             response,
         });
-        Arc::new(Router::new(schedule, backend).unwrap())
+        Arc::new(Router::new(1, vec![100], backend))
     }
 
     async fn invoke(methods: &Methods) -> MethodResponse {

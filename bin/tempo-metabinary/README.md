@@ -9,24 +9,25 @@ starts frozen read-only workers lazily for historical execution.
 ## Release configuration
 
 The release supplies `tempo-eras.json` beside the executable. Each catalog entry binds a chain ID
-and genesis hash to ordered eras:
+to its ordered frozen eras:
 
 ```json
 {"chains":[{
-  "chain_id":"0x1",
-  "genesis_hash":"0x1111111111111111111111111111111111111111111111111111111111111111",
+  "chain_id":"0x1079",
   "eras":[
-    {"name":"genesis-to-T10","start_timestamp":0,"binary":"eras/tempo-t10",
-     "checkpoint":{"number":1000000,"hash":"0x2222222222222222222222222222222222222222222222222222222222222222"}},
-    {"name":"T11-live","start_timestamp":2000000000}
+    {"until":"T11","binary":"eras/tempo-t10",
+     "checkpoint":{"number":1000000,"hash":"0x2222222222222222222222222222222222222222222222222222222222222222"}}
   ]
 }]}
 ```
 
-Closed eras name frozen executables, resolved relative to the catalog. The last (live) era uses
-the running node. A closed era's optional `checkpoint` pins its last canonical block. Network sync
-handoff and re-execution require it. The built-in development catalog (`bin/tempo/eras.json`) is
-empty. Unmatched chains and custom fork schedules use the native path.
+A frozen era executes blocks before its `until` hardfork. Its boundary is that fork's activation
+timestamp in `tempo-hardfork`'s constants, so only mainnet and moderato can have frozen eras, and
+`until` must be an already scheduled fork. Executables resolve relative to the catalog, and blocks
+after the last frozen era run in the live node. A frozen era's optional `checkpoint` pins its last
+canonical block. Network sync handoff requires it. The built-in development catalog
+(`bin/tempo/eras.json`) is empty. Unmatched chains, custom genesis, and custom fork schedules use
+the native path.
 
 Workers inherit the selected genesis, datadir, custom static-file/RocksDB paths, and resolved SDK
 `EthConfig` through private temporary files. Gas, simulation, memory, and tracing settings retain
@@ -77,14 +78,14 @@ tempo-metabinary --manifest /path/to/eras-manifest.json bootstrap
 ```
 
 Copy the [example manifest](examples/eras-manifest.json) and replace its illustrative identity,
-timestamps, executable paths, and checkpoints. Binary, datadir, and explicit chain-spec paths are
+`until` forks, executable paths, and checkpoints. Binary, datadir, and explicit chain-spec paths are
 manifest-relative. Paths inside import arguments should be absolute. Import commands share storage
 and run one at a time. Checkpoint inspection uses the same private read-only worker manager as the
 ordinary node, with an automatically selected loopback port. Partial startup failures clean up
 owned children.
 
-Each closed era's `bootstrap` supplies an ordinary `import` command and a trusted terminal block
-number/hash. Its file ends immediately before the successor's activation. The wrapper forces
+Each manifest entry pairs a frozen era, with a required trusted `checkpoint`, and the `args` of an
+ordinary `import` command. Its file ends immediately before the `until` fork's activation. The wrapper forces
 `--fail-on-invalid-block`, waits for import, opens a reader, and verifies the canonical checkpoint,
 era timestamp, and exact head. Subsequent imports verify the predecessor and first successor.
 No pipeline checkpoints or handoff markers are rewritten. An import failure may leave partial
@@ -112,13 +113,11 @@ an EVM.
 
 ## Re-execution
 
-With a release schedule, `tempo re-execute` splits its range at frozen-era checkpoints, not
-timestamps. Each frozen part runs as `<frozen binary> re-execute` with the operator's arguments and
+With a release schedule, `tempo re-execute` splits its range at the first local block of each
+`until` fork, found by searching local header timestamps. Each frozen part runs as `<frozen binary> re-execute` with the operator's arguments and
 only `--from`/`--to` replaced, one era at a time in block order. The live binary then re-executes
 the remainder. It does not run if nothing remains or a shutdown signal stopped a frozen child.
 
-- Every frozen era needs a `checkpoint`, otherwise `re-execute` fails, even for live-only ranges.
-- Checkpoints at or below the local head must be canonical. Higher ones are not checked.
 - Genesis is skipped, `--to` is clamped to the local head, and ranges exclude `--to`.
 - `TEMPO_RE_EXECUTE_ERA` marks frozen children so they never delegate again.
 

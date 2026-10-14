@@ -1,5 +1,6 @@
 //! Offline genesis import of canonical block files through frozen eras.
 
+use alloy_eips::BlockNumHash;
 use alloy_primitives::{B256, U64};
 use clap::{Parser, Subcommand};
 use eyre::{Context, OptionExt, Result, ensure};
@@ -7,8 +8,7 @@ use jsonrpsee::{core::client::ClientT, http_client::HttpClient};
 use serde::Deserialize;
 use std::{path::PathBuf, sync::Arc, time::Duration};
 use tempo_metabinary::{
-    catalog::ReleaseEra,
-    manifest::{Bootstrap, Manifest},
+    manifest::Manifest,
     process::{shutdown_children, shutdown_signal, spawn_bootstrap},
     workers::{DEFAULT_STARTUP_TIMEOUT_SECS, HistoricalWorkers, WorkerContext},
 };
@@ -73,9 +73,9 @@ struct Header {
     timestamp: U64,
 }
 
-async fn verify_successor(client: &HttpClient, checkpoint: &Bootstrap, start: u64) -> Result<()> {
+async fn verify_successor(client: &HttpClient, checkpoint: BlockNumHash, start: u64) -> Result<()> {
     let first_number = checkpoint
-        .terminal_block_number
+        .number
         .checked_add(1)
         .ok_or_eyre("terminal block number overflows")?;
     let first: Option<Header> = client
@@ -83,7 +83,7 @@ async fn verify_successor(client: &HttpClient, checkpoint: &Bootstrap, start: u6
         .await?;
     let first = first.ok_or_eyre("successor header is missing after bootstrap")?;
     ensure!(
-        first.parent_hash == checkpoint.terminal_block_hash,
+        first.parent_hash == checkpoint.hash,
         "successor does not extend the pinned handoff block"
     );
     ensure!(
@@ -95,7 +95,7 @@ async fn verify_successor(client: &HttpClient, checkpoint: &Bootstrap, start: u6
 
 async fn verify_checkpoint(
     client: &HttpClient,
-    checkpoint: &Bootstrap,
+    checkpoint: BlockNumHash,
     start: u64,
     end: u64,
     exact_head: bool,
@@ -103,16 +103,16 @@ async fn verify_checkpoint(
     let block: Option<Header> = client
         .request(
             "eth_getBlockByNumber",
-            (U64::from(checkpoint.terminal_block_number), false),
+            (U64::from(checkpoint.number), false),
         )
         .await?;
     let block = block.ok_or_eyre("bootstrap checkpoint is missing")?;
     ensure!(
-        block.number.to::<u64>() == checkpoint.terminal_block_number,
+        block.number.to::<u64>() == checkpoint.number,
         "bootstrap checkpoint is missing"
     );
     ensure!(
-        block.hash == checkpoint.terminal_block_hash,
+        block.hash == checkpoint.hash,
         "bootstrap canonical checkpoint hash mismatch"
     );
     ensure!(
@@ -147,62 +147,35 @@ async fn bootstrap(
         genesis_hash: manifest.genesis_hash,
         startup_timeout: timeout,
     };
-    for (index, eras) in manifest.eras.windows(2).enumerate() {
-        let era = &eras[0];
-        let checkpoint = era.bootstrap.as_ref().expect("validated bootstrap");
-        info!(
-            era = %era.name,
-            block = checkpoint.terminal_block_number,
-            "running bounded bootstrap"
-        );
+    let boundaries = manifest.boundaries()?;
+    // The previous era's checkpoint and start timestamp; this era starts where it ended.
+    let mut previous = None;
+    let mut start = 0;
+    for (bootstrap, &end) in manifest.eras.iter().zip(&boundaries) {
+        let era = &bootstrap.era;
+        let checkpoint = era.checkpoint.expect("validated checkpoint");
+        info!(%era, block = checkpoint.number, "running bounded bootstrap");
         let status = import
-            .insert(spawn_bootstrap(manifest, era, checkpoint)?)
+            .insert(spawn_bootstrap(manifest, bootstrap)?)
             .wait()
             .await
-            .wrap_err_with(|| format!("waiting for {} bootstrap", era.name))?;
+            .wrap_err_with(|| format!("waiting for {era} bootstrap"))?;
         // Clear only after reaping: cancellation retains ownership for shutdown.
         *import = None;
-        ensure!(
-            status.success(),
-            "{} bootstrap exited with {status}",
-            era.name
-        );
-        let workers = readers.insert(HistoricalWorkers::new(
-            context.clone(),
-            vec![ReleaseEra {
-                name: era.name.clone(),
-                start_timestamp: era.start_timestamp,
-                binary: Some(era.binary.clone()),
-                checkpoint: None,
-            }],
-        )?);
+        ensure!(status.success(), "{era} bootstrap exited with {status}");
+        let workers = readers.insert(HistoricalWorkers::new(context.clone(), vec![era.clone()])?);
         let worker = workers.get(0).await?;
-        verify_checkpoint(
-            &worker.client,
-            checkpoint,
-            era.start_timestamp,
-            eras[1].start_timestamp,
-            true,
-        )
-        .await
-        .wrap_err_with(|| format!("checking {} bootstrap", era.name))?;
-        if index > 0 {
-            let previous = manifest.eras[index - 1]
-                .bootstrap
-                .as_ref()
-                .expect("validated bootstrap");
-            verify_checkpoint(
-                &worker.client,
-                previous,
-                manifest.eras[index - 1].start_timestamp,
-                era.start_timestamp,
-                false,
-            )
-            .await?;
-            verify_successor(&worker.client, previous, era.start_timestamp).await?;
+        verify_checkpoint(&worker.client, checkpoint, start, end, true)
+            .await
+            .wrap_err_with(|| format!("checking {era} bootstrap"))?;
+        if let Some((previous, previous_start)) = previous {
+            verify_checkpoint(&worker.client, previous, previous_start, start, false).await?;
+            verify_successor(&worker.client, previous, start).await?;
         }
         workers.shutdown().await?;
         *readers = None;
+        previous = Some((checkpoint, start));
+        start = end;
     }
     info!("historical bootstrap complete; start the live era with tempo node");
     Ok(())
@@ -241,11 +214,7 @@ mod tests {
             .build(format!("http://{}", server.local_addr().unwrap()))
             .unwrap();
         let _server = server.start(module);
-        let checkpoint = Bootstrap {
-            args: vec![],
-            terminal_block_number: 2,
-            terminal_block_hash: hash(2).parse().unwrap(),
-        };
+        let checkpoint = BlockNumHash::new(2, hash(2).parse().unwrap());
         for (block, head, exact, valid) in [
             (Value::Null, Value::Null, true, false),
             (header(2, 99), header(2, 99), true, true),
@@ -255,7 +224,7 @@ mod tests {
             (header(2, 100), Value::Null, false, false),
         ] {
             *headers.lock().unwrap() = json!({"0x2": block, "latest": head});
-            let result = verify_checkpoint(&client, &checkpoint, 0, 100, exact).await;
+            let result = verify_checkpoint(&client, checkpoint, 0, 100, exact).await;
             assert_eq!(result.is_ok(), valid, "{result:?}");
         }
         let mut wrong_parent = header(3, 100);
@@ -267,7 +236,7 @@ mod tests {
             (header(3, 100), true),
         ] {
             headers.lock().unwrap()["0x3"] = block;
-            let result = verify_successor(&client, &checkpoint, 100).await;
+            let result = verify_successor(&client, checkpoint, 100).await;
             assert_eq!(result.is_ok(), valid, "{result:?}");
         }
     }

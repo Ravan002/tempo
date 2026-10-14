@@ -1,18 +1,16 @@
 //! Shared child ownership and cleanup for finite imports and private historical workers.
 
-use crate::manifest::{Bootstrap, Era, Manifest};
-use eyre::{Context, Result};
-use std::{
-    process::{ExitStatus, Stdio},
-    time::Duration,
-};
+use crate::manifest::{Bootstrap, Manifest};
+use eyre::{Context, Result, ensure};
+use std::{ops::ControlFlow, process::Stdio, time::Duration};
 use tokio::process::{Child, Command};
 
 const SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_secs(10);
 
 /// Start a canonical-file import from a validated manifest. The caller reaps this sole writer before opening a
 /// read-only checkpoint worker or starting another import; cancellation falls back to kill-on-drop.
-pub fn spawn_bootstrap(manifest: &Manifest, era: &Era, bootstrap: &Bootstrap) -> Result<Child> {
+pub fn spawn_bootstrap(manifest: &Manifest, bootstrap: &Bootstrap) -> Result<Child> {
+    let era = &bootstrap.era;
     spawn_child(
         Command::new(&era.binary)
             .args(&bootstrap.args)
@@ -20,13 +18,7 @@ pub fn spawn_bootstrap(manifest: &Manifest, era: &Era, bootstrap: &Bootstrap) ->
             .arg(&manifest.datadir)
             .arg("--fail-on-invalid-block"),
     )
-    .wrap_err_with(|| {
-        format!(
-            "starting {} bootstrap from {}",
-            era.name,
-            era.binary.display()
-        )
-    })
+    .wrap_err_with(|| format!("starting {era} bootstrap from {}", era.binary.display()))
 }
 
 /// Every supervised child uses the same I/O and cancellation fallback.
@@ -39,8 +31,9 @@ pub fn spawn_child(command: &mut Command) -> std::io::Result<Child> {
         .spawn()
 }
 
-/// Run a finite child to completion. A shutdown signal stops and reaps it instead, returning `None`.
-pub async fn run_child(name: &str, command: &mut Command) -> Result<Option<ExitStatus>> {
+/// Run a finite child to successful completion; an unsuccessful exit is an error. A shutdown signal
+/// stops and reaps it instead, returning `Break`.
+pub async fn run_child(name: &str, command: &mut Command) -> Result<ControlFlow<()>> {
     let mut child = spawn_child(command).wrap_err_with(|| format!("starting {name}"))?;
     let result = tokio::select! {
         status = child.wait() => status.map(Some).map_err(Into::into),
@@ -49,7 +42,11 @@ pub async fn run_child(name: &str, command: &mut Command) -> Result<Option<ExitS
     let shutdown = shutdown_children([(name, &mut child)]).await;
     let status = result?;
     shutdown?;
-    Ok(status)
+    let Some(status) = status else {
+        return Ok(ControlFlow::Break(()));
+    };
+    ensure!(status.success(), "{name} exited with {status}");
+    Ok(ControlFlow::Continue(()))
 }
 
 /// Wait for a node shutdown signal.
@@ -160,6 +157,18 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn finite_children_must_exit_successfully() {
+        let run = |script| async move {
+            run_child("test child", Command::new("/bin/sh").args(["-c", script])).await
+        };
+        assert_eq!(run("exit 0").await.unwrap(), ControlFlow::Continue(()));
+        assert_eq!(
+            run("exit 7").await.unwrap_err().to_string(),
+            "test child exited with exit status: 7"
+        );
+    }
+
+    #[tokio::test]
     async fn bootstrap_uses_same_storage_and_requires_block_validation() {
         let temp = tempfile::tempdir().unwrap();
         let binary = temp.path().join("tempo");
@@ -169,11 +178,9 @@ pub(crate) mod tests {
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
         let mut manifest = manifest();
         manifest.datadir = temp.path().join("data with spaces");
-        manifest.eras[0].binary = binary;
-        manifest.eras[0].bootstrap.as_mut().unwrap().args =
-            vec!["import".into(), "canonical-blocks.rlp".into()];
-        let era = &manifest.eras[0];
-        let mut child = spawn_bootstrap(&manifest, era, era.bootstrap.as_ref().unwrap()).unwrap();
+        manifest.eras[0].era.binary = binary;
+        manifest.eras[0].args = vec!["import".into(), "canonical-blocks.rlp".into()];
+        let mut child = spawn_bootstrap(&manifest, &manifest.eras[0]).unwrap();
         let pid = child.id().unwrap();
         assert!(child.wait().await.unwrap().success());
         let actual = std::fs::read_to_string(output).unwrap();

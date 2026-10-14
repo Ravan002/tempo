@@ -644,14 +644,6 @@ pub fn tempo_main_with(mut overrides: TempoOverrides) -> eyre::Result<()> {
                             .wrap_err("failed to register consensus rpc module")?;
                     }
 
-                    let chain_spec = ctx.config().chain.clone();
-                    tempo_node::rpc::execution_info::install_execution_info(
-                        ctx.modules,
-                        chain_spec.chain_id(),
-                        chain_spec.genesis_hash(),
-                        false,
-                    )?;
-
                     if let Some(runtime) = rpc_era_runtime {
                         runtime.install(ctx.modules, ctx.registry.eth_api().clone())?;
                     }
