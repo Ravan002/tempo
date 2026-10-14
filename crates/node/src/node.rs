@@ -137,7 +137,7 @@ pub struct TempoNodeArgs {
     pub shadow_replay: Option<Option<TempoHardfork>>,
     /// Experimental EVM JIT compilation settings.
     #[cfg(feature = "jit")]
-    #[command(flatten)]
+    #[arg(skip)]
     pub jit: crate::jit::JitArgs,
 }
 
@@ -579,7 +579,7 @@ where
         #[cfg(feature = "jit")]
         if self.jit.enabled || self.jit.blocking {
             let spec = ctx.chain_spec().tempo_hardfork_at(u64::MAX);
-            let backend = self.jit.backend(spec)?;
+            let backend = crate::jit::backend(&self.jit, spec)?;
             let stats_backend = backend.clone();
             ctx.task_executor().spawn_with_graceful_shutdown_signal(|shutdown| async move {
                 let mut shutdown = std::pin::pin!(shutdown);
