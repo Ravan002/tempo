@@ -115,19 +115,19 @@ impl Precompile for TIP403Registry {
                     setReceiveConfig(call) => mutate(call, msg_sender, |sender, c| self.set_receive_config(sender, c)),
                     #[schedule(since = T14)]
                     addReceiveTokens(call) => mutate(call, msg_sender, |sender, c| {
-                        self.modify_receive_list(sender, MembershipKind::RECEIVE_TOKEN, &c.tokens, true)
+                        self.modify_receive_members(sender, MembershipKind::RECEIVE_TOKEN, &c.tokens, true)
                     }),
                     #[schedule(since = T14)]
                     removeReceiveTokens(call) => mutate(call, msg_sender, |sender, c| {
-                        self.modify_receive_list(sender, MembershipKind::RECEIVE_TOKEN, &c.tokens, false)
+                        self.modify_receive_members(sender, MembershipKind::RECEIVE_TOKEN, &c.tokens, false)
                     }),
                     #[schedule(since = T14)]
                     addReceiveSenders(call) => mutate(call, msg_sender, |sender, c| {
-                        self.modify_receive_list(sender, MembershipKind::RECEIVE_SENDER, &c.senders, true)
+                        self.modify_receive_members(sender, MembershipKind::RECEIVE_SENDER, &c.senders, true)
                     }),
                     #[schedule(since = T14)]
                     removeReceiveSenders(call) => mutate(call, msg_sender, |sender, c| {
-                        self.modify_receive_list(sender, MembershipKind::RECEIVE_SENDER, &c.senders, false)
+                        self.modify_receive_members(sender, MembershipKind::RECEIVE_SENDER, &c.senders, false)
                     })
                 }
             }

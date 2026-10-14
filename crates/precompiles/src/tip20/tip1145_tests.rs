@@ -314,7 +314,7 @@ fn issuer_modes_and_memberships() -> eyre::Result<()> {
         assert!(transfer(&mut token, alice, bob, 10)?);
 
         // `ALL` edits all three lists without touching the receive-token bit.
-        TIP403Registry::new().modify_receive_list(
+        TIP403Registry::new().modify_receive_members(
             carol,
             MembershipKind::RECEIVE_TOKEN,
             &[address],
@@ -551,7 +551,12 @@ fn receive_configs_filter_tokens_then_senders() -> eyre::Result<()> {
         );
 
         // Whitelisting the token (a future-token-capable list) lets the transfer through.
-        registry.modify_receive_list(receiver, MembershipKind::RECEIVE_TOKEN, &[address], true)?;
+        registry.modify_receive_members(
+            receiver,
+            MembershipKind::RECEIVE_TOKEN,
+            &[address],
+            true,
+        )?;
         assert_eq!(flags(address, receiver), RECEIVE_TOKEN_FLAG);
         assert!(transfer(&mut token, sender, receiver, 10)?);
         assert_eq!(
@@ -560,7 +565,12 @@ fn receive_configs_filter_tokens_then_senders() -> eyre::Result<()> {
         );
 
         // Blacklisting the sender blocks with `RECEIVE_POLICY`.
-        registry.modify_receive_list(receiver, MembershipKind::RECEIVE_SENDER, &[sender], true)?;
+        registry.modify_receive_members(
+            receiver,
+            MembershipKind::RECEIVE_SENDER,
+            &[sender],
+            true,
+        )?;
         assert!(registry.receive_sender_members[receiver][sender].read()?);
         assert_eq!(
             registry.validate_receive_policy(address, sender, receiver)?,
@@ -615,7 +625,7 @@ fn receive_configs_filter_tokens_then_senders() -> eyre::Result<()> {
         // Caller restrictions.
         assert_eq!(
             registry
-                .modify_receive_list(
+                .modify_receive_members(
                     RECEIVE_POLICY_GUARD_ADDRESS,
                     MembershipKind::RECEIVE_TOKEN,
                     &[],
@@ -626,7 +636,7 @@ fn receive_configs_filter_tokens_then_senders() -> eyre::Result<()> {
         );
         assert_eq!(
             registry
-                .modify_receive_list(
+                .modify_receive_members(
                     receiver,
                     MembershipKind::RECEIVE_TOKEN,
                     &[Address::random()],

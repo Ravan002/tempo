@@ -191,23 +191,23 @@ impl TIP20Token {
 
     /// Returns the current total supply.
     pub fn total_supply(&self) -> Result<U256> {
-        Ok(self.load_supply()?.total)
+        Ok(self.get_supply()?.total)
     }
 
     /// Returns the active quote token address used for pricing.
     pub fn quote_token(&self) -> Result<Address> {
-        self.load_quote(false)
+        self.get_quote(false)
     }
 
     /// Returns the pending next quote token address (set but not yet finalized).
     pub fn next_quote_token(&self) -> Result<Address> {
-        self.load_quote(true)
+        self.get_quote(true)
     }
 
     /// Returns the maximum mintable supply.
     pub fn supply_cap(&self) -> Result<U256> {
         if self.storage.spec().is_t14() {
-            self.supply_cap_of(&self.load_supply()?)
+            self.supply_cap_of(&self.get_supply()?)
         } else {
             self.supply_cap.read()
         }
@@ -215,7 +215,7 @@ impl TIP20Token {
 
     /// Returns whether the token is currently paused.
     pub fn paused(&self) -> Result<bool> {
-        Ok(self.load_control()?.is_paused())
+        Ok(self.get_token_control()?.is_paused())
     }
 
     /// Returns the TIP-403 transfer policy ID governing this token's transfers.
@@ -344,7 +344,7 @@ impl TIP20Token {
         // token-specific policy and converts the token to the packed layout. Afterwards, generic
         // policy IDs are unsupported.
         if self.storage.spec().is_t14() {
-            let control = self.load_control()?;
+            let control = self.get_token_control()?;
             if call.newPolicyId == TOKEN_POLICY_ID {
                 if !control.is_packed() {
                     let policy = TIP403Registry::new().activate_token_policy(self.address)?;
@@ -392,7 +392,7 @@ impl TIP20Token {
         call: ITIP20::setSupplyCapCall,
     ) -> Result<()> {
         self.check_role(msg_sender, DEFAULT_ADMIN_ROLE)?;
-        let supply = self.load_supply()?;
+        let supply = self.get_supply()?;
         if call.newSupplyCap < supply.total {
             return Err(TIP20Error::invalid_supply_cap().into());
         }
@@ -402,7 +402,7 @@ impl TIP20Token {
         }
 
         match supply.cap {
-            Some(_) => self.store_supply(Supply {
+            Some(_) => self.set_supply(Supply {
                 cap: Some(call.newSupplyCap),
                 ..supply
             })?,
@@ -502,7 +502,7 @@ impl TIP20Token {
     /// - `Unauthorized` — caller does not hold `PAUSE_ROLE`
     pub fn pause(&mut self, msg_sender: Address, _call: ITIP20::pauseCall) -> Result<()> {
         self.check_role(msg_sender, PAUSE_ROLE)?;
-        self.store_paused(true)?;
+        self.set_paused(true)?;
 
         self.emit_event(TIP20Event::pause_state_update(msg_sender, true))
     }
@@ -513,7 +513,7 @@ impl TIP20Token {
     /// - `Unauthorized` — caller does not hold `UNPAUSE_ROLE`
     pub fn unpause(&mut self, msg_sender: Address, _call: ITIP20::unpauseCall) -> Result<()> {
         self.check_role(msg_sender, UNPAUSE_ROLE)?;
-        self.store_paused(false)?;
+        self.set_paused(false)?;
 
         self.emit_event(TIP20Event::pause_state_update(msg_sender, false))
     }
@@ -548,7 +548,7 @@ impl TIP20Token {
             return Err(TIP20Error::invalid_quote_token().into());
         }
 
-        self.store_quote(true, call.newQuoteToken)?;
+        self.set_quote(true, call.newQuoteToken)?;
 
         self.emit_event(TIP20Event::next_quote_token_set(
             msg_sender,
@@ -583,7 +583,7 @@ impl TIP20Token {
         }
 
         // Update the quote token
-        self.store_quote(false, next_quote_token)?;
+        self.set_quote(false, next_quote_token)?;
 
         self.emit_event(TIP20Event::quote_token_update(msg_sender, next_quote_token))
     }
@@ -673,7 +673,7 @@ impl TIP20Token {
 
         self.handle_rewards_on_mint(to.target, amount)?;
 
-        self.store_supply(Supply {
+        self.set_supply(Supply {
             total: new_supply,
             ..supply
         })?;
@@ -798,7 +798,7 @@ impl TIP20Token {
     /// Reduces total supply by a burned `amount`, reverting with `InsufficientBalance` on
     /// underflow.
     fn decrease_total_supply(&mut self, amount: U256) -> Result<()> {
-        let supply = self.load_supply()?;
+        let supply = self.get_supply()?;
         let new_supply =
             supply
                 .total
@@ -808,7 +808,7 @@ impl TIP20Token {
                     amount,
                     self.address,
                 ))?;
-        self.store_supply(Supply {
+        self.set_supply(Supply {
             total: new_supply,
             ..supply
         })
@@ -1331,7 +1331,7 @@ impl TIP20Token {
         let to = Recipient::resolve(to)?;
         self.check_role(msg_sender, ISSUER_ROLE)?;
 
-        let supply = self.load_supply()?;
+        let supply = self.get_supply()?;
         if self.storage.spec().is_t3() {
             self.check_not_paused()?;
             to.validate()?;
