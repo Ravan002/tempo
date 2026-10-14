@@ -192,7 +192,7 @@ class ZonesReleaseTagTests(unittest.TestCase):
         self.assertEqual(metadata['with']['tags'].splitlines(),
                          ['type=raw,value=profiling', 'type=sha,prefix=profiling-sha-'])
 
-    def parse_tag(self, tag, dispatch=True):
+    def parse_tag(self, tag, dispatch=True, on_main=True):
         with tempfile.TemporaryDirectory() as tmp:
             output = Path(tmp) / 'output'
             subprocess.run(['git', 'init', '-q', tmp], check=True)
@@ -200,6 +200,10 @@ class ZonesReleaseTagTests(unittest.TestCase):
                             '-c', 'user.email=test@example.invalid', 'commit',
                             '--allow-empty', '-qm', 'test: release fixture'], check=True)
             subprocess.run(['git', '-C', tmp, 'update-ref', 'refs/remotes/origin/main', 'HEAD'], check=True)
+            if not on_main:
+                subprocess.run(['git', '-C', tmp, '-c', 'user.name=Test',
+                                '-c', 'user.email=test@example.invalid', 'commit',
+                                '--allow-empty', '-qm', 'test: unmerged release'], check=True)
             subprocess.run(['git', '-C', tmp, 'tag', tag], capture_output=True)
             result = subprocess.run(['bash', '-eu', '-c', script('resolve-release', 'Record immutable release inputs')],
                                     cwd=tmp, env=dict(os.environ, GITHUB_EVENT_NAME='workflow_dispatch' if dispatch else 'push', INPUT_TAG=tag if dispatch else '',
@@ -223,6 +227,13 @@ class ZonesReleaseTagTests(unittest.TestCase):
                     'zones/v0.3.5\ntag=other'):
             with self.subTest(tag=tag):
                 code, output = self.parse_tag(tag)
+                self.assertNotEqual(code, 0)
+                self.assertEqual(output, '')
+
+    def test_rejects_release_tag_outside_main(self):
+        for dispatch in (True, False):
+            with self.subTest(dispatch=dispatch):
+                code, output = self.parse_tag('zones/v0.3.5', dispatch, on_main=False)
                 self.assertNotEqual(code, 0)
                 self.assertEqual(output, '')
 
