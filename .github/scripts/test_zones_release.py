@@ -18,7 +18,7 @@ def script(job, name):
 
 
 class ZonesReleaseTests(unittest.TestCase):
-    def parse_tag(self, tag, dispatch=True):
+    def parse_tag(self, tag, dispatch=True, on_main=True):
         with tempfile.TemporaryDirectory() as tmp:
             subprocess.run(['git', 'init', '-q', tmp], check=True)
             subprocess.run(['git', '-C', tmp, 'config', 'user.name', 'Test'], check=True)
@@ -26,6 +26,10 @@ class ZonesReleaseTests(unittest.TestCase):
             (Path(tmp) / 'source').write_text('release\n')
             subprocess.run(['git', '-C', tmp, 'add', '.'], check=True)
             subprocess.run(['git', '-C', tmp, 'commit', '-qm', 'release'], check=True)
+            subprocess.run(['git', '-C', tmp, 'update-ref', 'refs/remotes/origin/main', 'HEAD'], check=True)
+            if not on_main:
+                (Path(tmp) / 'source').write_text('unmerged release\n')
+                subprocess.run(['git', '-C', tmp, 'commit', '-qam', 'unmerged release'], check=True)
             if tag in ('zones/v0.3.5', 'zones/v0.3.5-rc.1'):
                 subprocess.run(['git', '-C', tmp, 'tag', tag], check=True)
             sha = subprocess.check_output(['git', '-C', tmp, 'rev-parse', 'HEAD'], text=True).strip()
@@ -50,6 +54,13 @@ class ZonesReleaseTests(unittest.TestCase):
                     'zones/v0.3.5\ntag=other'):
             with self.subTest(tag=tag):
                 code, output, _ = self.parse_tag(tag)
+                self.assertNotEqual(code, 0)
+                self.assertEqual(output, '')
+
+    def test_rejects_release_tag_outside_main(self):
+        for dispatch in (True, False):
+            with self.subTest(dispatch=dispatch):
+                code, output, _ = self.parse_tag('zones/v0.3.5', dispatch, on_main=False)
                 self.assertNotEqual(code, 0)
                 self.assertEqual(output, '')
 

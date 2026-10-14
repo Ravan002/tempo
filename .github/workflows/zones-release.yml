@@ -77,6 +77,16 @@ jobs:
             echo "Release tag $tag does not resolve to checked-out commit $commit_sha" >&2
             exit 1
           fi
+          # A manual dispatch can select an arbitrary tag. Only release code
+          # already on protected main may run in the credentialed build jobs.
+          if ! git show-ref --verify --quiet refs/remotes/origin/main; then
+            echo "Protected main was not fetched" >&2
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$commit_sha" refs/remotes/origin/main; then
+            echo "Release tag $tag does not point to a commit on main" >&2
+            exit 1
+          fi
           {
             echo "tag=$tag"
             echo "version=${tag#zones/}"
