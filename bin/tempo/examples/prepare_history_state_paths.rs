@@ -222,7 +222,7 @@ fn main() -> eyre::Result<()> {
                 .put::<tables::AccountsHistory>(ShardedKey::new(address, u64::MAX), &block_zero)?;
         }
         provider.commit()?;
-        if start / BATCH % 16 == 0 || end == args.code_count {
+        if (start / BATCH).is_multiple_of(16) || end == args.code_count {
             let elapsed = started.elapsed().as_secs_f64();
             eprintln!(
                 "code {end}/{} elapsed={elapsed:.1}s eta={:.1}s",
