@@ -2,7 +2,7 @@ name: Zones Contracts
 
 on:
   push:
-    branches: [main, dr/validium, feat/integrate-zones-history]
+    branches: [main]
     paths:
       - "crates/zones/contracts/**"
       - ".github/workflows/zones-contracts.yml"
@@ -21,7 +21,35 @@ env:
   FOUNDRY_REF: 6902a96211da7bcc3d9c4d8e97910ac5c9d5d2c6
 
 jobs:
+  check-zones-contracts-changes:
+    name: Check Zones contracts changes
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+      pull-requests: read
+    outputs:
+      should_run: ${{ contains(fromJSON(steps.filter.outputs.changes), 'zones_contracts') }}
+    steps:
+      - name: Secure runner
+        uses: tempoxyz/gh-actions/actions/secure-runner@e813067e922303348ee5aad965f745803cc24f1f # 2026-10-02T09-56-31Z-e813067e
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: tempoxyz/gh-actions/actions/changed-paths@e813067e922303348ee5aad965f745803cc24f1f # 2026-10-02T09-56-31Z-e813067e
+        id: filter
+        with:
+          filters: |
+            zones_contracts:
+              - 'crates/zones/contracts/**'
+              - '.gitmodules'
+              - '.github/workflows/zones-contracts.yml'
+
   build:
+    needs: check-zones-contracts-changes
+    if: needs.check-zones-contracts-changes.outputs.should_run == 'true'
     permissions:
       contents: read
       id-token: write
@@ -73,6 +101,8 @@ jobs:
             src/runtime/tempo/Verifier.sol
 
   lint:
+    needs: check-zones-contracts-changes
+    if: needs.check-zones-contracts-changes.outputs.should_run == 'true'
     permissions:
       contents: read
       id-token: write
@@ -97,11 +127,16 @@ jobs:
         run: forge fmt --check src/runtime test
 
   test:
+    needs: check-zones-contracts-changes
+    if: needs.check-zones-contracts-changes.outputs.should_run == 'true'
     permissions:
       contents: read
       id-token: write
     name: Forge Test & Coverage
-    runs-on: ubuntu-latest
+    # Depot keeps this job's multi-GB Rust cache out of the repository's 10 GB
+    # GitHub cache, where per-PR copies evicted every other cache, and gives
+    # sccache a shared backend for the forge rebuild.
+    runs-on: depot-ubuntu-latest-8
     env:
       RUSTC_WRAPPER: "sccache"
       MIN_LINES: "88"
@@ -141,7 +176,7 @@ jobs:
       # Rust setup, dependency restore, patch, and eight-minute link entirely.
       - name: Restore Tempo-capable forge
         id: forge-cache
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: foundry/target/release/forge
           key: zones-tempo-forge-v1-${{ runner.os }}-${{ steps.foundry-ref.outputs.sha }}-${{ env.TEMPO_FOUNDRY_REF }}
@@ -168,6 +203,15 @@ jobs:
         if: steps.forge-cache.outputs.cache-hit != 'true'
         working-directory: foundry
         run: cargo build --bin forge --profile release --no-default-features
+
+      # Save right after the build: rust-cache's post-job cleanup removes workspace
+      # binaries from target/ before an actions/cache post step could save the binary.
+      - name: Save Tempo-capable forge
+        if: steps.forge-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: foundry/target/release/forge
+          key: ${{ steps.forge-cache.outputs.cache-primary-key }}
 
       - name: Install z3 (symbolic solver)
         run: sudo apt-get update && sudo apt-get install -y z3
@@ -253,6 +297,8 @@ jobs:
           PY
 
   storage-layout:
+    needs: check-zones-contracts-changes
+    if: needs.check-zones-contracts-changes.outputs.should_run == 'true'
     permissions:
       contents: read
       id-token: write
@@ -305,6 +351,7 @@ jobs:
     runs-on: ubuntu-latest
     if: always()
     needs:
+      - check-zones-contracts-changes
       - build
       - lint
       - test
@@ -317,4 +364,5 @@ jobs:
       - name: Decide whether the needed jobs succeeded or failed
         uses: tempoxyz/gh-actions/actions/check-needs@e813067e922303348ee5aad965f745803cc24f1f # 2026-10-02T09-56-31Z-e813067e
         with:
+          allowed-skips: build,lint,test,storage-layout
           jobs: ${{ toJSON(needs) }}

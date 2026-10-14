@@ -1,29 +1,22 @@
 //! Zone protocol constants shared between host and guest.
 
-use alloy_primitives::{Address, U256, address};
+pub use tempo_contracts::zones::{
+    MAX_UNPROCESSED_DEPOSITS, MAX_UNPROCESSED_TOKEN_ENABLEMENTS, MAX_WITHDRAWAL_GAS_LIMIT,
+    NO_QUEUE_INDEX, TEMPO_STATE_ADDRESS, ZONE_FEE_MANAGER_ADDRESS, ZONE_INBOX_ADDRESS,
+    ZONE_OUTBOX_ADDRESS, ZONE_TOKEN_ADDRESS,
+};
+
+use alloy_primitives::Address;
 use tempo_hardfork::constants::{mainnet::MAINNET_CHAIN_ID, moderato::MODERATO_CHAIN_ID};
 
-/// Sentinel emitted as `BatchSubmitted.withdrawalQueueIndex` when a batch carried no
-/// withdrawals and therefore consumed no queue index (`NO_QUEUE_INDEX` in Solidity).
-pub const NO_QUEUE_INDEX: U256 = U256::MAX;
-
-/// Maximum callback gas a withdrawal may request.
-///
-/// The L1 processor adds fixed overhead, so this value keeps the outer
-/// keeps the outer `processWithdrawals` transaction well below a 30M gas block.
-pub const MAX_WITHDRAWAL_GAS_LIMIT: u64 = 10_000_000;
+/// Large blocks can exceed tungstenite's default 16 MiB frame limit.
+pub const MAX_WS_FRAME_AND_MESSAGE_SIZE: usize = 128 * 1024 * 1024;
 
 /// Maximum number of Tempo headers authenticated by one checkpoint-only Zone block.
 pub const MAX_TEMPO_HEADERS_PER_ZONE_BLOCK: usize = 1024;
 
-/// Maximum deposit entries that may remain outstanding on a ZonePortal.
-pub const MAX_UNPROCESSED_DEPOSITS: usize = 230;
-
 /// Capacity reserved for one maximum-size withdrawal batch to bounce back.
 pub const WITHDRAWAL_BOUNCEBACK_RESERVE: usize = 20;
-
-/// Maximum token enablements that may remain outstanding on a ZonePortal.
-pub const MAX_UNPROCESSED_TOKEN_ENABLEMENTS: usize = 8;
 
 /// Maximum RLP-encoded block size.
 ///
@@ -31,28 +24,10 @@ pub const MAX_UNPROCESSED_TOKEN_ENABLEMENTS: usize = 8;
 /// `reth_consensus_common::validation::MAX_RLP_BLOCK_SIZE`.
 pub const MAX_RLP_BLOCK_SIZE: usize = 8_388_608;
 
-/// TempoState predeploy address on Zone L2.
-pub const TEMPO_STATE_ADDRESS: Address = address!("0x1c00000000000000000000000000000000000000");
-
-/// ZoneInbox predeploy address on Zone L2.
-pub const ZONE_INBOX_ADDRESS: Address = address!("0x1c00000000000000000000000000000000000001");
-
-/// ZoneOutbox predeploy address on Zone L2.
-pub const ZONE_OUTBOX_ADDRESS: Address = address!("0x1c00000000000000000000000000000000000002");
-
 /// Protocol-level contract deployers permitted to create contracts on Zones.
 ///
 /// WARNING: Updating this list is a consensus change.
 pub const CONTRACT_DEPLOYER_ALLOWLIST: &[Address] = &[];
-
-/// Zone-native fee manager precompile address.
-///
-/// This is adjacent to, but distinct from, Tempo L1's fee manager at `0xfeec...0000`.
-pub const ZONE_FEE_MANAGER_ADDRESS: Address =
-    address!("0xfeec000000000000000000000000000000000001");
-
-/// Default zone token address (pathUSD TIP-20).
-pub const ZONE_TOKEN_ADDRESS: Address = address!("0x20C0000000000000000000000000000000000000");
 
 /// Base offset for deriving **mainnet** zone chain IDs.
 ///
@@ -118,9 +93,9 @@ pub fn zone_chain_id(parent_chain_id: u64, zone_id: u32) -> Result<u64, ZoneChai
     validate_chain_id(parent_chain_id, zone_id)?;
 
     let chain_id = match parent_chain_id {
-        MAINNET_CHAIN_ID => ZONE_CHAIN_ID_BASE + zone_id as u64,
-        MODERATO_CHAIN_ID => ZONE_CHAIN_ID_BASE_TESTNET + zone_id as u64,
-        _ => (parent_chain_id << 32) | zone_id as u64,
+        MAINNET_CHAIN_ID => ZONE_CHAIN_ID_BASE + u64::from(zone_id),
+        MODERATO_CHAIN_ID => ZONE_CHAIN_ID_BASE_TESTNET + u64::from(zone_id),
+        _ => (parent_chain_id << 32) | u64::from(zone_id),
     };
 
     Ok(chain_id)
@@ -162,8 +137,9 @@ fn validate_chain_id(parent_chain_id: u64, zone_id: u32) -> Result<(), ZoneChain
         return Err(ZoneChainIdError::InvalidParentChainId(parent_chain_id));
     }
 
-    if (parent_chain_id == MAINNET_CHAIN_ID && zone_id as u64 >= ZONE_CHAIN_ID_RANGE)
-        || (parent_chain_id == MODERATO_CHAIN_ID && zone_id as u64 >= ZONE_CHAIN_ID_RANGE_TESTNET)
+    if (parent_chain_id == MAINNET_CHAIN_ID && u64::from(zone_id) >= ZONE_CHAIN_ID_RANGE)
+        || (parent_chain_id == MODERATO_CHAIN_ID
+            && u64::from(zone_id) >= ZONE_CHAIN_ID_RANGE_TESTNET)
     {
         return Err(ZoneChainIdError::ZoneIdOutOfRange {
             parent_chain_id,

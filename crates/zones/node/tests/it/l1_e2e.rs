@@ -19,11 +19,11 @@ use alloy_consensus::Transaction;
 use eyre::WrapErr as _;
 use futures::future::try_join_all;
 use std::{collections::HashMap, time::Duration};
-use tempo_precompiles::{PATH_USD_ADDRESS, zone_factory::portal};
-use tempo_zone_contracts::{
+use tempo_contracts::zones::{
     IZoneOutbox, TEMPO_STATE_ADDRESS, TempoState, ZONE_OUTBOX_ADDRESS, ZONE_TOKEN_ADDRESS,
     ZonePortal, ZonePortal::Role as PortalRole,
 };
+use tempo_precompiles::{PATH_USD_ADDRESS, zone_factory::portal};
 use zone_node::dev::{ProvisionConfig, provision_zone};
 
 /// Longer timeout for real L1 tests — the L1 dev node produces blocks every
@@ -495,7 +495,7 @@ async fn test_dev_provisioner_replays_initial_token_event() -> eyre::Result<()> 
 /// 8. Wait for the batch to be submitted and the withdrawal to be processed on L1.
 ///
 /// NOTE: This test requires the Foundry-compiled shared runtime artifacts.
-/// Run `forge build` in `crates/contracts/` first.
+/// Run `forge build` in `crates/zones/contracts/` first.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_deposit_via_real_l1() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
@@ -1277,7 +1277,7 @@ async fn test_queued_callback_bounces_after_gateway_revocation() -> eyre::Result
 ///    |<-- deposit 0.2 ----|                 |
 /// ```
 ///
-/// NOTE: Requires `forge build` in `crates/contracts/` for shared runtime and router artifacts.
+/// NOTE: Requires `forge build` in `crates/zones/contracts/` for shared runtime and router artifacts.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_cross_zone_withdrawal() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
@@ -1877,7 +1877,7 @@ async fn test_swap_and_deposit_into_same_zone_bounces_back_with_explicit_payload
 ///    |<-- withdraw ZoneUSD --------|  ✓ ZoneUSD burned
 /// ```
 ///
-/// NOTE: Requires `forge build` in `crates/contracts/` for shared runtime artifacts.
+/// NOTE: Requires `forge build` in `crates/zones/contracts/` for shared runtime artifacts.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_multiasset_deposit_withdrawal() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
@@ -2032,7 +2032,7 @@ async fn test_multiasset_deposit_withdrawal() -> eyre::Result<()> {
 ///   │            → tokens to L1              │
 /// ```
 ///
-/// NOTE: Requires `forge build` in `crates/contracts/` for shared runtime artifacts.
+/// NOTE: Requires `forge build` in `crates/zones/contracts/` for shared runtime artifacts.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_deposit_and_withdrawal() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
@@ -2501,8 +2501,7 @@ async fn test_deposit_old_key_during_grace_mints_after_rotation() -> eyre::Resul
     reth_tracing::init_test_tracing();
 
     use k256::{AffinePoint, ProjectivePoint, Scalar};
-    use tempo_contracts::precompiles::ITIP20;
-    use tempo_zone_contracts::DepositPayload;
+    use tempo_contracts::{precompiles::ITIP20, zones::DepositPayload};
     use zone_precompiles::ecies;
 
     let l1 = L1TestNode::start().await?;
@@ -2690,7 +2689,8 @@ async fn test_deposit_blacklisted_recipient() -> eyre::Result<()> {
     {
         use tempo_contracts::precompiles::ITIP20;
 
-        let portal = tempo_zone_contracts::ZonePortal::new(portal_address, depositor.l1_provider());
+        let portal =
+            tempo_contracts::zones::ZonePortal::new(portal_address, depositor.l1_provider());
 
         ITIP20::new(PATH_USD_ADDRESS, depositor.l1_provider())
             .approve(portal_address, U256::MAX)
@@ -2803,8 +2803,7 @@ async fn test_blacklisted_sender_transfer_rejected() -> eyre::Result<()> {
     // herself. The dev account deposits on her behalf (recipient = allow-all).
     let deposit_amount: u128 = 1_000_000; // 1 pathUSD
     {
-        use tempo_contracts::precompiles::ITIP20;
-        use tempo_zone_contracts::ZonePortal;
+        use tempo_contracts::{precompiles::ITIP20, zones::ZonePortal};
 
         let dev_provider = l1.dev_provider();
         ITIP20::new(PATH_USD_ADDRESS, &dev_provider)
@@ -2916,7 +2915,7 @@ async fn test_deposit_to_blacklisted_recipient_is_accepted_on_l1() -> eyre::Resu
         .await?;
 
     // The portal cannot inspect the encrypted recipient, so this is accepted on L1.
-    use tempo_zone_contracts::ZonePortal;
+    use tempo_contracts::zones::ZonePortal;
     let portal = ZonePortal::new(portal_address, &depositor_provider);
     let (key_index, encrypted) = l1
         .encrypt_deposit_for_portal(portal_address, depositor, blacklisted_recipient, B256::ZERO)

@@ -160,7 +160,7 @@ async fn test_pool_validation_uses_enabled_token_anchored_policy() -> eyre::Resu
     let simulated = token
         .transfer(recipient, U256::from(transfer_amount))
         .fee_token(token_address)
-        .max_fee_per_gas(TEMPO_T0_BASE_FEE as u128)
+        .max_fee_per_gas(u128::from(TEMPO_T0_BASE_FEE))
         .max_priority_fee_per_gas(0)
         .gas(TIP20_TX_GAS)
         .call()
@@ -170,7 +170,7 @@ async fn test_pool_validation_uses_enabled_token_anchored_policy() -> eyre::Resu
     let pending = token
         .transfer(recipient, U256::from(transfer_amount))
         .fee_token(token_address)
-        .max_fee_per_gas(TEMPO_T0_BASE_FEE as u128)
+        .max_fee_per_gas(u128::from(TEMPO_T0_BASE_FEE))
         .max_priority_fee_per_gas(0)
         .gas(TIP20_TX_GAS)
         .send()
@@ -222,7 +222,7 @@ const L1_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 ///    |<-- withdraw AlphaUSD -----------|  ✓ AlphaUSD burned
 /// ```
 ///
-/// NOTE: Requires `forge build` in `crates/contracts/` for shared runtime artifacts.
+/// NOTE: Requires `forge build` in `crates/zones/contracts/` for shared runtime artifacts.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_enable_token_via_real_l1() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();

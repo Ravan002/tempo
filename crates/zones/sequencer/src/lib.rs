@@ -18,7 +18,7 @@ use tokio::sync::Notify;
 use zone_chainspec::ZoneChainSpec;
 
 pub mod abi {
-    pub use tempo_zone_contracts::*;
+    pub use tempo_contracts::zones::*;
 }
 
 pub mod attestation;
@@ -75,8 +75,6 @@ pub trait ZoneSequencerProvider:
     > + CanonStateSubscriptions<Primitives = TempoPrimitives>
     + StateProviderFactory
     + Clone
-    + Send
-    + Sync
     + 'static
 {
 }
@@ -90,8 +88,6 @@ impl<T> ZoneSequencerProvider for T where
         > + CanonStateSubscriptions<Primitives = TempoPrimitives>
         + StateProviderFactory
         + Clone
-        + Send
-        + Sync
         + 'static
 {
 }

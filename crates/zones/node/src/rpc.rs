@@ -37,7 +37,7 @@ use reth_rpc_eth_api::{
     helpers::{EthApiSpec, EthBlocks, EthCall, EthFees, EthState, EthTransactions, FullEthApi},
 };
 use reth_rpc_eth_types::{EthApiError, logs_utils};
-use reth_storage_api::{BlockNumReader, StateProviderFactory};
+use reth_storage_api::StateProviderFactory;
 use reth_trie_common::{ExecutionWitnessMode, HashedPostState, HashedStorage};
 use tempo_alloy::{
     TempoNetwork,
@@ -57,9 +57,10 @@ use tokio::{
 use zone_l1::{TempoStateExt as _, state::EnabledTokenRegistry};
 
 use alloy_rpc_client::{ConnectionConfig, WebSocketConfig};
-use tempo_zone_contracts::{IZoneInbox, ZONE_INBOX_ADDRESS, ZONE_TOKEN_ADDRESS, ZonePortal};
+use tempo_contracts::zones::{IZoneInbox, ZONE_INBOX_ADDRESS, ZONE_TOKEN_ADDRESS, ZonePortal};
 use zone_evm::ZoneEvmConfig;
 use zone_p2p::{LeadershipSchedule, PeerTip, ZoneManifest};
+use zone_primitives::constants::MAX_WS_FRAME_AND_MESSAGE_SIZE;
 use zone_rpc::{
     auth::AuthContext,
     types::{
@@ -171,7 +172,7 @@ impl<P> OperatorZoneApi<P> {
 #[jsonrpsee::core::async_trait]
 impl<P> ZoneApiServer for OperatorZoneApi<P>
 where
-    P: StateProviderFactory + Clone + Send + Sync + 'static,
+    P: StateProviderFactory + Clone + 'static,
 {
     async fn get_zone_info(&self) -> RpcResult<ZoneInfoResponse> {
         let tempo_block_number = self
@@ -207,7 +208,7 @@ pub(crate) fn operator_zone_rpc_module<P>(
     provider: P,
 ) -> Result<RpcModule<()>, jsonrpsee::core::RegisterMethodError>
 where
-    P: BlockNumReader + HeaderProvider + StateProviderFactory + Clone + Send + Sync + 'static,
+    P: HeaderProvider + StateProviderFactory + Clone + 'static,
 {
     let mut module = RpcModule::new(());
     let set_leader_sequencer = sequencer.clone();
@@ -543,7 +544,7 @@ fn get_sequencer_info<P>(
     provider: &P,
 ) -> Result<SequencerInfoResponse, JsonRpcError>
 where
-    P: BlockNumReader + HeaderProvider + StateProviderFactory,
+    P: HeaderProvider + StateProviderFactory,
 {
     let Some(context) = sequencer.get() else {
         // Single-sequencer (or not yet initialized) node: report the minimal view.
@@ -671,7 +672,6 @@ where
 
 type RpcBlock = Block<alloy_rpc_types_eth::Transaction<TempoTxEnvelope>, TempoHeaderResponse>;
 const FILTER_OWNER_PRUNE_INTERVAL: Duration = Duration::from_secs(60);
-const MAX_WS_FRAME_AND_MESSAGE_SIZE: usize = 128 * 1024 * 1024;
 
 fn filter_not_found_error() -> JsonRpcError {
     JsonRpcError::invalid_params("filter not found")
@@ -849,7 +849,7 @@ impl<Api: EthApiTypes + 'static> ZoneRpc<Api> {
 
 impl<Api> ZoneRpc<Api>
 where
-    Api: FullEthApi + EthApiTypes<NetworkTypes = TempoNetwork> + Send + Sync + 'static,
+    Api: FullEthApi + EthApiTypes<NetworkTypes = TempoNetwork>,
 {
     fn block_by_id(&self, id: BlockId) -> BoxFut<'_> {
         Box::pin(async move {
@@ -870,7 +870,7 @@ where
 
 impl<Api> zone_rpc::ZoneRpcApi for ZoneRpc<Api>
 where
-    Api: FullEthApi + EthApiTypes<NetworkTypes = TempoNetwork> + Send + Sync + 'static,
+    Api: FullEthApi + EthApiTypes<NetworkTypes = TempoNetwork>,
 {
     fn get_keychain_key(&self, account: Address, key_id: Address) -> BoxEyreFut<'_, KeyInfo> {
         Box::pin(async move {
@@ -1400,7 +1400,7 @@ where
 
 fn local_recovery_tip<P>(provider: &P) -> Result<PeerTip, JsonRpcError>
 where
-    P: BlockNumReader + HeaderProvider + StateProviderFactory,
+    P: HeaderProvider + StateProviderFactory,
 {
     let zone_height = provider.last_block_number().map_err(internal)?;
     let zone_header = provider
@@ -1500,7 +1500,9 @@ async fn set_leader(
             .setLeader(target, expected_epoch)
             .nonce_key(zone_sequencer::nonce_keys::ADMIN_OPS_NONCE_KEY)
             .nonce(nonce)
-            .max_fee_per_gas(tempo_chainspec::constants::gas::TEMPO_T1_BASE_FEE as u128)
+            .max_fee_per_gas(u128::from(
+                tempo_chainspec::constants::gas::TEMPO_T1_BASE_FEE,
+            ))
             .max_priority_fee_per_gas(0)
             .send_sync(),
     )
@@ -1598,7 +1600,6 @@ pub(crate) fn rpc_connection_config(retry_connection_interval: Duration) -> Conn
         .with_retry_interval(retry_connection_interval)
         .with_ws_config(
             WebSocketConfig::default()
-                // Large blocks can exceed tungstenite's default 16 MiB frame limit.
                 .max_frame_size(Some(MAX_WS_FRAME_AND_MESSAGE_SIZE))
                 .max_message_size(Some(MAX_WS_FRAME_AND_MESSAGE_SIZE)),
         )

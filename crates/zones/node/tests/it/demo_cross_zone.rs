@@ -4,8 +4,8 @@ use crate::utils::{
     L1TestNode, WithdrawalArgs, ZoneAccount, ZoneCreationConfig, ZoneTestNode, spawn_sequencer,
 };
 use alloy::primitives::U256;
+use tempo_contracts::zones::ZONE_TOKEN_ADDRESS;
 use tempo_precompiles::PATH_USD_ADDRESS;
-use tempo_zone_contracts::ZONE_TOKEN_ADDRESS;
 
 /// Longer timeout for real L1 tests.
 const L1_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -29,7 +29,7 @@ const L1_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 ///   |  ✓ Alice -= 500                  ✓ Bob += 500
 /// ```
 ///
-/// NOTE: Requires `forge build` in `crates/contracts/` for shared runtime and router artifacts.
+/// NOTE: Requires `forge build` in `crates/zones/contracts/` for shared runtime and router artifacts.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_cross_zone_send() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
