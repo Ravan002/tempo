@@ -15,7 +15,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     emitter.add_instructions(&cargo_builder)?;
 
     let git_builder = Git2::builder()
-        .describe(false, true, None)
+        .describe(false, true, Some("zones/v[0-9]*"))
         .dirty(true)
         .sha(false)
         .build();
@@ -28,7 +28,9 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let is_dirty = env::var("VERGEN_GIT_DIRTY").is_ok_and(|dirty| dirty == "true");
     let not_on_tag = env::var("VERGEN_GIT_DESCRIBE")
-        .map(|describe| describe.ends_with(&format!("-g{sha_short}")))
+        .map(|describe| {
+            !describe.starts_with("zones/v") || describe.ends_with(&format!("-g{sha_short}"))
+        })
         .unwrap_or(true);
     let version_suffix = if is_dirty || not_on_tag { "-dev" } else { "" };
     println!("cargo:rustc-env=RETH_VERSION_SUFFIX={version_suffix}");

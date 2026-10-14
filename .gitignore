@@ -22,6 +22,9 @@ profile.json.gz
 localnet/**
 
 .claude/
+!/.claude/
+/.claude/*
+!/.claude/skills
 !docs/.claude/
 CLAUDE.local.md
 research.md
@@ -45,3 +48,9 @@ __pycache__/
 
 # Amp orb portals
 .amp/portals/*
+
+# Imported Zones test fixtures and generated Solidity artifacts
+/earn/
+crates/zones/contracts/cache/
+crates/zones/contracts/out/
+crates/zones/contracts/benchmark-out/
