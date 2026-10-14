@@ -33,28 +33,6 @@ import { ITIP20 } from "tempo-std/interfaces/ITIP20.sol";
 import { ITIP20Factory } from "tempo-std/interfaces/ITIP20Factory.sol";
 import { ITIP403Registry } from "tempo-std/interfaces/ITIP403Registry.sol";
 
-/// @notice TIP-1145 authorization view, pending its addition to tempo-std.
-interface ITIP403TokenPolicy {
-
-    enum AuthRole {
-        SENDER,
-        RECIPIENT,
-        MINT_RECIPIENT,
-        TRANSFER,
-        ALL
-    }
-
-    function isTokenAuthorized(
-        address token,
-        address account,
-        AuthRole role
-    )
-        external
-        view
-        returns (bool);
-
-}
-
 /// @title ZonePortal
 /// @notice Per-zone portal that escrows zone tokens on Tempo and manages deposits/withdrawals
 contract ZonePortal is IZonePortal {
@@ -1030,10 +1008,9 @@ contract ZonePortal is IZonePortal {
 
         uint64 policyId = ITIP20(_token).transferPolicyId();
         bool authorized = policyId == type(uint64).max
-            ? ITIP403TokenPolicy(address(TIP403_REGISTRY))
-                .isTokenAuthorized(
-                    _token, tempoRefundRecipient, ITIP403TokenPolicy.AuthRole.RECIPIENT
-                )
+            ? TIP403_REGISTRY.isTokenAuthorized(
+                _token, tempoRefundRecipient, ITIP403Registry.AuthRole.RECIPIENT
+            )
             : TIP403_REGISTRY.isAuthorizedRecipient(policyId, tempoRefundRecipient);
         if (!authorized) {
             revert ITIP20.PolicyForbids();
