@@ -4587,6 +4587,79 @@ mod jit_tests {
     use crate::jit::{JitBackend, RuntimeConfig};
 
     #[test]
+    fn jit_nested_call_equivalence() -> eyre::Result<()> {
+        let key_pair = P256KeyPair::random();
+        let caller = key_pair.address;
+        let contract = Address::repeat_byte(0x6c);
+        let callee = Address::repeat_byte(0x6d);
+        let spec = TempoHardfork::T13;
+        for call in [opcode::STATICCALL, opcode::DELEGATECALL] {
+            let backend = JitBackend::new(RuntimeConfig {
+                enabled: true,
+                blocking: true,
+                single_error: false,
+                gas_params: Some(tempo_gas_params(spec)),
+                ..Default::default()
+            })?;
+            // CALL-family suspension/resumption must preserve static mode and storage ownership.
+            let mut body = hex!("600060006000600073").to_vec();
+            body.extend_from_slice(callee.as_slice());
+            body.extend_from_slice(&[opcode::PUSH3, 0xff, 0xff, 0xff, call]);
+            body.extend_from_slice(&hex!("60005260206000f3"));
+            let mut outputs = Vec::new();
+            for compiled in [false, true] {
+                let mut evm = create_funded_evm_at_spec_with_timestamp(caller, 1, spec);
+                evm.ctx.db_mut().insert_account_info(
+                    contract,
+                    AccountInfo {
+                        code: Some(Bytecode::new_raw(body.clone().into())),
+                        ..Default::default()
+                    },
+                );
+                evm.ctx.db_mut().insert_account_info(
+                    callee,
+                    AccountInfo {
+                        code: Some(Bytecode::new_raw(bytes!("600160005500"))),
+                        ..Default::default()
+                    },
+                );
+                seed_storage_credit_balance(&mut evm, contract, 2);
+                if compiled {
+                    evm.set_jit_backend(backend.clone(), spec);
+                }
+                let tx = TxBuilder::new()
+                    .call(contract, &[])
+                    .gas_limit(2_000_000)
+                    .build();
+                let result = evm.transact_commit(TempoTxEnv::from_recovered_tx(
+                    &key_pair.sign_tx(tx)?,
+                    caller,
+                ))?;
+                let stored = evm.ctx.db().storage_ref(contract, U256::ZERO)?;
+                let credits = storage_credit_balance(&evm, contract);
+                assert!(result.is_success());
+                assert_eq!(
+                    stored,
+                    if call == opcode::DELEGATECALL {
+                        U256::ONE
+                    } else {
+                        U256::ZERO
+                    }
+                );
+                assert_eq!(evm.ctx.db().storage_ref(callee, U256::ZERO)?, U256::ZERO);
+                outputs.push((result, stored, credits));
+            }
+            assert_eq!(outputs[0], outputs[1]);
+            assert!(
+                backend.stats().lookup_hits >= 2,
+                "both call frames must execute compiled code"
+            );
+            assert_eq!(backend.stats().compilations_failed, 0);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn jit_storage_credit_equivalence() -> eyre::Result<()> {
         let key_pair = P256KeyPair::random();
         let caller = key_pair.address;
@@ -4594,7 +4667,7 @@ mod jit_tests {
         for spec in [TempoHardfork::T6, TempoHardfork::T7, TempoHardfork::T13] {
             for mode in [CreditMode::Refund, CreditMode::Preserve, CreditMode::Direct] {
                 for revert in [false, true] {
-                    for gas_limit in [100_000, 2_000_000] {
+                    for gas_limit in [300_000, 2_000_000] {
                         let backend = JitBackend::new(RuntimeConfig {
                             enabled: true,
                             blocking: true,

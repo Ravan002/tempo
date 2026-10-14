@@ -1,4 +1,4 @@
-//! CLI arguments and metrics for revmc JIT compilation.
+//! CLI arguments and backend construction for revmc JIT compilation.
 
 use clap::Args;
 use humantime::parse_duration;

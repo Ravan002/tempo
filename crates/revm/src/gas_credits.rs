@@ -93,7 +93,9 @@ pub fn apply_refund<DB: Database, I>(
 /// Bridges the revm host/interpreter to the backend-agnostic [`sstore_storage_credits`] so the
 /// SSTORE opcode runs the same TIP-1060 storage credits policy as precompile storage writes.
 pub(crate) struct StorageCreditsContext<'a, H: revm::context::Host + ?Sized> {
+    /// Host used for storage-credit bookkeeping.
     pub(crate) context: &'a mut H,
+    /// Transaction gas tracker charged by the shared storage-credit policy.
     pub(crate) gas_tracker: &'a mut GasTracker,
 }
 
