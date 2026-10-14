@@ -21,13 +21,19 @@ RUN curl -fsSL "https://get.nexte.st/${NEXTEST_VERSION}/linux" | tar -xzf - -C "
 COPY . /src
 WORKDIR /src
 
+# Some e2e tests overflow the default stack, as in CI.
 ENV RUST_BACKTRACE=1 \
     CARGO_TERM_COLOR=never \
-    # Some e2e tests overflow the default stack, as in CI.
-    RUST_MIN_STACK=8388608 \
-    # Line tables keep backtraces useful without full debuginfo's link time and disk.
-    CARGO_PROFILE_DEV_DEBUG=line-tables-only \
-    CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C link-arg=-fuse-ld=mold"
+    RUST_MIN_STACK=8388608
+
+# In cargo's global config so later builds in the image use the same profile and reuse these artifacts. Line tables
+# for workspace crates only, and no incremental cache: with either, the image grows past 90 GB.
+RUN printf '%s\n' \
+      '[build]' 'incremental = false' \
+      '[target.x86_64-unknown-linux-gnu]' 'rustflags = ["-C", "link-arg=-fuse-ld=mold"]' \
+      '[profile.dev]' 'debug = "line-tables-only"' \
+      '[profile.dev.package."*"]' 'debug = 0' \
+      > "${CARGO_HOME}/config.toml"
 
 RUN cargo fetch --locked
 
