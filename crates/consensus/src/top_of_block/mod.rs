@@ -115,6 +115,13 @@ pub fn start_operator_network(
 ) -> eyre::Result<OperatorChannels> {
     use commonware_runtime::Supervisor as _;
 
+    let validators = ordered::Map::from_iter_dedup(
+        config
+            .validators
+            .into_iter()
+            .map(|(key, address)| (key, Address::Symmetric(address))),
+    );
+    eyre::ensure!(!validators.is_empty(), "no validators to connect to");
     let namespace = commonware_utils::union_unique(crate::config::NAMESPACE, b"_P2P");
     // Inbound mailboxes are preallocated for `max_peers_per_set *
     // tracked_peer_sets * burst` messages, so keep these bounds tight.
@@ -129,7 +136,9 @@ pub fn start_operator_network(
                 config.signer,
                 &namespace,
                 config.listen,
-                std::num::NonZeroUsize::new(16).expect("not zero"),
+                // The tracked set holds every validator, and the network counts
+                // this node too.
+                std::num::NonZeroUsize::new(validators.len() + 1).expect("not zero"),
                 config.max_message_size,
             )
         },
@@ -151,13 +160,6 @@ pub fn start_operator_network(
     }
     let top_of_block = network.register(CHANNEL, LIMIT);
 
-    let validators = ordered::Map::from_iter_dedup(
-        config
-            .validators
-            .into_iter()
-            .map(|(key, address)| (key, Address::Symmetric(address))),
-    );
-    eyre::ensure!(!validators.is_empty(), "no validators to connect to");
     oracle.track(
         0,
         AddressableTrackedPeers {
