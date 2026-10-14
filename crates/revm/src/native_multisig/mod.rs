@@ -240,7 +240,7 @@ pub fn validate_state<J: JournalTr>(
                 extra_gas += CONFIG_COMMITMENT_REGISTRATION_GAS;
                 if info.is_empty()
                     && !(address == tx.caller
-                        && crate::handler::pays_nonce_zero_account_gas(tx, spec))
+                        && crate::handler::pays_sender_account_creation(tx, spec))
                 {
                     extra_gas += gas.get(GasId::new_account_cost());
                     state_gas += gas.new_account_state_gas();

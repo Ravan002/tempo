@@ -2434,7 +2434,7 @@ pub fn calculate_aa_batch_intrinsic_gas<'a>(
     Ok(gas)
 }
 
-/// Whether the AA intrinsic charge already covers creation of the sender account.
+/// Whether AA intrinsic gas includes TIP-1000's `nonce == 0` charge.
 pub(crate) fn pays_nonce_zero_account_gas(
     tx: &crate::TempoTxEnv,
     spec: tempo_chainspec::hardfork::TempoHardfork,
@@ -2445,6 +2445,23 @@ pub(crate) fn pays_nonce_zero_account_gas(
             .tempo_tx_env
             .as_ref()
             .is_some_and(|aa| aa.nonce_key != TEMPO_EXPIRING_NONCE_KEY)
+}
+
+/// Whether another TIP-1000 charge already pays for creating an empty sender account.
+/// With a 2D nonce key, the `nonce == 0` charge pays for the nonce-key slot instead.
+pub(crate) fn pays_sender_account_creation(
+    tx: &crate::TempoTxEnv,
+    spec: tempo_chainspec::hardfork::TempoHardfork,
+) -> bool {
+    let Some(aa) = tx.tempo_tx_env.as_ref() else {
+        return false;
+    };
+    if aa.nonce_key.is_zero() {
+        pays_nonce_zero_account_gas(tx, spec)
+    } else {
+        // Charged in `validate_against_state_and_deduct_caller`.
+        tx.first_call().is_some_and(|(kind, _)| kind.is_create())
+    }
 }
 
 /// Validates and calculates intrinsic gas for AA signatures and batch calls.
