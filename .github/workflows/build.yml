@@ -12,6 +12,11 @@ on:
         options:
           - "tempo"
           - "tempo-sidecar"
+          - "tempo-zone"
+          - "tempo-zone-xtask"
+          - "tempo-zone-prover-utils"
+          - "tempo-zone-prover-enclave"
+          - "tempo-vsock-proxy"
           - "all"
       profile:
         default: "maxperf"
@@ -42,7 +47,7 @@ jobs:
       contents: read
     strategy:
       matrix:
-        binary: ${{ fromJSON(inputs.binary == 'all' && '["tempo","tempo-sidecar"]' || format('["{0}"]', inputs.binary || 'tempo')) }}
+        binary: ${{ fromJSON(inputs.binary == 'all' && '["tempo","tempo-sidecar","tempo-zone","tempo-zone-xtask","tempo-zone-prover-utils","tempo-zone-prover-enclave","tempo-vsock-proxy"]' || format('["{0}"]', inputs.binary || 'tempo')) }}
     steps:
       - name: Secure runner
         uses: tempoxyz/gh-actions/actions/secure-runner@e813067e922303348ee5aad965f745803cc24f1f # 2026-10-02T09-56-31Z-e813067e
