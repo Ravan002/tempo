@@ -40,7 +40,7 @@ import {
     WithdrawalQueueLib
 } from "../../src/runtime/libraries/WithdrawalQueueLib.sol";
 import { ZoneMessenger } from "../../src/runtime/tempo/ZoneMessenger.sol";
-import { ZonePortal } from "../../src/runtime/tempo/ZonePortal.sol";
+import { ITIP403TokenPolicy, ZonePortal } from "../../src/runtime/tempo/ZonePortal.sol";
 import { BaseTest } from "../BaseTest.t.sol";
 import { PortalRuntimeTest } from "../PortalRuntimeTest.sol";
 import { MockRevertingReceiver } from "../mocks/MockCallbackReceivers.sol";
@@ -2758,6 +2758,30 @@ contract ZonePortalTest is BaseTest {
         vm.expectRevert(ITIP20.PolicyForbids.selector);
         _deposit(portal, address(pathUSD), alice, depositAmount, bytes32("memo"), bob);
         vm.stopPrank();
+    }
+
+    function testFuzz_deposit_tokenSpecificRefundPolicy(bool authorized) public {
+        uint128 amount = 1000e6;
+        vm.mockCall(
+            address(pathUSD),
+            abi.encodeCall(ITIP20.transferPolicyId, ()),
+            abi.encode(type(uint64).max)
+        );
+        vm.mockCall(
+            address(registry),
+            abi.encodeCall(
+                ITIP403TokenPolicy.isTokenAuthorized,
+                (address(pathUSD), bob, ITIP403TokenPolicy.AuthRole.RECIPIENT)
+            ),
+            abi.encode(authorized)
+        );
+        vm.startPrank(alice);
+        pathUSD.approve(address(portal), amount);
+        if (!authorized) vm.expectRevert(ITIP20.PolicyForbids.selector);
+        _deposit(portal, address(pathUSD), alice, amount, bytes32("memo"), bob);
+        vm.stopPrank();
+        assertEq(portal.depositCount(), authorized ? 1 : 0);
+        assertEq(pathUSD.balanceOf(address(portal)), authorized ? amount : 0);
     }
 
     function test_deposit_allowsCompoundPolicyMintRecipient() public {

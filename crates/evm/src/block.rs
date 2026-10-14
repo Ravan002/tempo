@@ -27,7 +27,7 @@ use tempo_contracts::precompiles::{
     ADDRESS_REGISTRY_ADDRESS, CURRENT_COMMITTEE_ADDRESS, ICurrentCommittee, INITIAL_FACTORY_OWNER,
     InitialZoneFactoryAccount, RECEIVE_POLICY_GUARD_ADDRESS, SIGNATURE_VERIFIER_ADDRESS,
     STORAGE_CREDITS_ADDRESS, TIP20_CHANNEL_RESERVE_ADDRESS, VALIDATOR_CONFIG_V2_ADDRESS,
-    initial_zone_factory_state, t13_zone_factory_state,
+    initial_zone_factory_state, t13_zone_factory_state, t14_zone_factory_state,
 };
 use tempo_primitives::{SubBlockMetadata, TempoReceipt, TempoTxEnvelope, TempoTxType};
 use tempo_revm::{ExecutionContext, evm::TempoContext};
@@ -273,9 +273,13 @@ where
         Ok(())
     }
 
-    /// Exercises the shared runtime upgrade path at T13.
+    /// Installs the shared runtimes for the active hardfork.
     fn upgrade_zone_runtimes_at_boundary(&mut self) -> Result<(), BlockExecutionError> {
-        let [_, portal, verifier, messenger] = t13_zone_factory_state(INITIAL_FACTORY_OWNER);
+        let [_, portal, verifier, messenger] = if self.evm().cfg.spec.is_t14() {
+            t14_zone_factory_state(INITIAL_FACTORY_OWNER)
+        } else {
+            t13_zone_factory_state(INITIAL_FACTORY_OWNER)
+        };
         self.install_zone_runtimes_at_boundary([portal, verifier, messenger])
     }
 
@@ -542,14 +546,19 @@ where
         if self.inner.spec.is_t10_active_at_timestamp(timestamp) {
             self.deploy_zone_factory_at_boundary()?;
         }
-        // Chains starting at T13 supply their runtime code in genesis. Preserve those
+        // Chains starting at the active fork supply their runtime code in genesis. Preserve those
         // allocations (including locally compiled contracts on test chains). Chains
-        // that activate T13 later still follow the normal runtime upgrade path.
-        if self.inner.spec.is_t13_active_at_timestamp(timestamp)
+        // that activate a later fork still follow the normal runtime upgrade path.
+        if (self.inner.spec.is_t13_active_at_timestamp(timestamp)
             && !self
                 .inner
                 .spec
-                .is_t13_active_at_timestamp(self.inner.spec.genesis().timestamp)
+                .is_t13_active_at_timestamp(self.inner.spec.genesis().timestamp))
+            || (self.inner.spec.is_t14_active_at_timestamp(timestamp)
+                && !self
+                    .inner
+                    .spec
+                    .is_t14_active_at_timestamp(self.inner.spec.genesis().timestamp))
         {
             self.upgrade_zone_runtimes_at_boundary()?;
         }
@@ -762,7 +771,8 @@ mod tests {
         },
         zones::{
             T13_ZONE_MESSENGER_RUNTIME, T13_ZONE_PORTAL_RUNTIME, T13_ZONE_VERIFIER_RUNTIME,
-            ZONE_MESSENGER_RUNTIME, ZONE_PORTAL_RUNTIME, ZONE_VERIFIER_RUNTIME,
+            T14_ZONE_PORTAL_RUNTIME, ZONE_MESSENGER_RUNTIME, ZONE_PORTAL_RUNTIME,
+            ZONE_VERIFIER_RUNTIME,
         },
     };
     use tempo_dkg_onchain_artifacts::OnchainDkgOutcome;
@@ -2232,6 +2242,78 @@ mod tests {
                     .code
                     .unwrap();
                 assert_eq!(installed.original_bytes(), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn portal_runtime_upgrade_activates_at_t14() {
+        for (genesis_timestamp, timestamp, portal_runtime) in [
+            (0, 19, T13_ZONE_PORTAL_RUNTIME),
+            (0, 20, T14_ZONE_PORTAL_RUNTIME),
+            (0, 21, T14_ZONE_PORTAL_RUNTIME),
+            (20, 21, T13_ZONE_PORTAL_RUNTIME),
+        ] {
+            let mut genesis = DEV.genesis().clone();
+            genesis.timestamp = genesis_timestamp;
+            genesis
+                .config
+                .extra_fields
+                .insert_value("t13Time".into(), 0)
+                .unwrap();
+            genesis
+                .config
+                .extra_fields
+                .insert_value("t14Time".into(), 20)
+                .unwrap();
+            let chainspec = Arc::new(TempoChainSpec::from_genesis(genesis));
+            let mut db = State::builder().with_bundle_update().build();
+            for account in t13_zone_factory_state(INITIAL_FACTORY_OWNER) {
+                let code = Bytecode::new_legacy(account.code);
+                db.insert_account_with_storage(
+                    account.address,
+                    AccountInfo {
+                        balance: U256::from(42),
+                        nonce: 7,
+                        code_hash: code.hash_slow(),
+                        code: Some(code),
+                        ..Default::default()
+                    },
+                    [(U256::from(9), U256::from(123))].into_iter().collect(),
+                );
+            }
+            let mut executor = TestExecutorBuilder::default()
+                .with_spec(if timestamp < 20 {
+                    TempoHardfork::T13
+                } else {
+                    TempoHardfork::T14
+                })
+                .with_parent_beacon_block_root(B256::ZERO)
+                .build(&mut db, &chainspec);
+            executor.evm_mut().ctx_mut().block.timestamp = U256::from(timestamp);
+            executor.apply_pre_execution_changes().unwrap();
+            drop(executor);
+            for (index, account) in t14_zone_factory_state(INITIAL_FACTORY_OWNER)
+                .into_iter()
+                .enumerate()
+            {
+                let info = db
+                    .load_cache_account(account.address)
+                    .unwrap()
+                    .account_info()
+                    .unwrap();
+                let expected = if index == 1 {
+                    portal_runtime.clone()
+                } else {
+                    account.code
+                };
+                assert_eq!(info.code.unwrap().original_bytes(), expected);
+                assert_eq!(info.balance, U256::from(42));
+                assert_eq!(info.nonce, 7);
+                assert_eq!(
+                    revm::Database::storage(&mut db, account.address, U256::from(9)).unwrap(),
+                    U256::from(123)
+                );
             }
         }
     }

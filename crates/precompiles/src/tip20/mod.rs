@@ -206,7 +206,11 @@ impl TIP20Token {
 
     /// Returns the maximum mintable supply.
     pub fn supply_cap(&self) -> Result<U256> {
-        self.supply_cap_of(&self.load_supply()?)
+        if self.storage.spec().is_t14() {
+            self.supply_cap_of(&self.load_supply()?)
+        } else {
+            self.supply_cap.read()
+        }
     }
 
     /// Returns whether the token is currently paused.
@@ -245,15 +249,17 @@ impl TIP20Token {
             return Ok(IssuerPolicy::TokenSpecific(policy));
         }
         Ok(match self.generic_transfer_policy_id()? {
-            TOKEN_POLICY_ID => match TIP403Registry::new().token_policy(self.address)? {
-                policy if policy.is_set => IssuerPolicy::TokenSpecific(policy),
-                _ => IssuerPolicy::Generic(REJECT_ALL_POLICY_ID),
-            },
+            TOKEN_POLICY_ID if self.storage.spec().is_t14() => {
+                match TIP403Registry::new().token_policy(self.address)? {
+                    policy if policy.is_set => IssuerPolicy::TokenSpecific(policy),
+                    _ => IssuerPolicy::Generic(REJECT_ALL_POLICY_ID),
+                }
+            }
             policy_id => IssuerPolicy::Generic(policy_id),
         })
     }
 
-    /// Returns the generic TIP-403 policy ID bound to this token.
+    /// Returns the registered policy ID, falling back to legacy token-local storage.
     fn generic_transfer_policy_id(&self) -> Result<u64> {
         if StorageCtx.spec().is_t9()
             && let Some(policy_id) =
@@ -1176,8 +1182,8 @@ impl TIP20Token {
 
     /// Like [`Self::initialize`]. With `mirror_registry`, for environments whose TIP-403 state
     /// mirrors another chain (e.g. zones), the token keeps the legacy layout, as a packed mode
-    /// cache could not be synchronized. Without a registry binding, its policy then resolves from
-    /// the registry's token-specific policy, or rejects all if none is active.
+    /// cache could not be synchronized. At T14, without a registry binding, its policy resolves
+    /// from the registry's token-specific policy, or rejects all if none is active.
     #[allow(clippy::too_many_arguments)]
     pub fn initialize_with_mirror(
         &mut self,
@@ -1212,9 +1218,6 @@ impl TIP20Token {
                     .set_token_transfer_policy(self.address, ALLOW_ALL_POLICY_ID)?;
             } else {
                 self.transfer_policy_id.write(ALLOW_ALL_POLICY_ID)?;
-            }
-            if mirror_registry {
-                self.transfer_policy_id.write(TOKEN_POLICY_ID)?;
             }
         }
 

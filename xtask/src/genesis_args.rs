@@ -41,7 +41,7 @@ use tempo_contracts::{
     contracts::{CreateX, Multicall3, SafeDeployer},
     precompiles::{
         INITIAL_FACTORY_OWNER, IValidatorConfigV2, createTokenCall, initial_zone_factory_state,
-        t13_zone_factory_state,
+        t13_zone_factory_state, t14_zone_factory_state,
     },
 };
 use tempo_dkg_onchain_artifacts::OnchainDkgOutcome;
@@ -531,7 +531,9 @@ fn insert_zone_state_at_genesis(
 ) {
     if hardforks.active_at_genesis(TempoHardfork::T10) {
         println!("Initializing ZoneFactory and shared runtimes");
-        let accounts = if hardforks.active_at_genesis(TempoHardfork::T13) {
+        let accounts = if hardforks.active_at_genesis(TempoHardfork::T14) {
+            t14_zone_factory_state(INITIAL_FACTORY_OWNER)
+        } else if hardforks.active_at_genesis(TempoHardfork::T13) {
             t13_zone_factory_state(INITIAL_FACTORY_OWNER)
         } else {
             initial_zone_factory_state(INITIAL_FACTORY_OWNER)
@@ -884,7 +886,8 @@ mod tests {
         },
         zones::{
             T13_ZONE_MESSENGER_RUNTIME, T13_ZONE_PORTAL_RUNTIME, T13_ZONE_VERIFIER_RUNTIME,
-            ZONE_MESSENGER_RUNTIME, ZONE_PORTAL_RUNTIME, ZONE_VERIFIER_RUNTIME,
+            T14_ZONE_PORTAL_RUNTIME, ZONE_MESSENGER_RUNTIME, ZONE_PORTAL_RUNTIME,
+            ZONE_VERIFIER_RUNTIME,
         },
     };
 
@@ -951,6 +954,7 @@ mod tests {
     fn t10_genesis_installs_factory_and_canonical_shared_runtimes() {
         let mut alloc = BTreeMap::new();
         let hardforks = TempoHardforkArgs {
+            hardfork: Some(TempoHardfork::T10),
             t13_time: Some(1),
             ..Default::default()
         };
@@ -988,7 +992,10 @@ mod tests {
     #[test]
     fn t13_genesis_installs_t13_shared_runtimes() {
         let mut alloc = BTreeMap::new();
-        let hardforks = TempoHardforkArgs::default();
+        let hardforks = TempoHardforkArgs {
+            hardfork: Some(TempoHardfork::T13),
+            ..Default::default()
+        };
         insert_zone_state_at_genesis(&hardforks, &mut alloc);
 
         for (destination, expected) in [
@@ -998,6 +1005,20 @@ mod tests {
         ] {
             assert_eq!(alloc[&destination].code.as_ref(), Some(&expected));
         }
+    }
+
+    #[test]
+    fn t14_genesis_installs_token_policy_portal_runtime() {
+        let mut alloc = BTreeMap::new();
+        let hardforks = TempoHardforkArgs {
+            t14_time: Some(0),
+            ..Default::default()
+        };
+        insert_zone_state_at_genesis(&hardforks, &mut alloc);
+        assert_eq!(
+            alloc[&ZONE_PORTAL_IMPL_ADDRESS].code.as_ref(),
+            Some(&T14_ZONE_PORTAL_RUNTIME)
+        );
     }
 
     #[derive(Parser)]

@@ -356,6 +356,7 @@ mod tests {
         error::TempoPrecompileError,
         storage::{ContractStorage, StorageCtx, hashmap::HashMapStorageProvider},
         test_util::TIP20Setup,
+        tip403_registry::TOKEN_POLICY_ID,
     };
     use alloy::{
         primitives::{B256, U256, address, keccak256},
@@ -363,7 +364,7 @@ mod tests {
     };
     use portal::PortalTokenConfig;
     use tempo_chainspec::hardfork::TempoHardfork;
-    use tempo_contracts::precompiles::ZonePortalCapability;
+    use tempo_contracts::precompiles::{ITIP20, ZonePortalCapability};
 
     const OWNER: Address = Address::with_last_byte(0x11);
     const ADMIN: Address = Address::with_last_byte(0x22);
@@ -917,5 +918,38 @@ mod tests {
 
             Ok(())
         })
+    }
+
+    #[test]
+    fn create_zone_accepts_token_specific_policies() -> eyre::Result<()> {
+        for converted in [false, true] {
+            let mut storage = HashMapStorageProvider::new_with_spec(1, TempoHardfork::T13);
+            StorageCtx::enter(&mut storage, || -> eyre::Result<()> {
+                if !converted {
+                    StorageCtx.set_spec(TempoHardfork::T14);
+                }
+                let mut token = TIP20Setup::path_usd(ADMIN).apply()?;
+                StorageCtx.set_spec(TempoHardfork::T14);
+                if converted {
+                    token.change_transfer_policy_id(
+                        ADMIN,
+                        ITIP20::changeTransferPolicyIdCall {
+                            newPolicyId: TOKEN_POLICY_ID,
+                        },
+                    )?;
+                }
+                let mut factory = factory_with_owner(OWNER)?;
+                let created = factory.create_zone(
+                    OWNER,
+                    IZoneFactory::createZoneCall {
+                        params: create_params(PATH_USD_ADDRESS),
+                    },
+                )?;
+                assert_eq!(created.portal, portal_address(1));
+                assert_eq!(token.transfer_policy_id()?, TOKEN_POLICY_ID);
+                Ok(())
+            })?;
+        }
+        Ok(())
     }
 }
