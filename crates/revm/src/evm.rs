@@ -76,6 +76,9 @@ pub struct TempoEvm<DB: Database, I> {
     /// Compiled dispatch and the Tempo gas schedule used to compile it.
     #[cfg(feature = "jit")]
     jit_backend: Option<(crate::jit::JitBackend, TempoHardfork)>,
+    /// Dispatch decisions retained until the next root frame begins.
+    #[cfg(feature = "jit")]
+    jit_decisions: alloy_primitives::map::B256HashMap<crate::jit::LookupDecision>,
 }
 
 impl<DB: Database, I> TempoEvm<DB, I> {
@@ -138,6 +141,8 @@ impl<DB: Database, I> TempoEvm<DB, I> {
             precompiles_builder,
             #[cfg(feature = "jit")]
             jit_backend,
+            #[cfg(feature = "jit")]
+            jit_decisions,
             ..
         } = self;
 
@@ -156,6 +161,8 @@ impl<DB: Database, I> TempoEvm<DB, I> {
             precompiles_builder,
             #[cfg(feature = "jit")]
             jit_backend,
+            #[cfg(feature = "jit")]
+            jit_decisions,
         }
     }
 
@@ -190,6 +197,8 @@ impl<DB: Database, I> TempoEvm<DB, I> {
             precompiles_builder,
             #[cfg(feature = "jit")]
             jit_backend: None,
+            #[cfg(feature = "jit")]
+            jit_decisions: Default::default(),
         }
     }
 
@@ -245,6 +254,7 @@ impl<DB: Database, I> TempoEvm<DB, I> {
     #[cfg(feature = "jit")]
     pub fn set_jit_backend(&mut self, backend: crate::jit::JitBackend, spec: TempoHardfork) {
         self.jit_backend = Some((backend, spec));
+        self.jit_decisions.clear();
     }
 
     /// Consumes self and returns the inner Inspector.
@@ -313,6 +323,10 @@ where
         ItemOrResult<&mut Self::Frame, <Self::Frame as FrameTr>::FrameResult>,
         ContextError<DB::Error>,
     > {
+        #[cfg(feature = "jit")]
+        if self.inner.frame_stack.index().is_none() {
+            self.jit_decisions.clear();
+        }
         self.inner.frame_init(frame_input)
     }
 
@@ -325,12 +339,16 @@ where
         {
             let frame = self.inner.frame_stack.get();
             let code_hash = frame.interpreter.bytecode.get_or_calculate_hash();
-            let decision = backend.lookup(crate::jit::LookupRequest {
-                key: crate::jit::RuntimeCacheKey {
-                    code_hash,
-                    spec_id: (*spec).into(),
-                },
-                code: frame.interpreter.bytecode.original_bytes(),
+            // Compiled resume indices differ from interpreter PCs. Keep the original
+            // decision and compiled handle alive across every CALL/CREATE suspension.
+            let decision = self.jit_decisions.entry(code_hash).or_insert_with(|| {
+                backend.lookup(crate::jit::LookupRequest {
+                    key: crate::jit::RuntimeCacheKey {
+                        code_hash,
+                        spec_id: (*spec).into(),
+                    },
+                    code: frame.interpreter.bytecode.original_bytes(),
+                })
             });
             if let crate::jit::LookupDecision::Compiled(program) = decision {
                 tracing::trace!(target: "tempo::jit::execution", %code_hash, "Executing compiled bytecode");

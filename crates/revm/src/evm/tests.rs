@@ -4584,7 +4584,15 @@ fn test_aa_tx_transfer_calls_format_no_extra_250k() -> eyre::Result<()> {
 #[cfg(feature = "jit")]
 mod jit_tests {
     use super::*;
-    use crate::jit::{JitBackend, RuntimeConfig};
+    use crate::jit::{JitBackend, LookupRequest, RuntimeCacheKey, RuntimeConfig, RuntimeTuning};
+    use revm::{
+        context::JournalTr,
+        handler::{EvmTr, ItemOrResult},
+        interpreter::{
+            CallInputs, CallScheme, CallValue, FrameInput, SharedMemory,
+            interpreter_action::FrameInit, interpreter_types::Jumps,
+        },
+    };
 
     #[test]
     fn jit_nested_call_equivalence() -> eyre::Result<()> {
@@ -4752,6 +4760,99 @@ mod jit_tests {
                 }
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn jit_compilation_during_suspended_frame() -> eyre::Result<()> {
+        let caller = Address::repeat_byte(0x6b);
+        let contract = Address::repeat_byte(0x6c);
+        let spec = TempoHardfork::T13;
+        let backend = JitBackend::new(RuntimeConfig {
+            enabled: true,
+            gas_params: Some(tempo_gas_params(spec)),
+            tuning: RuntimeTuning {
+                jit_hot_threshold: usize::MAX,
+                ..Default::default()
+            },
+            ..Default::default()
+        })?;
+        // Call the identity precompile, then return its success flag.
+        let code = Bytecode::new_raw(bytes!("6000600060006000600461fffffa60005260206000f3"));
+        let code_hash = code.hash_slow();
+        let input = FrameInit {
+            depth: 0,
+            memory: SharedMemory::new(),
+            frame_input: FrameInput::Call(Box::new(CallInputs {
+                input: Default::default(),
+                return_memory_offset: 0..0,
+                gas_limit: 1_000_000,
+                reservoir: 0,
+                bytecode_address: contract,
+                known_bytecode: (code_hash, code.clone()),
+                target_address: contract,
+                caller,
+                value: CallValue::Transfer(U256::ZERO),
+                scheme: CallScheme::Call,
+                is_static: false,
+                charged_new_account_state_gas: false,
+            })),
+        };
+        let mut evm = create_funded_evm_at_spec_with_timestamp(caller, 1, spec);
+        evm.set_jit_backend(backend.clone(), spec);
+        evm.ctx.journal_mut().load_account(contract).unwrap();
+        evm.ctx
+            .journal_mut()
+            .load_account(IDENTITY_PRECOMPILE)
+            .unwrap();
+        assert!(evm.frame_init(input.clone()).unwrap().is_item());
+        let ItemOrResult::Item(child) = evm.frame_run().unwrap() else {
+            panic!("expected suspension at STATICCALL");
+        };
+        assert!(evm.inner.frame_stack.get().interpreter.bytecode.pc() > 0);
+        backend.compile_jit_sync(LookupRequest {
+            key: RuntimeCacheKey {
+                code_hash,
+                spec_id: spec.into(),
+            },
+            code: code.original_bytes(),
+        })?;
+        assert!(backend.get_compiled(code_hash, spec.into()).is_some());
+        let ItemOrResult::Result(child_result) = evm.frame_init(child).unwrap() else {
+            panic!("identity precompile must return without a child frame");
+        };
+        assert!(evm.frame_return_result(child_result).unwrap().is_none());
+        let ItemOrResult::Result(interpreted) = evm.frame_run().unwrap() else {
+            panic!("expected root frame result");
+        };
+        assert_eq!(
+            interpreted.interpreter_result().output.as_ref(),
+            U256::ONE.to_be_bytes::<32>()
+        );
+        assert!(
+            evm.frame_return_result(interpreted.clone())
+                .unwrap()
+                .is_some()
+        );
+
+        // The next root frame must pick up the newly compiled program.
+        assert!(evm.frame_init(input).unwrap().is_item());
+        let ItemOrResult::Item(child) = evm.frame_run().unwrap() else {
+            panic!("expected compiled STATICCALL suspension");
+        };
+        // Compiled execution stores a resume index instead of the bytecode PC.
+        assert_eq!(evm.inner.frame_stack.get().interpreter.bytecode.pc(), 1);
+        let ItemOrResult::Result(child_result) = evm.frame_init(child).unwrap() else {
+            panic!("identity precompile must return without a child frame");
+        };
+        assert!(evm.frame_return_result(child_result).unwrap().is_none());
+        let ItemOrResult::Result(compiled) = evm.frame_run().unwrap() else {
+            panic!("expected compiled root frame result");
+        };
+        assert_eq!(
+            interpreted.interpreter_result(),
+            compiled.interpreter_result()
+        );
         Ok(())
     }
 }
