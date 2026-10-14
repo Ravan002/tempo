@@ -9,7 +9,10 @@ use revm::{
     state::{AccountInfo, Bytecode},
 };
 use scoped_tls::scoped_thread_local;
-use std::{cell::RefCell, fmt::Debug};
+use std::{
+    cell::{Cell, RefCell},
+    fmt::Debug,
+};
 use tempo_chainspec::hardfork::TempoHardfork;
 use tempo_primitives::TempoBlockEnv;
 
@@ -19,7 +22,13 @@ use crate::{
     storage::{PrecompileStorageProvider, StorageActions, evm::EvmPrecompileStorageProvider},
 };
 
-scoped_thread_local!(static STORAGE: RefCell<&mut dyn PrecompileStorageProvider>);
+scoped_thread_local!(static STORAGE: StorageScope);
+
+/// Active provider plus its cached spec, which avoids a borrow and virtual call per `spec()`.
+struct StorageScope {
+    provider: RefCell<&'static mut dyn PrecompileStorageProvider>,
+    spec: Cell<TempoHardfork>,
+}
 
 /// Thread-local storage accessor that implements `PrecompileStorageProvider` without the trait bound.
 ///
@@ -55,8 +64,11 @@ impl StorageCtx {
         let storage: &mut dyn PrecompileStorageProvider = storage;
         let storage_static: &mut (dyn PrecompileStorageProvider + 'static) =
             unsafe { std::mem::transmute(storage) };
-        let cell = RefCell::new(storage_static);
-        STORAGE.set(&cell, f)
+        let scope = StorageScope {
+            spec: Cell::new(storage_static.spec()),
+            provider: RefCell::new(storage_static),
+        };
+        STORAGE.set(&scope, f)
     }
 
     /// Execute an infallible function with access to the current thread-local storage provider.
@@ -74,7 +86,7 @@ impl StorageCtx {
         STORAGE.with(|cell| {
             // SAFETY: `scoped_tls` ensures the pointer is only accessible within the closure scope.
             // Holding the guard prevents re-entrant borrows.
-            let mut guard = cell.borrow_mut();
+            let mut guard = cell.provider.borrow_mut();
             f(&mut **guard)
         })
     }
@@ -92,7 +104,7 @@ impl StorageCtx {
         STORAGE.with(|cell| {
             // SAFETY: `scoped_tls` ensures the pointer is only accessible within the closure scope.
             // Holding the guard prevents re-entrant borrows.
-            let mut guard = cell.borrow_mut();
+            let mut guard = cell.provider.borrow_mut();
             f(&mut **guard)
         })
     }
@@ -236,7 +248,7 @@ impl StorageCtx {
 
     /// Returns the currently active hardfork.
     pub fn spec(&self) -> TempoHardfork {
-        Self::with_storage(|s| s.spec())
+        STORAGE.with(|scope| scope.spec.get())
     }
 
     /// Returns the shared storage-actions recorder for the current storage context.
@@ -276,13 +288,10 @@ impl StorageCtx {
     /// Panics if no storage context is set.
     pub fn checkpoint(&mut self) -> CheckpointGuard {
         // spec: only available +T1C. Prior to that checkpoints are a no-op.
-        let checkpoint = Self::with_storage(|s| {
-            if s.spec().is_t1c() {
-                Some(s.checkpoint())
-            } else {
-                None
-            }
-        });
+        let checkpoint = self
+            .spec()
+            .is_t1c()
+            .then(|| Self::with_storage(|s| s.checkpoint()));
 
         CheckpointGuard { checkpoint }
     }
@@ -543,7 +552,8 @@ impl StorageCtx {
 
     /// NOTE: assumes storage tests always use the `HashMapStorageProvider`
     pub fn set_spec(&mut self, spec: TempoHardfork) {
-        self.as_hashmap().set_spec(spec)
+        self.as_hashmap().set_spec(spec);
+        STORAGE.with(|scope| scope.spec.set(spec));
     }
 
     /// NOTE: assumes storage tests always use the `HashMapStorageProvider`
