@@ -31,7 +31,7 @@ use crate::{
     tip20::{layout::Supply, rewards::UserRewardInfo, roles::DEFAULT_ADMIN_ROLE},
     tip20_factory::TIP20Factory,
     tip403_registry::{
-        ALLOW_ALL_POLICY_ID, AuthRole, ITIP403Registry, REJECT_ALL_POLICY_ID, TIP403Registry,
+        ALLOW_ALL_POLICY_ID, AuthRole, ITIP403Registry, IssuerPolicy, TIP403Registry,
         TIP403RegistryError, TOKEN_POLICY_ID, TokenPolicy,
     },
 };
@@ -222,7 +222,7 @@ impl TIP20Token {
     ///
     /// (T14+) Tokens with a token-specific policy report [`TOKEN_POLICY_ID`].
     pub fn transfer_policy_id(&self) -> Result<u64> {
-        Ok(match self.issuer_policy()? {
+        Ok(match TIP403Registry::new().issuer_policy(self)? {
             IssuerPolicy::Generic(policy_id) => policy_id,
             IssuerPolicy::TokenSpecific(_) => TOKEN_POLICY_ID,
         })
@@ -233,42 +233,10 @@ impl TIP20Token {
     /// # Errors
     /// - `InvalidTransferPolicyId` — the token uses a generic TIP-403 policy
     pub fn transfer_policy(&self) -> Result<TokenPolicy> {
-        match self.issuer_policy()? {
+        match TIP403Registry::new().issuer_policy(self)? {
             IssuerPolicy::TokenSpecific(policy) => Ok(policy),
             IssuerPolicy::Generic(_) => Err(TIP20Error::invalid_transfer_policy_id().into()),
         }
-    }
-
-    /// Resolves the active issuer policy.
-    ///
-    /// Token-specific policies always use the packed layout, so packed tokens read their cached
-    /// modes and legacy tokens use their generic policy ID. Registry-mirroring tokens (see
-    /// [`Self::initialize_with_mirror`]) resolve [`TOKEN_POLICY_ID`] through the registry.
-    pub(crate) fn issuer_policy(&self) -> Result<IssuerPolicy> {
-        if let Some(policy) = self.token_control()?.and_then(|control| control.policy()) {
-            return Ok(IssuerPolicy::TokenSpecific(policy));
-        }
-        Ok(match self.generic_transfer_policy_id()? {
-            TOKEN_POLICY_ID if self.storage.spec().is_t14() => {
-                match TIP403Registry::new().token_policy(self.address)? {
-                    policy if policy.is_set => IssuerPolicy::TokenSpecific(policy),
-                    _ => IssuerPolicy::Generic(REJECT_ALL_POLICY_ID),
-                }
-            }
-            policy_id => IssuerPolicy::Generic(policy_id),
-        })
-    }
-
-    /// Returns the registered policy ID, falling back to legacy token-local storage.
-    fn generic_transfer_policy_id(&self) -> Result<u64> {
-        if StorageCtx.spec().is_t9()
-            && let Some(policy_id) =
-                TIP403Registry::new().registered_token_transfer_policy_id(self.address)?
-        {
-            return Ok(policy_id);
-        }
-
-        self.legacy_transfer_policy_id()
     }
 
     /// Returns the policy ID stored in the legacy TIP-20 storage slot.
@@ -1354,32 +1322,24 @@ impl TIP20Token {
     ///
     /// [TIP-1015]: <https://docs.tempo.xyz/protocol/tips/tip-1015>
     pub fn is_transfer_authorized(&self, from: Address, to: Address) -> Result<bool> {
-        let policy = self.issuer_policy()?;
+        let registry = TIP403Registry::new();
+        let policy = registry.issuer_policy(self)?;
 
         // (spec: +T2) short-circuit and skip recipient check if sender fails
-        let sender_auth = self.policy_allows(policy, from, AuthRole::sender())?;
+        let sender_auth = registry.policy_allows(self.address, policy, from, AuthRole::sender())?;
         if self.storage.spec().is_t2() && !sender_auth {
             return Ok(false);
         }
-        let recipient_auth = self.policy_allows(policy, to, AuthRole::recipient())?;
+        let recipient_auth =
+            registry.policy_allows(self.address, policy, to, AuthRole::recipient())?;
         Ok(sender_auth && recipient_auth)
-    }
-
-    /// Returns whether the resolved `policy` allows `user` in `role`. Callers resolve `policy` once
-    /// via [`Self::issuer_policy`] for repeated checks.
-    fn policy_allows(&self, policy: IssuerPolicy, user: Address, role: AuthRole) -> Result<bool> {
-        let registry = TIP403Registry::new();
-        match policy {
-            IssuerPolicy::Generic(policy_id) => registry.is_authorized_as(policy_id, user, role),
-            IssuerPolicy::TokenSpecific(policy) => {
-                registry.token_policy_allows(self.address, &policy, user, role.mask())
-            }
-        }
     }
 
     /// Returns whether `user` is authorized for `role` by the token's active issuer policy.
     pub fn is_authorized_as(&self, user: Address, role: AuthRole) -> Result<bool> {
-        self.policy_allows(self.issuer_policy()?, user, role)
+        let registry = TIP403Registry::new();
+        let policy = registry.issuer_policy(self)?;
+        registry.policy_allows(self.address, policy, user, role)
     }
 
     /// Ensures the transfer is authorized by the token's [`TIP403Registry`] policy.
@@ -1418,9 +1378,10 @@ impl TIP20Token {
     /// # Errors
     /// - `PolicyForbids` — a user is not authorized for the requested role by the active transfer policy
     pub fn ensure_authorized_as(&self, user_auth: &[(Address, AuthRole)]) -> Result<()> {
-        let policy = self.issuer_policy()?;
+        let registry = TIP403Registry::new();
+        let policy = registry.issuer_policy(self)?;
         for &(user, role) in user_auth {
-            if !self.policy_allows(policy, user, role)? {
+            if !registry.policy_allows(self.address, policy, user, role)? {
                 return Err(TIP20Error::policy_forbids().into());
             }
         }
@@ -1640,15 +1601,6 @@ impl TIP20Token {
 
         Ok(())
     }
-}
-
-/// Issuer authorization source of a TIP-20 token.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum IssuerPolicy {
-    /// Generic (shared) TIP-403 policy ID.
-    Generic(u64),
-    /// TIP-1145 token-specific flat modes.
-    TokenSpecific(TokenPolicy),
 }
 
 /// Descriptive TIP-20 token metadata, written once when the token is initialized.
@@ -4849,8 +4801,9 @@ pub(crate) mod tests {
         let admin = Address::random();
         let sender = Address::random();
         let recipient = Address::random();
+        let user_auth = [(sender, AuthRole::Sender), (recipient, AuthRole::Recipient)];
 
-        for hardfork in [TempoHardfork::T0, TempoHardfork::T1] {
+        for hardfork in [TempoHardfork::T0, TempoHardfork::T1, TempoHardfork::T13] {
             let mut storage = HashMapStorageProvider::new_with_spec(1, hardfork);
 
             StorageCtx::enter(&mut storage, || {
@@ -4877,46 +4830,37 @@ pub(crate) mod tests {
                     },
                 )?;
 
-                // Sender not whitelisted, recipient whitelisted
-                registry.modify_policy_whitelist(
-                    admin,
-                    ITIP403Registry::modifyPolicyWhitelistCall {
-                        policyId: policy_id,
-                        account: recipient,
-                        allowed: true,
-                    },
-                )?;
-                assert!(!token.is_transfer_authorized(sender, recipient)?);
-
-                // Sender whitelisted, recipient not whitelisted
-                registry.modify_policy_whitelist(
-                    admin,
-                    ITIP403Registry::modifyPolicyWhitelistCall {
-                        policyId: policy_id,
-                        account: sender,
-                        allowed: true,
-                    },
-                )?;
-                registry.modify_policy_whitelist(
-                    admin,
-                    ITIP403Registry::modifyPolicyWhitelistCall {
-                        policyId: policy_id,
-                        account: recipient,
-                        allowed: false,
-                    },
-                )?;
-                assert!(!token.is_transfer_authorized(sender, recipient)?);
-
-                // Both whitelisted
-                registry.modify_policy_whitelist(
-                    admin,
-                    ITIP403Registry::modifyPolicyWhitelistCall {
-                        policyId: policy_id,
-                        account: recipient,
-                        allowed: true,
-                    },
-                )?;
-                assert!(token.is_transfer_authorized(sender, recipient)?);
+                for (updates, authorized) in [
+                    (&[(recipient, true)][..], false),
+                    (&[(sender, true), (recipient, false)][..], false),
+                    (&[(recipient, true)][..], true),
+                ] {
+                    for &(account, allowed) in updates {
+                        registry.modify_policy_whitelist(
+                            admin,
+                            ITIP403Registry::modifyPolicyWhitelistCall {
+                                policyId: policy_id,
+                                account,
+                                allowed,
+                            },
+                        )?;
+                    }
+                    assert_eq!(
+                        token.is_transfer_authorized(sender, recipient)?,
+                        authorized,
+                        "{hardfork:?}, updates: {updates:?}"
+                    );
+                    let expected = if authorized {
+                        Ok(())
+                    } else {
+                        Err(TIP20Error::policy_forbids().into())
+                    };
+                    assert_eq!(
+                        token.ensure_authorized_as(&user_auth),
+                        expected,
+                        "{hardfork:?}, updates: {updates:?}"
+                    );
+                }
 
                 Ok::<_, TempoPrecompileError>(())
             })?;

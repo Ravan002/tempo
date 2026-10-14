@@ -30,8 +30,8 @@ use crate::{
     RECEIVE_POLICY_GUARD_ADDRESS, TIP403_REGISTRY_ADDRESS,
     error::{Result, TempoPrecompileError},
     storage::{
-        Handler, Layout, LayoutCtx, Mapping, Slot, Storable, StorableType, StorageOps,
-        packing::PackedSlot,
+        ContractStorage, Handler, Layout, LayoutCtx, Mapping, Slot, Storable, StorableType,
+        StorageOps, packing::PackedSlot,
     },
     tip20::TIP20Token,
     tip20_factory::TIP20Factory,
@@ -931,6 +931,47 @@ impl TIP403Registry {
         self.is_authorized_simple_inner(policy_id, user, &data)
     }
 
+    /// Resolves cached packed modes, otherwise the registered or legacy token policy.
+    /// Mirrored tokens resolve [`TOKEN_POLICY_ID`] through the registry, falling back to
+    /// [`REJECT_ALL_POLICY_ID`] when no token-specific policy is active.
+    pub(crate) fn issuer_policy(&self, token: &TIP20Token) -> Result<IssuerPolicy> {
+        if let Some(policy) = token.token_control()?.and_then(|control| control.policy()) {
+            return Ok(IssuerPolicy::TokenSpecific(policy));
+        }
+        let policy_id = if self.storage.spec().is_t9()
+            && let Some(policy_id) = self.registered_token_transfer_policy_id(token.address())?
+        {
+            policy_id
+        } else {
+            token.legacy_transfer_policy_id()?
+        };
+        if policy_id == TOKEN_POLICY_ID && self.storage.spec().is_t14() {
+            return Ok(match self.token_policy(token.address())? {
+                policy if policy.is_set => IssuerPolicy::TokenSpecific(policy),
+                _ => IssuerPolicy::Generic(REJECT_ALL_POLICY_ID),
+            });
+        }
+        Ok(IssuerPolicy::Generic(policy_id))
+    }
+
+    /// Returns whether the resolved issuer `policy` allows `user` in `role`.
+    /// Token-specific memberships are looked up under `token`.
+    /// Lookup and storage errors propagate.
+    pub(crate) fn policy_allows(
+        &self,
+        token: Address,
+        policy: IssuerPolicy,
+        user: Address,
+        role: AuthRole,
+    ) -> Result<bool> {
+        match policy {
+            IssuerPolicy::Generic(policy_id) => self.is_authorized_as(policy_id, user, role),
+            IssuerPolicy::TokenSpecific(policy) => {
+                self.token_policy_allows(token, &policy, user, role.mask())
+            }
+        }
+    }
+
     /// (spec: +T6) Returns whether `user` is a protocol address that can't be policed and is
     /// always authorized.
     fn is_always_authorized(&self, user: Address) -> bool {
@@ -1057,6 +1098,15 @@ impl TIP403Registry {
     fn set_policy_set(&mut self, policy_id: u64, account: Address, value: bool) -> Result<()> {
         self.policy_set[policy_id][account].write(value)
     }
+}
+
+/// Issuer authorization source of a TIP-20 token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IssuerPolicy {
+    /// Generic (shared) TIP-403 policy ID.
+    Generic(u64),
+    /// TIP-1145 token-specific flat modes.
+    TokenSpecific(TokenPolicy),
 }
 
 impl AuthRole {

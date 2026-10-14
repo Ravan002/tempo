@@ -428,7 +428,8 @@ fn create_empty_blacklist(registry: &mut TIP403Registry, admin: Address) -> Resu
 }
 
 /// Sets empty issuer blacklists for all three roles and returns the active policy ID.
-/// Packed tokens use token-specific modes, while legacy tokens use a compound policy.
+/// Packed tokens use token-specific modes and require empty issuer membership lists.
+/// Legacy tokens use a new compound policy.
 pub fn set_empty_transfer_policy(admin: Address, token: Address) -> Result<u64> {
     let mut registry = TIP403Registry::new();
     let mut token = TIP20Token::from_address(token)?;
@@ -461,6 +462,7 @@ pub fn set_empty_transfer_policy(admin: Address, token: Address) -> Result<u64> 
 
 /// Sets empty sender and token blacklists with originator recovery for each account.
 /// Uses receive configurations at T14 and legacy receive policies on earlier forks.
+/// T14 accounts must have empty receive-token and receive-sender lists.
 pub fn set_empty_receive_policies(admin: Address, accounts: &[Address]) -> Result<()> {
     let mut registry = TIP403Registry::new();
     if StorageCtx.spec().is_t14() {
