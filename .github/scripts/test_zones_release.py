@@ -19,6 +19,9 @@ WORKFLOW = (Path(__file__).parents[1] / "workflows/zones-release.yml").read_text
 
 
 PARSED_WORKFLOW = yaml.safe_load(WORKFLOW)
+PROFILING_WORKFLOW = yaml.safe_load(
+    (Path(__file__).parents[1] / "workflows/zones-docker-profiling.yml").read_text()
+)
 
 
 def step_script(name):
@@ -172,6 +175,23 @@ def script(job, name):
 
 
 class ZonesReleaseTagTests(unittest.TestCase):
+    def test_release_jobs_check_out_resolved_commit(self):
+        for job in ('check-version', 'build-linux-x86_64-release',
+                    'rebuild-linux-x86_64-release', 'build-other-release', 'create-release'):
+            with self.subTest(job=job):
+                checkout = next(step for step in PARSED_WORKFLOW['jobs'][job]['steps']
+                                if step.get('uses', '').startswith('actions/checkout@'))
+                self.assertEqual(checkout['with']['ref'],
+                                 '${{ needs.resolve-release.outputs.commit_sha }}')
+
+    def test_profiling_cannot_select_a_release_tag(self):
+        dispatch = PROFILING_WORKFLOW.get('on', PROFILING_WORKFLOW.get(True))['workflow_dispatch']
+        self.assertNotIn('inputs', dispatch or {})
+        metadata = next(step for step in PROFILING_WORKFLOW['jobs']['build-and-push']['steps']
+                        if step.get('id') == 'meta-tempo-zone')
+        self.assertEqual(metadata['with']['tags'].splitlines(),
+                         ['type=raw,value=profiling', 'type=sha,prefix=profiling-sha-'])
+
     def parse_tag(self, tag, dispatch=True):
         with tempfile.TemporaryDirectory() as tmp:
             output = Path(tmp) / 'output'
