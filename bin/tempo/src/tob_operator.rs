@@ -45,9 +45,14 @@ const ROUNDS_KEPT: usize = 40;
 #[derive(Debug, Parser)]
 #[command(name = "tempo-tob-operator", about = "Demo top-of-block operator")]
 struct Args {
-    /// Seed of the operator's ed25519 identity.
-    #[arg(long)]
-    seed: u64,
+    /// Seed of the operator's ed25519 identity. For local devnets only:
+    /// anyone can derive the key from the seed.
+    #[arg(long, required_unless_present = "signing_key")]
+    seed: Option<u64>,
+    /// File with the operator's hex-encoded ed25519 private key, as written
+    /// by `tempo consensus generate-private-key`.
+    #[arg(long, conflicts_with = "seed")]
+    signing_key: Option<std::path::PathBuf>,
     /// Print the operator's public key and exit.
     #[arg(long)]
     print_public_key: bool,
@@ -60,6 +65,8 @@ struct Args {
     #[arg(long = "validator")]
     validators: Vec<String>,
     /// JSON-RPC endpoints of the validators, in the order of `--validator`.
+    /// A single endpoint serves every validator; it must allow
+    /// `debug_chainConfig`.
     #[arg(long = "rpc")]
     rpcs: Vec<String>,
     /// Number of makers streaming quotes.
@@ -91,16 +98,25 @@ struct Args {
 }
 
 fn main() -> eyre::Result<()> {
-    let args = Args::parse();
-    let signer = PrivateKey::from_seed(args.seed);
+    let mut args = Args::parse();
+    let signer = match (&args.signing_key, args.seed) {
+        (Some(path), _) => tempo_consensus_config::SigningKey::read_from_file_unencrypted(path)
+            .wrap_err_with(|| format!("failed reading signing key `{}`", path.display()))?
+            .into_inner(),
+        (None, Some(seed)) => PrivateKey::from_seed(seed),
+        (None, None) => eyre::bail!("pass --seed or --signing-key"),
+    };
     if args.print_public_key {
         println!("{}", signer.public_key());
         return Ok(());
     }
 
+    if let [rpc] = args.rpcs.as_slice() {
+        args.rpcs = vec![rpc.clone(); args.validators.len()];
+    }
     eyre::ensure!(
         args.validators.len() == args.rpcs.len() && !args.rpcs.is_empty(),
-        "pass one --rpc per --validator"
+        "pass one --rpc, or one per --validator"
     );
     let validators = args
         .validators
