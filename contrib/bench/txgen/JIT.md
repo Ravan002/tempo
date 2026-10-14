@@ -16,7 +16,7 @@ gh workflow run bench-e2e.yml --repo tempoxyz/tempo --ref "$bench_branch" \
   -f preset=public-mix -f feature-args='--jit --jit.hot-threshold 1' \
   -f duration=90 -f run-pairs=3 -f bloat=100 -f tps=50000 \
   -f accounts=1000 -f max-concurrent-requests=100 -f otlp=false \
-  -f txgen-ref=9d2124ad5831e848381b369dea3875c3e7999a38
+  -f txgen-ref=992d083c7d95a071c6cda238d2d83bf5bcb84969
 ```
 
 The workflow installs LLVM 22 if necessary and builds both sides with JIT support;
