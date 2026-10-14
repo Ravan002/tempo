@@ -1,3 +1,5 @@
+//! Offline genesis import of canonical block files through frozen eras.
+
 use alloy_primitives::{B256, U64};
 use clap::{Parser, Subcommand};
 use eyre::{Context, OptionExt, Result, ensure};

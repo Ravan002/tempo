@@ -145,6 +145,14 @@ async fn bundle_pins_numeric_state_and_rejects_invalid_or_crossing_timestamps() 
     bundle["timestamp"] = json!("0x62");
     let named = json!({"request":bundle});
     f.check("eth_callBundle", named.clone(), 0, named).await;
+    // The generated child timestamp saturates and stays in the parent's era.
+    f.check(
+        "eth_callBundle",
+        json!([request("0x4")]),
+        1,
+        json!([request("0x4")]),
+    )
+    .await;
 
     for (selector, timestamp, code) in [
         (json!("0x2"), None, -32004),
@@ -154,7 +162,6 @@ async fn bundle_pins_numeric_state_and_rejects_invalid_or_crossing_timestamps() 
         (json!({"blockNumber":"0x1"}), None, -32602),
         (json!({"blockHash":hash(1)}), None, -32602),
         (Value::Null, None, -32602),
-        (json!("0x4"), None, -32602),
     ] {
         let mut bundle = request("latest");
         bundle["stateBlockNumber"] = selector;
@@ -392,10 +399,10 @@ async fn simulations_ranges_and_overrides_stay_in_one_era() {
             "eth_simulateV1",
             json!([{"blockStateCalls":[{"blockOverrides":{"time":"0x63"}},{"blockOverrides":{"time":"0x64"}}]},"0x1"]),
         ),
-        // Number gaps generate intermediate blocks, even if the requested block is new.
+        // Number gaps generate intermediate blocks in the old era before the new requested block.
         (
             "eth_simulateV1",
-            json!([{"blockStateCalls":[{"blockOverrides":{"blockNumber":"0x40", "timestamp":"0x12c"}}]},"0x1"]),
+            json!([{"blockStateCalls":[{"blockOverrides":{"blockNumber":"0x3", "timestamp":"0x6e"}}]},"0x1"]),
         ),
         (
             "debug_traceCallMany",

@@ -10,13 +10,13 @@ use jsonrpsee::{
     http_client::{HttpClient, HttpClientBuilder},
 };
 use serde_json::value::RawValue;
-use std::{collections::HashSet, net::TcpListener, path::PathBuf, sync::Arc, time::Duration};
+use std::{net::TcpListener, path::PathBuf, sync::Arc, time::Duration};
 use tokio::{
     process::{Child, Command},
     sync::Mutex,
     time::Instant,
 };
-use tokio_util::sync::CancellationToken;
+use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 use crate::{
     catalog::ReleaseEra,
@@ -36,42 +36,23 @@ const RETRY_DELAY: Duration = Duration::from_secs(30);
 ///
 /// A cancelled request leaves a starting child owned by its state, so another request can finish
 /// the handshake. Unleased workers are stopped after five idle minutes and restarted on demand.
+/// Failed and idle children are stopped by tracked tasks, outside request cancellation.
 /// Explicit shutdown reaps every child; final drop kills children as a fallback.
 pub struct HistoricalWorkers {
     context: WorkerContext,
     eras: Vec<ReleaseEra>,
     states: Vec<Mutex<State>>,
     shutdown: CancellationToken,
+    stopping: TaskTracker,
 }
 
 impl HistoricalWorkers {
+    /// `eras` come from a validated `ChainEras` or `Manifest`, which own name and executable checks.
     pub fn new(context: WorkerContext, eras: Vec<ReleaseEra>) -> Result<Arc<Self>> {
-        ensure!(
-            !context.chain.is_empty(),
-            "historical worker chain must not be empty"
-        );
-        ensure!(
-            !context.datadir.as_os_str().is_empty(),
-            "historical worker datadir must not be empty"
-        );
         ensure!(
             !context.startup_timeout.is_zero(),
             "historical worker startup timeout must be positive"
         );
-        let mut names = HashSet::new();
-        for era in &eras {
-            ensure!(
-                !era.name.is_empty() && names.insert(&era.name),
-                "historical era names must be unique and nonempty"
-            );
-            ensure!(
-                era.binary
-                    .as_ref()
-                    .is_some_and(|path| !path.as_os_str().is_empty()),
-                "historical era {} has no executable",
-                era.name
-            );
-        }
         let states = eras.iter().map(|_| Mutex::new(State::Dormant)).collect();
         let runtime = tokio::runtime::Handle::try_current()
             .wrap_err("historical workers require a Tokio runtime")?;
@@ -80,25 +61,25 @@ impl HistoricalWorkers {
             eras,
             states,
             shutdown: CancellationToken::new(),
+            stopping: TaskTracker::new(),
         });
         let weak = Arc::downgrade(&workers);
-        let shutdown = workers.shutdown.clone();
-        runtime.spawn(async move {
-            tokio::select! {
-                biased;
-                _ = shutdown.cancelled() => {},
-                _ = async {
+        runtime.spawn(
+            workers
+                .shutdown
+                .clone()
+                .run_until_cancelled_owned(async move {
                     loop {
                         tokio::time::sleep(IDLE_CHECK_INTERVAL).await;
                         let Some(workers) = weak.upgrade() else { break };
                         workers.reap_idle().await;
                     }
-                } => {},
-            }
-        });
+                }),
+        );
         Ok(workers)
     }
 
+    /// Starts the era's worker on demand. A failure stops it and starts the retry cooldown.
     pub async fn get(&self, index: usize) -> Result<Arc<HistoricalWorker>> {
         let era = self
             .eras
@@ -109,9 +90,8 @@ impl HistoricalWorkers {
             !self.shutdown.is_cancelled(),
             "historical workers are shutting down"
         );
-        if let State::Failed(error, retry_at, _) = &*state {
+        if let State::Failed(error, retry_at) = &*state {
             ensure!(Instant::now() >= *retry_at, "{error}");
-            state.cleanup_failed(&era.name).await?;
             *state = State::Dormant;
         }
         let result = async {
@@ -124,7 +104,7 @@ impl HistoricalWorkers {
             if let Some(status) = process.child.try_wait()? {
                 bail!("historical era {} exited with {status}", era.name);
             }
-            process.idle_since = None;
+            process.last_used = Instant::now();
             if let Some(worker) = &process.ready {
                 return Ok(worker.clone());
             }
@@ -138,19 +118,16 @@ impl HistoricalWorkers {
             Err(error) => {
                 let message = format!("historical era {} unavailable: {error:#}", era.name);
                 tracing::warn!(era = %era.name, %message, "Historical worker failed");
-                let process = match std::mem::replace(&mut *state, State::Dormant) {
-                    State::Running(process) => Some(process),
-                    _ => None,
-                };
-                *state = State::Failed(message.clone(), Instant::now() + RETRY_DELAY, process);
-                if let Err(error) = state.cleanup_failed(&era.name).await {
-                    tracing::warn!(era = %era.name, %error, "Failed to clean up historical worker");
+                let failed = State::Failed(message.clone(), Instant::now() + RETRY_DELAY);
+                if let State::Running(process) = std::mem::replace(&mut *state, failed) {
+                    self.stop(era, process);
                 }
                 bail!("{message}");
             }
         }
     }
 
+    /// Methods the worker did not advertise fail with `-32004`.
     pub async fn request(
         &self,
         index: usize,
@@ -158,12 +135,7 @@ impl HistoricalWorkers {
         params: RpcParams,
     ) -> RpcResult<Box<RawValue>> {
         let worker = self.get(index).await.map_err(execution_error)?;
-        if worker
-            .info
-            .methods
-            .binary_search_by(|name| name.as_str().cmp(method))
-            .is_err()
-        {
+        if !worker.info.methods.iter().any(|name| name == method) {
             return Err(unsupported(format!(
                 "{method} is unavailable in historical era {}",
                 self.eras[index].name
@@ -181,30 +153,35 @@ impl HistoricalWorkers {
             let Ok(mut state) = state.try_lock() else {
                 continue;
             };
-            if let Err(error) = state.cleanup_failed(&era.name).await {
-                tracing::warn!(era = %era.name, %error, "Failed to clean up historical worker");
-                continue;
-            }
             let State::Running(process) = &mut *state else {
                 continue;
             };
-            if process.ready.as_ref().map_or(0, Arc::strong_count) > 1 {
-                process.idle_since = None;
-                continue;
-            }
             let now = Instant::now();
-            if now.duration_since(*process.idle_since.get_or_insert(now)) < IDLE_TIMEOUT {
+            if process.ready.as_ref().map_or(0, Arc::strong_count) > 1 {
+                process.last_used = now;
                 continue;
             }
-            if let Err(error) = process.stop(&era.name).await {
-                tracing::warn!(era = %era.name, %error, "Failed to reap idle historical worker");
+            if now.duration_since(process.last_used) < IDLE_TIMEOUT {
                 continue;
             }
-            *state = State::Dormant;
-            tracing::debug!(era = %era.name, "Stopped idle historical RPC worker");
+            if let State::Running(process) = std::mem::replace(&mut *state, State::Dormant) {
+                tracing::debug!(era = %era.name, "Stopping idle historical RPC worker");
+                self.stop(era, process);
+            }
         }
     }
 
+    /// Stop a child that its state no longer owns. Shutdown waits for these tasks.
+    fn stop(&self, era: &ReleaseEra, mut process: Box<Process>) {
+        let name = era.name.clone();
+        self.stopping.spawn(async move {
+            if let Err(error) = process.stop(&name).await {
+                tracing::warn!(era = %name, %error, "Failed to stop historical worker");
+            }
+        });
+    }
+
+    /// Retryable after cancellation; children stay owned until reaped.
     pub async fn shutdown(&self) -> Result<()> {
         self.shutdown.cancel();
         let mut states = futures::future::join_all(self.states.iter().map(Mutex::lock)).await;
@@ -214,19 +191,20 @@ impl HistoricalWorkers {
                 .iter_mut()
                 .zip(&self.eras)
                 .filter_map(|(state, era)| match &mut **state {
-                    State::Running(process) | State::Failed(_, _, Some(process)) => {
-                        Some((era.name.as_str(), &mut process.child))
-                    }
+                    State::Running(process) => Some((era.name.as_str(), &mut process.child)),
                     _ => None,
                 }),
         )
         .await?;
         for state in &mut states {
-            if let State::Running(process) | State::Failed(_, _, Some(process)) = &**state {
+            if let State::Running(process) = &**state {
                 process.cleanup()?;
             }
             **state = State::Dormant;
         }
+        // Stop tasks are spawned only under a state lock held above, so none can follow this wait.
+        self.stopping.close();
+        self.stopping.wait().await;
         Ok(())
     }
 }
@@ -258,18 +236,21 @@ struct Process {
     client: HttpClient,
     ready: Option<Arc<HistoricalWorker>>,
     deadline: Instant,
-    idle_since: Option<Instant>,
+    last_used: Instant,
     secondary_path: PathBuf,
 }
 
+/// `Dormant` -> `Running` -> `Failed` -> `Dormant` after the cooldown; idle reaping and shutdown
+/// return `Running` to `Dormant`.
 enum State {
     Dormant,
     Running(Box<Process>),
-    Failed(String, Instant, Option<Box<Process>>),
+    Failed(String, Instant),
 }
 
 fn spawn(context: &WorkerContext, era: &ReleaseEra) -> Result<Process> {
-    let deadline = Instant::now()
+    let now = Instant::now();
+    let deadline = now
         .checked_add(context.startup_timeout)
         .ok_or_eyre("historical worker startup timeout exceeds the clock range")?;
     // Reserve a loopback port until immediately before spawn. The PID handshake detects
@@ -317,7 +298,7 @@ fn spawn(context: &WorkerContext, era: &ReleaseEra) -> Result<Process> {
         client,
         ready: None,
         deadline,
-        idle_since: None,
+        last_used: now,
         secondary_path,
     })
 }
@@ -341,21 +322,17 @@ async fn ready(
         pid,
         process.deadline,
         || {
-            ensure!(
-                !workers.shutdown.is_cancelled(),
-                "historical workers are shutting down"
-            );
             if let Some(status) = process.child.try_wait()? {
                 bail!("historical worker exited with {status}");
             }
             Ok(())
         },
     );
-    let mut info = tokio::select! {
+    let info = tokio::select! {
+        biased;
         _ = workers.shutdown.cancelled() => { bail!("historical workers are shutting down"); },
         info = handshake => info?,
     };
-    info.methods.sort_unstable();
     tracing::debug!(era = %era.name, pid, "Historical RPC worker ready");
     Ok(Arc::new(HistoricalWorker {
         client: process.client.clone(),
@@ -380,19 +357,6 @@ impl Process {
                 )
             }),
         }
-    }
-}
-
-impl State {
-    async fn cleanup_failed(&mut self, name: &str) -> Result<()> {
-        if let Self::Failed(_, _, process) = self
-            && let Some(child) = process
-        {
-            // Retain ownership across awaits so cancellation cannot lose secondary cleanup.
-            child.stop(name).await?;
-            *process = None;
-        }
-        Ok(())
     }
 }
 
@@ -531,6 +495,22 @@ mod tests {
             .await
             .unwrap()
         }
+
+        /// Background stops remove the secondary only after reaping the child.
+        async fn stopped(&self, pid: u32) {
+            let secondary = self
+                ._directory
+                .path()
+                .join(format!("rocksdb-secondary-tmp-{pid}"));
+            tokio::time::timeout(Duration::from_secs(15), async {
+                while secondary.exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_reaped(pid);
+        }
     }
 
     #[tokio::test]
@@ -575,7 +555,7 @@ mod tests {
         })
         .await
         .unwrap();
-        assert_reaped(pid);
+        fixture.stopped(pid).await;
         let worker = workers.get(0).await.unwrap();
         workers.shutdown().await.unwrap();
         assert_reaped(worker.info.process_id);
@@ -595,11 +575,11 @@ mod tests {
                 unreachable!()
             };
             assert_eq!(Arc::strong_count(process.ready.as_ref().unwrap()), 1);
-            process.idle_since = Some(Instant::now() - IDLE_TIMEOUT);
+            process.last_used = Instant::now() - IDLE_TIMEOUT;
         }
         workers.reap_idle().await;
         assert!(matches!(*workers.states[0].lock().await, State::Dormant));
-        assert_reaped(pid);
+        fixture.stopped(pid).await;
         workers.shutdown().await.unwrap();
     }
 
@@ -626,7 +606,7 @@ mod tests {
                 assert!(error.to_string().contains("startup timed out"));
             }
             let pid = fixture.spawned_pid().await;
-            assert_reaped(pid);
+            fixture.stopped(pid).await;
             assert!(fixture.workers.get(0).await.is_err());
             assert_eq!(fixture.pids(), [pid]);
             fixture.workers.shutdown().await.unwrap();
@@ -672,15 +652,7 @@ mod tests {
             }
             assert!(workers.get(0).await.is_err());
             let pids = fixture.pids();
-            let pid = *pids.last().unwrap();
-            assert_reaped(pid);
-            assert!(
-                !fixture
-                    ._directory
-                    .path()
-                    .join(format!("rocksdb-secondary-tmp-{pid}"))
-                    .exists()
-            );
+            fixture.stopped(*pids.last().unwrap()).await;
             tokio::time::pause();
             tokio::time::advance(RETRY_DELAY - Duration::from_secs(1)).await;
             assert!(workers.get(0).await.is_err());

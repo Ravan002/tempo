@@ -23,6 +23,7 @@ pub struct Manifest {
 }
 
 impl Manifest {
+    /// Paths resolve relative to the manifest.
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         let bytes = std::fs::read(path)
@@ -168,7 +169,7 @@ pub(crate) mod tests {
 
     pub(crate) fn manifest() -> Manifest {
         let mut manifest: Manifest =
-            serde_json::from_str(include_str!("../examples/eras.json")).unwrap();
+            serde_json::from_str(include_str!("../examples/eras-manifest.json")).unwrap();
         manifest.eras[1].start_timestamp = 100;
         manifest
     }

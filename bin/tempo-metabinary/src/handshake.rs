@@ -25,7 +25,9 @@ pub struct ExecutionInfo {
     pub chain_id: U64,
     pub genesis_hash: B256,
     pub read_only: bool,
+    /// Detects another process on the worker's port.
     pub process_id: u32,
+    /// Only these methods are forwarded.
     pub methods: Vec<String>,
 }
 

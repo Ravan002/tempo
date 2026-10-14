@@ -18,6 +18,7 @@ pub struct Catalog {
 }
 
 impl Catalog {
+    /// Executable paths resolve relative to the catalog.
     pub fn load(path: &Path) -> eyre::Result<Self> {
         let mut catalog: Self = serde_json::from_slice(&std::fs::read(path)?)
             .wrap_err_with(|| format!("invalid era catalog {}", path.display()))?;
@@ -50,6 +51,7 @@ impl Catalog {
         Ok(())
     }
 
+    /// `None` means the chain executes natively.
     pub fn for_chain(&self, chain_id: u64, genesis_hash: B256) -> Option<&ChainEras> {
         let chain_id = U64::from(chain_id);
         self.chains
