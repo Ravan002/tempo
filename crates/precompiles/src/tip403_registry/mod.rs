@@ -324,12 +324,7 @@ impl TIP403Registry {
             return Err(tempo_contracts::precompiles::TIP20Error::invalid_token().into());
         }
 
-        let registered_policy_id =
-            if self.storage.spec().is_t14() && self.token_policy(call.token)?.is_set {
-                Some(TOKEN_POLICY_ID)
-            } else {
-                self.registered_token_transfer_policy_id(call.token)?
-            };
+        let registered_policy_id = self.registered_token_transfer_policy_id(call.token)?;
         let is_set = registered_policy_id.is_some();
         let policy_id = match registered_policy_id {
             Some(policy_id) => policy_id,
@@ -342,13 +337,19 @@ impl TIP403Registry {
         })
     }
 
-    /// Returns the registered policy ID without validating the token address.
+    /// Returns the registered policy ID, including active T14 token-specific policies.
     pub(crate) fn registered_token_transfer_policy_id(
         &self,
         token: Address,
     ) -> Result<Option<u64>> {
         let binding = self.token_transfer_policies[token].read()?;
-        Ok(binding.is_set.then_some(binding.policy_id))
+        Ok(if binding.is_set {
+            Some(binding.policy_id)
+        } else if self.storage.spec().is_t14() && self.token_policy(token)?.is_set {
+            Some(TOKEN_POLICY_ID)
+        } else {
+            None
+        })
     }
 
     /// Writes the active registry binding for a TIP-20 token.
@@ -375,7 +376,6 @@ impl TIP403Registry {
         for token in call.tokens {
             if !factory.is_tip20(token)?
                 || self.registered_token_transfer_policy_id(token)?.is_some()
-                || (self.storage.spec().is_t14() && self.token_policy(token)?.is_set)
             {
                 continue;
             }

@@ -314,7 +314,7 @@ fn issuer_modes_and_memberships() -> eyre::Result<()> {
         assert!(transfer(&mut token, alice, bob, 10)?);
 
         // `ALL` edits all three lists without touching the receive-token bit.
-        TIP403Registry::new().modify_receive_list(
+        TIP403Registry::new().modify_receive_members(
             carol,
             MembershipKind::RECEIVE_TOKEN,
             &[address],
@@ -551,7 +551,12 @@ fn receive_configs_filter_tokens_then_senders() -> eyre::Result<()> {
         );
 
         // Whitelisting the token (a future-token-capable list) lets the transfer through.
-        registry.modify_receive_list(receiver, MembershipKind::RECEIVE_TOKEN, &[address], true)?;
+        registry.modify_receive_members(
+            receiver,
+            MembershipKind::RECEIVE_TOKEN,
+            &[address],
+            true,
+        )?;
         assert_eq!(flags(address, receiver), RECEIVE_TOKEN_FLAG);
         assert!(transfer(&mut token, sender, receiver, 10)?);
         assert_eq!(
@@ -560,7 +565,12 @@ fn receive_configs_filter_tokens_then_senders() -> eyre::Result<()> {
         );
 
         // Blacklisting the sender blocks with `RECEIVE_POLICY`.
-        registry.modify_receive_list(receiver, MembershipKind::RECEIVE_SENDER, &[sender], true)?;
+        registry.modify_receive_members(
+            receiver,
+            MembershipKind::RECEIVE_SENDER,
+            &[sender],
+            true,
+        )?;
         assert!(registry.receive_sender_members[receiver][sender].read()?);
         assert_eq!(
             registry.validate_receive_policy(address, sender, receiver)?,
@@ -615,7 +625,7 @@ fn receive_configs_filter_tokens_then_senders() -> eyre::Result<()> {
         // Caller restrictions.
         assert_eq!(
             registry
-                .modify_receive_list(
+                .modify_receive_members(
                     RECEIVE_POLICY_GUARD_ADDRESS,
                     MembershipKind::RECEIVE_TOKEN,
                     &[],
@@ -626,7 +636,7 @@ fn receive_configs_filter_tokens_then_senders() -> eyre::Result<()> {
         );
         assert_eq!(
             registry
-                .modify_receive_list(
+                .modify_receive_members(
                     receiver,
                     MembershipKind::RECEIVE_TOKEN,
                     &[Address::random()],
@@ -783,8 +793,11 @@ fn activation_converts_legacy_tokens() -> eyre::Result<()> {
 
         // Activation clears the obsolete generic binding.
         assert_eq!(
-            TIP403Registry::new().registered_token_transfer_policy_id(address)?,
-            None
+            word(
+                TIP403_REGISTRY_ADDRESS,
+                address.mapping_slot(tip403_registry_slots::TOKEN_TRANSFER_POLICIES)
+            ),
+            U256::ZERO
         );
 
         // Legacy binding migration skips token-specific tokens.
@@ -841,47 +854,57 @@ fn activation_rejects_unpackable_tokens_and_malformed_words() -> eyre::Result<()
 
 #[test]
 fn registry_mirrors_resolve_token_specific_policies() -> eyre::Result<()> {
-    let mut storage = t14();
     let admin = Address::random();
     let (alice, bob) = (Address::random(), Address::random());
 
-    StorageCtx::enter(&mut storage, || {
-        // A legacy-layout mirror (as zones create) without a registry binding.
-        TIP20Setup::path_usd(admin).apply()?;
-        let address = Address::new_tip20(0x1145);
-        let mut token = TIP20Token::from_address(address)?;
-        token.initialize_with_mirror(
-            admin,
-            "Mirror",
-            "MIR",
-            "USD",
-            PATH_USD_ADDRESS,
-            admin,
-            true,
-        )?;
-        token.grant_role_internal(admin, ISSUER_ROLE)?;
-        let mut registry = TIP403Registry::new();
-        registry.token_transfer_policies[address].delete()?;
-        assert!(token.token_control()?.is_none());
+    for fork in [TempoHardfork::T13, TempoHardfork::T14] {
+        let mut storage = HashMapStorageProvider::new_with_spec(1, fork);
+        StorageCtx::enter(&mut storage, || -> eyre::Result<()> {
+            // A legacy-layout mirror (as zones create) without a registry binding.
+            TIP20Setup::path_usd(admin).apply()?;
+            let address = Address::new_tip20(0x1145);
+            let mut token = TIP20Token::from_address(address)?;
+            token.initialize_with_mirror(
+                admin,
+                "Mirror",
+                "MIR",
+                "USD",
+                PATH_USD_ADDRESS,
+                admin,
+                true,
+            )?;
+            assert_eq!(token.legacy_transfer_policy_id()?, REJECT_ALL_POLICY_ID);
+            token.grant_role_internal(admin, ISSUER_ROLE)?;
+            let mut registry = TIP403Registry::new();
+            registry.token_transfer_policies[address].delete()?;
+            if !fork.is_t14() {
+                StorageCtx.reset_counters();
+                assert_eq!(token.transfer_policy_id()?, REJECT_ALL_POLICY_ID);
+                assert_eq!(StorageCtx.counter_sload(), 2);
+            }
+            StorageCtx.set_spec(TempoHardfork::T14);
+            assert!(token.token_control()?.is_none());
 
-        // No active token-specific policy: reject all.
-        assert_eq!(mint(&mut token, admin, alice, 10).unwrap_err(), forbids());
+            // No active token-specific policy: reject all.
+            assert_eq!(mint(&mut token, admin, alice, 10).unwrap_err(), forbids());
 
-        // The mirrored registry policy applies, including its lists.
-        registry.write_token_policy(
-            address,
-            TokenPolicy {
-                recipient: MODE_WHITELIST,
-                ..TokenPolicy::ALLOW_ALL
-            },
-        )?;
-        mint(&mut token, admin, alice, 10)?;
-        assert_eq!(transfer(&mut token, alice, bob, 1).unwrap_err(), forbids());
-        registry.token_user_flags[address][bob].write(RECIPIENT_FLAG)?;
-        assert!(transfer(&mut token, alice, bob, 1)?);
-        assert_eq!(token.transfer_policy_id()?, TOKEN_POLICY_ID);
-        Ok(())
-    })
+            // The mirrored registry policy applies, including its lists.
+            registry.write_token_policy(
+                address,
+                TokenPolicy {
+                    recipient: MODE_WHITELIST,
+                    ..TokenPolicy::ALLOW_ALL
+                },
+            )?;
+            mint(&mut token, admin, alice, 10)?;
+            assert_eq!(transfer(&mut token, alice, bob, 1).unwrap_err(), forbids());
+            registry.token_user_flags[address][bob].write(RECIPIENT_FLAG)?;
+            assert!(transfer(&mut token, alice, bob, 1)?);
+            assert_eq!(token.transfer_policy_id()?, TOKEN_POLICY_ID);
+            Ok(())
+        })?;
+    }
+    Ok(())
 }
 
 #[test]
@@ -895,6 +918,9 @@ fn pre_t14_tokens_keep_the_legacy_layout() -> eyre::Result<()> {
         assert_eq!(token.transfer_policy_id()?, ALLOW_ALL_POLICY_ID);
         assert_eq!(word(token.address, slots::SUPPLY_CAP), U128_MAX);
         assert!(!TIP403Registry::new().token_policy(token.address)?.is_set);
+        StorageCtx.reset_counters();
+        assert_eq!(token.supply_cap()?, U128_MAX);
+        assert_eq!(StorageCtx.counter_sload(), 1);
         Ok(())
     })
 }

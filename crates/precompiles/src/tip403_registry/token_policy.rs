@@ -54,9 +54,7 @@ impl StorableType for PolicyMode {
 impl Storable for PolicyMode {
     fn load<S: StorageOps>(storage: &S, slot: U256, ctx: LayoutCtx) -> Result<Self> {
         Self::try_from(u8::load(storage, slot, ctx)?)
-            .ok()
-            .filter(|mode| *mode != Self::__Invalid)
-            .ok_or_else(|| TIP403RegistryError::invalid_policy_mode().into())
+            .map_err(|_| TIP403RegistryError::invalid_policy_mode().into())
     }
 
     fn store<S: StorageOps>(&self, storage: &mut S, slot: U256, ctx: LayoutCtx) -> Result<()> {
@@ -304,7 +302,7 @@ impl TIP403Registry {
             mint_recipient: call.mintRecipientMode,
         };
         self.write_token_policy(call.token, policy)?;
-        tip20.sync_policy_modes(&policy)
+        tip20.set_policy_modes(&policy)
     }
 
     /// Adds or removes issuer list members for every role selected by `role`.
@@ -326,7 +324,7 @@ impl TIP403Registry {
         let mask = role_mask(role)?;
         for &account in accounts {
             ensure_not_virtual(account)?;
-            self.set_token_flags(token, account, mask, is_member)?;
+            self.set_token_user_flags(token, account, mask, is_member)?;
             self.emit_event(ITIP403Registry::PolicyMembershipUpdated {
                 kind: MembershipKind::ISSUER,
                 owner: token,
@@ -339,7 +337,7 @@ impl TIP403Registry {
     }
 
     /// Sets or clears `mask` in `tokenUserFlags[token][account]`, preserving unrelated bits.
-    fn set_token_flags(
+    fn set_token_user_flags(
         &mut self,
         token: Address,
         account: Address,
@@ -413,7 +411,7 @@ impl TIP403Registry {
     /// - `VirtualAddressNotAllowed` — caller or a listed sender is a virtual address
     /// - `AddressReserved` — caller is the `ReceivePolicyGuard`
     /// - `InvalidToken` — a listed token lacks the TIP-20 prefix
-    pub fn modify_receive_list(
+    pub fn modify_receive_members(
         &mut self,
         msg_sender: Address,
         kind: MembershipKind,
@@ -425,7 +423,7 @@ impl TIP403Registry {
         for &account in accounts {
             if kind == MembershipKind::RECEIVE_TOKEN {
                 ensure_tip20_prefix(account)?;
-                self.set_token_flags(account, msg_sender, RECEIVE_TOKEN_FLAG, is_member)?;
+                self.set_token_user_flags(account, msg_sender, RECEIVE_TOKEN_FLAG, is_member)?;
             } else {
                 ensure_not_virtual(account)?;
                 self.receive_sender_members[msg_sender][account].write(is_member)?;
