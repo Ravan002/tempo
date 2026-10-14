@@ -86,6 +86,13 @@ pub struct OperatorNetwork {
     /// validators send consensus broadcasts to all connected peers, including
     /// operators, and a message larger than this closes the connection.
     pub max_message_size: u32,
+    /// Must equal the validators' `--consensus.wait-before-peers-reping`.
+    ///
+    /// Each side accepts at most one ping per half of its own ping period and
+    /// stops reading the connection until the next one is allowed. Pinging
+    /// more often than the validators stalls every message behind the pings;
+    /// pinging less often makes the operator stall the validators the same way.
+    pub ping_frequency: std::time::Duration,
 }
 
 /// The operator's handles to the network.
@@ -132,6 +139,7 @@ pub fn start_operator_network(
             bypass_ip_check: true,
             allow_private_ips: true,
             tracked_peer_sets: std::num::NonZeroUsize::new(1).expect("not zero"),
+            ping_frequency: config.ping_frequency,
             ..lookup::Config::local(
                 config.signer,
                 &namespace,
