@@ -287,7 +287,7 @@ where
         best_txs: impl FnOnce(BestTransactionsAttributes) -> Txs,
     ) -> Result<BuildOutcome<TempoBuiltPayload>, PayloadBuilderError>
     where
-        Txs: BestTransactions<Item = BestTransaction> + Send + 'static,
+        Txs: BestTransactions<Item = BestTransaction> + 'static,
     {
         let BuildArguments {
             cached_reads,
@@ -1036,8 +1036,9 @@ where
 
         self.executor
             .spawn_blocking_named("builder-roots-task", move || {
-                let _span = debug_span!(target: "payload_builder", parent: parent, "builder_roots")
-                    .entered();
+                let _span =
+                    debug_span!(target: "payload_builder", parent: &parent, "builder_roots")
+                        .entered();
                 let mut transactions = Vec::new();
                 let mut senders = Vec::new();
 

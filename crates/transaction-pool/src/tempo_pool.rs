@@ -658,8 +658,6 @@ where
     EvmConfig: ConfigureTempoPoolEvm,
     Client: StateProviderFactory
         + ChainSpecProvider<ChainSpec: EthChainSpec<Header = TempoHeader> + TempoHardforks>
-        + Send
-        + Sync
         + 'static,
     TempoPooledTransaction: reth_transaction_pool::EthPoolTransaction,
 {

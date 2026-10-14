@@ -126,7 +126,12 @@ mod runtime_tests {
             IAccountKeychain, IZoneFactory, IZoneVerifier, ZONE_FACTORY_ADDRESS,
             ZONE_MESSENGER_ADDRESS, ZONE_PORTAL_IMPL_ADDRESS, ZONE_VERIFIER_ADDRESS,
         },
-        zones::{T13_ZONE_VERIFIER_RUNTIME, ZONE_MESSENGER_RUNTIME, ZONE_PORTAL_RUNTIME},
+        zones::{
+            BlockTransition, DepositQueueTransition,
+            SwapAndDepositRouter as TestWithdrawalReceiver, T13_ZONE_VERIFIER_RUNTIME,
+            TokenEnablementTransition, ZONE_MESSENGER_RUNTIME, ZONE_PORTAL_RUNTIME,
+            ZoneMessenger as IZoneMessenger, ZonePortal as IZonePortal, legacySubmitBatchCall,
+        },
     };
     use tempo_precompiles::{
         ACCOUNT_KEYCHAIN_ADDRESS, NONCE_PRECOMPILE_ADDRESS, PATH_USD_ADDRESS,
@@ -135,7 +140,7 @@ mod runtime_tests {
         error::TempoPrecompileError,
         storage::{ContractStorage, StorageAction, StorageCtx, StorageKey},
         storage_credits::StorageCredits,
-        test_util::TIP20Setup,
+        test_util::{TIP20Setup, set_empty_compound_transfer_policy, set_empty_receive_policies},
         tip_fee_manager::{
             IFeeManager, TipFeeManager,
             amm::{Pool, PoolKey, compute_amount_out},
@@ -152,85 +157,6 @@ mod runtime_tests {
         AASigned, TempoAddressExt, TempoTransaction, TempoTxEnvelope,
         transaction::{Call, KeychainSignature, PrimitiveSignature, TempoSignature},
     };
-
-    alloy_sol_types::sol! {
-        enum TestZonePortalRole {
-            None,
-            Sequencer,
-            Account,
-            CallbackGateway,
-            PauseGuardian
-        }
-
-        enum TestZonePortalCapability {
-            PausePortal,
-            AccessPolicy
-        }
-
-        struct TestBlockTransition {
-            bytes32 prevBlockHash;
-            bytes32 nextBlockHash;
-        }
-
-        struct TestDepositQueueTransition {
-            bytes32 prevProcessedHash;
-            bytes32 nextProcessedHash;
-            uint64 prevDepositNumber;
-            uint64 nextDepositNumber;
-        }
-
-        interface TestZonePortal {
-            error InvalidProof();
-
-            function enableToken(address token) external;
-            function tokenEnablementHash() external view returns (bytes32);
-            function hasRole(address account, TestZonePortalRole role) external view returns (bool);
-            function isSequencer(address account) external view returns (bool);
-            function setAllowedAccount(address account, bool allowed) external;
-            function paused() external view returns (bool);
-            function pauseExpiry() external view returns (uint64);
-            function abdicationEffectiveAt(TestZonePortalCapability capability)
-                external
-                view
-                returns (uint64);
-            function pause() external;
-            function resume() external;
-            function submitBatch(
-                uint64 tempoBlockNumber,
-                uint64 recentTempoBlockNumber,
-                TestBlockTransition calldata blockTransition,
-                TestDepositQueueTransition calldata depositQueueTransition,
-                bytes32 withdrawalQueueHash,
-                bytes calldata verifierConfig,
-                bytes calldata proof,
-                uint256 nextZoneHeight,
-                bytes[] calldata signatures
-            ) external;
-        }
-
-        interface TestZoneMessenger {
-            function relayMessage(
-                uint32 zoneId,
-                address token,
-                bytes32 senderTag,
-                address target,
-                uint128 amount,
-                uint64 gasLimit,
-                bytes calldata data
-            ) external;
-        }
-
-        interface TestWithdrawalReceiver {
-            function onWithdrawalReceived(
-                uint32 zoneId,
-                address portal,
-                bytes32 senderTag,
-                address token,
-                uint128 amount,
-                bytes calldata data
-            ) external returns (bytes4);
-        }
-    }
 
     fn runtime_returning_selector(selector: [u8; 4]) -> Bytecode {
         const SELECTOR_SHIFT_BITS: u8 = 224;
@@ -442,17 +368,17 @@ mod runtime_tests {
             anchorBlockHash: B256::ZERO,
             expectedWithdrawalBatchIndex: 0,
             nextZoneHeight: U256::ZERO,
-            blockTransition: IZoneVerifier::BlockTransition {
+            blockTransition: BlockTransition {
                 prevBlockHash: B256::ZERO,
                 nextBlockHash: B256::ZERO,
             },
-            depositQueueTransition: IZoneVerifier::DepositQueueTransition {
+            depositQueueTransition: DepositQueueTransition {
                 prevProcessedHash: B256::ZERO,
                 nextProcessedHash: B256::ZERO,
                 prevDepositNumber: 0,
                 nextDepositNumber: 0,
             },
-            tokenEnablementTransition: IZoneVerifier::TokenEnablementTransition {
+            tokenEnablementTransition: TokenEnablementTransition {
                 prevProcessedTokenCount: 0,
                 nextProcessedTokenCount: 0,
             },
@@ -540,7 +466,7 @@ mod runtime_tests {
             .system_call(
                 SystemTx::new(
                     created.portal,
-                    TestZonePortal::isSequencerCall { account: sequencer }
+                    IZonePortal::isSequencerCall { account: sequencer }
                         .abi_encode()
                         .into(),
                 )
@@ -553,7 +479,7 @@ mod runtime_tests {
             "isSequencer failed: {sequencer_status:?}"
         );
         assert!(
-            TestZonePortal::isSequencerCall::abi_decode_returns(&sequencer_status.output).unwrap()
+            IZonePortal::isSequencerCall::abi_decode_returns(&sequencer_status.output).unwrap()
         );
 
         let account = Address::repeat_byte(0x55);
@@ -561,7 +487,7 @@ mod runtime_tests {
             .system_call(
                 SystemTx::new(
                     created.portal,
-                    TestZonePortal::setAllowedAccountCall {
+                    IZonePortal::setAllowedAccountCall {
                         account,
                         allowed: true,
                     }
@@ -581,9 +507,9 @@ mod runtime_tests {
             .system_call(
                 SystemTx::new(
                     created.portal,
-                    TestZonePortal::hasRoleCall {
+                    IZonePortal::hasRoleCall {
                         account,
-                        role: TestZonePortalRole::Account,
+                        role: IZonePortal::Role::Account,
                     }
                     .abi_encode()
                     .into(),
@@ -593,13 +519,13 @@ mod runtime_tests {
             .unwrap()
             .discard();
         assert!(account_role.status, "hasRole failed: {account_role:?}");
-        assert!(TestZonePortal::hasRoleCall::abi_decode_returns(&account_role.output).unwrap());
+        assert!(IZonePortal::hasRoleCall::abi_decode_returns(&account_role.output).unwrap());
 
         for call in [
-            TestZonePortal::pausedCall {}.abi_encode(),
-            TestZonePortal::pauseExpiryCall {}.abi_encode(),
-            TestZonePortal::abdicationEffectiveAtCall {
-                capability: TestZonePortalCapability::PausePortal,
+            IZonePortal::pausedCall {}.abi_encode(),
+            IZonePortal::pauseExpiryCall {}.abi_encode(),
+            IZonePortal::abdicationEffectiveAtCall {
+                capability: IZonePortal::Capability::PausePortal,
             }
             .abi_encode(),
         ] {
@@ -615,7 +541,7 @@ mod runtime_tests {
             .system_call(
                 SystemTx::new(
                     created.portal,
-                    TestZonePortal::pauseCall {}.abi_encode().into(),
+                    IZonePortal::pauseCall {}.abi_encode().into(),
                 )
                 .with_caller(sequencer),
             )
@@ -627,14 +553,14 @@ mod runtime_tests {
             .system_call(
                 SystemTx::new(
                     created.portal,
-                    TestZonePortal::submitBatchCall {
+                    legacySubmitBatchCall {
                         tempoBlockNumber: 0,
                         recentTempoBlockNumber: 0,
-                        blockTransition: TestBlockTransition {
+                        blockTransition: BlockTransition {
                             prevBlockHash: B256::repeat_byte(1),
                             nextBlockHash: B256::ZERO,
                         },
-                        depositQueueTransition: TestDepositQueueTransition {
+                        depositQueueTransition: DepositQueueTransition {
                             prevProcessedHash: B256::ZERO,
                             nextProcessedHash: B256::ZERO,
                             prevDepositNumber: 0,
@@ -654,16 +580,13 @@ mod runtime_tests {
             .unwrap()
             .discard();
         assert_eq!(submit.stop, InstrStop::Revert);
-        assert_eq!(
-            submit.output.as_ref(),
-            TestZonePortal::InvalidProof::SELECTOR
-        );
+        assert_eq!(submit.output.as_ref(), IZonePortal::InvalidProof::SELECTOR);
 
         let resume = evm
             .system_call(
                 SystemTx::new(
                     created.portal,
-                    TestZonePortal::resumeCall {}.abi_encode().into(),
+                    IZonePortal::resumeCall {}.abi_encode().into(),
                 )
                 .with_caller(admin),
             )
@@ -675,7 +598,7 @@ mod runtime_tests {
             .system_call(
                 SystemTx::new(
                     created.portal,
-                    TestZonePortal::pausedCall {}.abi_encode().into(),
+                    IZonePortal::pausedCall {}.abi_encode().into(),
                 )
                 .with_caller(Address::ZERO),
             )
@@ -688,7 +611,7 @@ mod runtime_tests {
             .system_call(
                 SystemTx::new(
                     created.portal,
-                    TestZonePortal::enableTokenCall {
+                    IZonePortal::enableTokenCall {
                         token: second_token,
                     }
                     .abi_encode()
@@ -704,9 +627,7 @@ mod runtime_tests {
             .system_call(
                 SystemTx::new(
                     created.portal,
-                    TestZonePortal::tokenEnablementHashCall {}
-                        .abi_encode()
-                        .into(),
+                    IZonePortal::tokenEnablementHashCall {}.abi_encode().into(),
                 )
                 .with_caller(Address::ZERO),
             )
@@ -717,8 +638,7 @@ mod runtime_tests {
             "tokenEnablementHash failed: {commitment:?}"
         );
         let actual =
-            TestZonePortal::tokenEnablementHashCall::abi_decode_returns(&commitment.output)
-                .unwrap();
+            IZonePortal::tokenEnablementHashCall::abi_decode_returns(&commitment.output).unwrap();
         let initial = keccak256(
             (B256::ZERO, PATH_USD_ADDRESS, "pathUSD", "pathUSD", "USD").abi_encode_params(),
         );
@@ -788,7 +708,7 @@ mod runtime_tests {
             .system_call(
                 SystemTx::new(
                     ZONE_MESSENGER_ADDRESS,
-                    TestZoneMessenger::relayMessageCall {
+                    IZoneMessenger::relayMessageCall {
                         zoneId: created.zoneId,
                         token: PATH_USD_ADDRESS,
                         senderTag: B256::ZERO,
@@ -1110,9 +1030,12 @@ mod runtime_tests {
 
     #[test]
     fn test_tip20_full_evm_storage_actions() {
-        for hardfork in TempoHardfork::VARIANTS {
-            // skip pre-T5 hardforks to avoid clutter
-            if !hardfork.is_t5() {
+        for (hardfork, with_policies) in TempoHardfork::VARIANTS
+            .iter()
+            .flat_map(|hardfork| [(hardfork, false), (hardfork, true)])
+        {
+            // Keep the existing cases since T5 and compare policy-heavy payments across T14.
+            if !hardfork.is_t5() || (with_policies && !hardfork.is_t13()) {
                 continue;
             }
 
@@ -1181,6 +1104,15 @@ mod runtime_tests {
                         }
                         .encode_to_slot()?,
                     )?;
+
+                    if with_policies {
+                        // Separate compound policies keep fee checks from warming the
+                        // payment token's policy. Empty blacklists still read every list.
+                        for address in [PATH_USD_ADDRESS, fee_token.address()] {
+                            set_empty_compound_transfer_policy(sender, address)?;
+                        }
+                        set_empty_receive_policies(sender, &[recipient])?;
+                    }
 
                     Ok::<(Address, Address), tempo_precompiles::error::TempoPrecompileError>((
                         fee_token.address(),
@@ -1307,6 +1239,20 @@ mod runtime_tests {
                     .transact(&Recovered::new_unchecked(tx, caller))?
                     .detach();
                 assert!(result.result.status, "hardfork: {hardfork:?}");
+                if with_policies {
+                    insta::with_settings!({
+                        snapshot_path => "snapshots",
+                        prepend_module_to_snapshot => false,
+                    }, {
+                        insta::assert_snapshot!(
+                            format!(
+                                "tempo_evm__evm__tests__policy_payment_gas_{}",
+                                hardfork.name()
+                            ),
+                            result.result.tx_gas_used()
+                        );
+                    });
+                }
                 let actions = actions
                     .take()
                     .expect("storage action recording should be enabled");
@@ -1319,6 +1265,31 @@ mod runtime_tests {
                 Ok(snapshot_storage_actions(&actions, &labels))
             };
 
+            if with_policies {
+                let snapshot = IndexMap::from([(
+                    "policy_payment",
+                    run_transfer(
+                        &mut evm,
+                        sender,
+                        recipient,
+                        transfer_amount,
+                        0,
+                        U256::ZERO,
+                        fee_token,
+                    )
+                    .unwrap(),
+                )]);
+                insta::with_settings!({
+                    snapshot_path => "snapshots",
+                    prepend_module_to_snapshot => false,
+                }, {
+                    insta::assert_yaml_snapshot!(
+                        format!("tempo_evm__evm__tests__policy_payment_{}", hardfork.name()),
+                        snapshot
+                    );
+                });
+                continue;
+            }
             let snapshot = IndexMap::from([
                 // TIP-20 transfer with sequential protocol nonce and a fee token that requires going through feeAMM to pay fees.
                 (
