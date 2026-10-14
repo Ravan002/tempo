@@ -218,6 +218,10 @@ gh attestation verify "$ARCHIVE" --repo tempoxyz/tempo \
   --predicate-type https://slsa.dev/provenance/v1
 ```
 
+## Hello, world!
+
+Hello, world!
+
 ## License
 
 Licensed under either of [Apache License](./LICENSE-APACHE), Version
