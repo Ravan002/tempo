@@ -990,35 +990,25 @@ mod tests {
     }
 
     #[test]
-    fn t13_genesis_installs_t13_shared_runtimes() {
-        let mut alloc = BTreeMap::new();
-        let hardforks = TempoHardforkArgs {
-            hardfork: Some(TempoHardfork::T13),
-            ..Default::default()
-        };
-        insert_zone_state_at_genesis(&hardforks, &mut alloc);
-
-        for (destination, expected) in [
-            (ZONE_PORTAL_IMPL_ADDRESS, T13_ZONE_PORTAL_RUNTIME),
-            (ZONE_VERIFIER_ADDRESS, T13_ZONE_VERIFIER_RUNTIME),
-            (ZONE_MESSENGER_ADDRESS, T13_ZONE_MESSENGER_RUNTIME),
+    fn genesis_installs_active_fork_shared_runtimes() {
+        for (fork, portal) in [
+            (TempoHardfork::T13, T13_ZONE_PORTAL_RUNTIME),
+            (TempoHardfork::T14, T14_ZONE_PORTAL_RUNTIME),
         ] {
-            assert_eq!(alloc[&destination].code.as_ref(), Some(&expected));
+            let mut alloc = BTreeMap::new();
+            let hardforks = TempoHardforkArgs {
+                hardfork: Some(fork),
+                ..Default::default()
+            };
+            insert_zone_state_at_genesis(&hardforks, &mut alloc);
+            for (destination, expected) in [
+                (ZONE_PORTAL_IMPL_ADDRESS, portal),
+                (ZONE_VERIFIER_ADDRESS, T13_ZONE_VERIFIER_RUNTIME),
+                (ZONE_MESSENGER_ADDRESS, T13_ZONE_MESSENGER_RUNTIME),
+            ] {
+                assert_eq!(alloc[&destination].code.as_ref(), Some(&expected));
+            }
         }
-    }
-
-    #[test]
-    fn t14_genesis_installs_token_policy_portal_runtime() {
-        let mut alloc = BTreeMap::new();
-        let hardforks = TempoHardforkArgs {
-            t14_time: Some(0),
-            ..Default::default()
-        };
-        insert_zone_state_at_genesis(&hardforks, &mut alloc);
-        assert_eq!(
-            alloc[&ZONE_PORTAL_IMPL_ADDRESS].code.as_ref(),
-            Some(&T14_ZONE_PORTAL_RUNTIME)
-        );
     }
 
     #[derive(Parser)]

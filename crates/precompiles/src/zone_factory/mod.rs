@@ -603,10 +603,24 @@ mod tests {
 
     #[test]
     fn create_zone_initializes_token_cursor_at_t13() -> eyre::Result<()> {
-        for hardfork in [TempoHardfork::T12, TempoHardfork::T13] {
+        for (hardfork, converted) in [
+            (TempoHardfork::T12, false),
+            (TempoHardfork::T13, false),
+            (TempoHardfork::T14, false),
+            (TempoHardfork::T13, true),
+        ] {
             let mut storage = HashMapStorageProvider::new_with_spec(1, hardfork);
             StorageCtx::enter(&mut storage, || -> eyre::Result<()> {
-                TIP20Setup::path_usd(ADMIN).apply()?;
+                let mut token = TIP20Setup::path_usd(ADMIN).apply()?;
+                if converted {
+                    StorageCtx.set_spec(TempoHardfork::T14);
+                    token.change_transfer_policy_id(
+                        ADMIN,
+                        ITIP20::changeTransferPolicyIdCall {
+                            newPolicyId: TOKEN_POLICY_ID,
+                        },
+                    )?;
+                }
                 let mut factory = factory_with_owner(OWNER)?;
                 let created = factory.create_zone(
                     OWNER,
@@ -918,38 +932,5 @@ mod tests {
 
             Ok(())
         })
-    }
-
-    #[test]
-    fn create_zone_accepts_token_specific_policies() -> eyre::Result<()> {
-        for converted in [false, true] {
-            let mut storage = HashMapStorageProvider::new_with_spec(1, TempoHardfork::T13);
-            StorageCtx::enter(&mut storage, || -> eyre::Result<()> {
-                if !converted {
-                    StorageCtx.set_spec(TempoHardfork::T14);
-                }
-                let mut token = TIP20Setup::path_usd(ADMIN).apply()?;
-                StorageCtx.set_spec(TempoHardfork::T14);
-                if converted {
-                    token.change_transfer_policy_id(
-                        ADMIN,
-                        ITIP20::changeTransferPolicyIdCall {
-                            newPolicyId: TOKEN_POLICY_ID,
-                        },
-                    )?;
-                }
-                let mut factory = factory_with_owner(OWNER)?;
-                let created = factory.create_zone(
-                    OWNER,
-                    IZoneFactory::createZoneCall {
-                        params: create_params(PATH_USD_ADDRESS),
-                    },
-                )?;
-                assert_eq!(created.portal, portal_address(1));
-                assert_eq!(token.transfer_policy_id()?, TOKEN_POLICY_ID);
-                Ok(())
-            })?;
-        }
-        Ok(())
     }
 }
