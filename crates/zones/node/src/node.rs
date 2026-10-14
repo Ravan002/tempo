@@ -49,7 +49,6 @@ use reth_primitives_traits::SealedHeader;
 use reth_provider::ChainSpecProvider;
 use reth_rpc_api::Web3ApiServer as _;
 use reth_rpc_builder::Identity;
-use reth_rpc_eth_api::EthApiTypes;
 use reth_storage_api::{
     BlockNumReader, EmptyBodyStorage, HeaderProvider, ReceiptProvider, StateProvider,
     StateProviderFactory,
@@ -65,6 +64,10 @@ use std::{
     time::Duration,
 };
 use tempo_alloy::TempoNetwork;
+use tempo_contracts::zones::{
+    LegacyTempoAdvanced, TempoAdvanced, ZONE_INBOX_ADDRESS, ZONE_OUTBOX_ADDRESS,
+    ZonePortal::{self},
+};
 use tempo_evm::{TempoInvalidTransaction, consensus::TempoConsensus};
 use tempo_node::{
     DEFAULT_AA_VALID_AFTER_MAX_SECS, engine::TempoEngineValidator, rpc::TempoEthApiBuilder,
@@ -79,10 +82,6 @@ use tempo_transaction_pool::{
     ordering::TempoTipOrdering,
     transaction::{TempoPoolTransactionError, TempoPooledTransaction},
     validator::{DEFAULT_MAX_TEMPO_AUTHORIZATIONS, TempoTransactionValidator},
-};
-use tempo_contracts::zones::{
-    LegacyTempoAdvanced, TempoAdvanced, ZONE_INBOX_ADDRESS, ZONE_OUTBOX_ADDRESS,
-    ZonePortal::{self},
 };
 use tokio::sync::mpsc::{Receiver, Sender};
 use tracing::{debug, info, warn};
@@ -467,8 +466,7 @@ impl NodeTypes for ZoneNode {
 pub struct ZoneAddOns<N>
 where
     N: FullNodeComponents<Types = ZoneNode, Evm = ZoneEvmConfig>,
-    N::Pool: TempoTransactionPoolExt,
-    N::Pool: reth_transaction_pool::TransactionPool<Transaction = TempoPooledTransaction>,
+    N::Pool: TempoTransactionPoolExt<Transaction = TempoPooledTransaction>,
 {
     inner: RpcAddOns<
         N,
@@ -507,8 +505,7 @@ where
 impl<N> std::fmt::Debug for ZoneAddOns<N>
 where
     N: FullNodeComponents<Types = ZoneNode, Evm = ZoneEvmConfig>,
-    N::Pool: TempoTransactionPoolExt,
-    N::Pool: reth_transaction_pool::TransactionPool<Transaction = TempoPooledTransaction>,
+    N::Pool: TempoTransactionPoolExt<Transaction = TempoPooledTransaction>,
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ZoneAddOns").finish_non_exhaustive()
@@ -576,18 +573,7 @@ struct P2PRuntime {
 impl<N> NodeAddOns<N> for ZoneAddOns<N>
 where
     N: FullNodeComponents<Types = ZoneNode, Evm = ZoneEvmConfig>,
-    N::Pool: TempoTransactionPoolExt,
-    N::Pool: reth_transaction_pool::TransactionPool<
-            Transaction = tempo_transaction_pool::transaction::TempoPooledTransaction,
-        >,
-    TempoEthApiBuilder<N>: EthApiBuilder<
-            N,
-            EthApi: reth_rpc_eth_api::helpers::FullEthApi<
-                Evm = ZoneEvmConfig,
-                Primitives = TempoPrimitives,
-                NetworkTypes = TempoNetwork,
-            >,
-        >,
+    N::Pool: TempoTransactionPoolExt<Transaction = TempoPooledTransaction>,
 {
     type Handle = <RpcAddOns<
         N,
@@ -852,6 +838,7 @@ where
                 debug_api: debug_api.clone(),
                 portal_address: self.portal_address,
                 l1_provider: l1_provider.clone(),
+                retain_for_shadow_proving: matches!(prover_config, ZoneProverConfig::Shadow { .. }),
             };
             let (collector, collector_task) =
                 create_proof_collector(proof_collector_config, provider.clone()).await?;
@@ -1102,7 +1089,7 @@ async fn install_manifest_forced_recovery<P>(
     schedule: &LeadershipSchedule,
 ) -> eyre::Result<()>
 where
-    P: BlockNumReader + HeaderProvider<Header = TempoHeader> + StateProviderFactory,
+    P: HeaderProvider<Header = TempoHeader> + StateProviderFactory,
 {
     let Some(recovery) = manifest.forced_recovery() else {
         return Ok(());
@@ -1247,18 +1234,7 @@ async fn seed_leadership_schedule(
 impl<N> ZoneAddOns<N>
 where
     N: FullNodeComponents<Types = ZoneNode, Evm = ZoneEvmConfig>,
-    N::Pool: TempoTransactionPoolExt,
-    N::Pool: reth_transaction_pool::TransactionPool<
-            Transaction = tempo_transaction_pool::transaction::TempoPooledTransaction,
-        >,
-    TempoEthApiBuilder<N>: EthApiBuilder<
-            N,
-            EthApi: reth_rpc_eth_api::helpers::FullEthApi<
-                Evm = ZoneEvmConfig,
-                Primitives = TempoPrimitives,
-                NetworkTypes = TempoNetwork,
-            >,
-        >,
+    N::Pool: TempoTransactionPoolExt<Transaction = TempoPooledTransaction>,
 {
     async fn start_p2p(
         config: P2pConfig,
@@ -1709,18 +1685,7 @@ where
 impl<N> RethRpcAddOns<N> for ZoneAddOns<N>
 where
     N: FullNodeComponents<Types = ZoneNode, Evm = ZoneEvmConfig>,
-    N::Pool: TempoTransactionPoolExt,
-    N::Pool: reth_transaction_pool::TransactionPool<
-            Transaction = tempo_transaction_pool::transaction::TempoPooledTransaction,
-        >,
-    TempoEthApiBuilder<N>: EthApiBuilder<
-            N,
-            EthApi: reth_rpc_eth_api::helpers::FullEthApi<
-                Evm = ZoneEvmConfig,
-                Primitives = TempoPrimitives,
-                NetworkTypes = TempoNetwork,
-            >,
-        >,
+    N::Pool: TempoTransactionPoolExt<Transaction = TempoPooledTransaction>,
 {
     type EthApi = <TempoEthApiBuilder<N> as EthApiBuilder<N>>::EthApi;
 
@@ -1732,11 +1697,7 @@ where
 impl<N> EngineValidatorAddOn<N> for ZoneAddOns<N>
 where
     N: FullNodeComponents<Types = ZoneNode, Evm = ZoneEvmConfig>,
-    N::Pool: TempoTransactionPoolExt,
-    N::Pool: reth_transaction_pool::TransactionPool<
-            Transaction = tempo_transaction_pool::transaction::TempoPooledTransaction,
-        >,
-    TempoEthApiBuilder<N>: EthApiBuilder<N, EthApi: EthApiTypes<NetworkTypes = TempoNetwork>>,
+    N::Pool: TempoTransactionPoolExt<Transaction = TempoPooledTransaction>,
 {
     type ValidatorBuilder = BasicEngineValidatorBuilder<ZoneEngineValidatorBuilder>;
 
@@ -2070,7 +2031,7 @@ where
 /// boundary.
 fn latest_operational_tempo_block<P>(provider: &P) -> eyre::Result<u64>
 where
-    P: BlockNumReader + ReceiptProvider + StateProviderFactory,
+    P: ReceiptProvider + StateProviderFactory,
 {
     let best = provider.best_block_number()?;
     for number in (1..=best).rev() {

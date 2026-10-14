@@ -22,7 +22,7 @@ use reth_tasks::Runtime;
 use std::{
     collections::{BTreeMap, BTreeSet},
     future::Future,
-    net::{SocketAddr, TcpListener},
+    net::{SocketAddr, TcpListener, TcpStream},
     num::NonZeroU32,
     ops::Deref,
     pin::Pin,
@@ -40,13 +40,20 @@ use tempo_chainspec::{
     hardfork::TempoHardfork,
     spec::{TEMPO_T0_BASE_FEE, TempoChainSpec},
 };
-use tempo_contracts::precompiles::{
-    ACCOUNT_KEYCHAIN_ADDRESS, IStablecoinDEX, ITIP20, ITIP403Registry, TIP403_REGISTRY_ADDRESS,
-    ZONE_PORTAL_IMPL_ADDRESS, ZONE_VERIFIER_ADDRESS,
-    account_keychain::IAccountKeychain::{
-        IAccountKeychainInstance, KeyRestrictions, SignatureType as KeyInfoSignatureType,
+use tempo_contracts::{
+    precompiles::{
+        ACCOUNT_KEYCHAIN_ADDRESS, IStablecoinDEX, ITIP20, ITIP403Registry, TIP403_REGISTRY_ADDRESS,
+        ZONE_PORTAL_IMPL_ADDRESS, ZONE_VERIFIER_ADDRESS,
+        account_keychain::IAccountKeychain::{
+            IAccountKeychainInstance, KeyRestrictions, SignatureType as KeyInfoSignatureType,
+        },
+        t13_zone_factory_state,
     },
-    t13_zone_factory_state,
+    zones::{
+        ZONE_OUTBOX_ADDRESS,
+        ZonePortal::{self, Role as PortalRole},
+        submitBatchCall,
+    },
 };
 use tempo_precompiles::{
     PATH_USD_ADDRESS,
@@ -59,12 +66,7 @@ use tempo_precompiles::{
     },
     zone_factory::portal,
 };
-use tempo_primitives::{TempoHeader, transaction::tt_signature::TempoSignature};
-use tempo_contracts::zones::{
-    ZONE_OUTBOX_ADDRESS,
-    ZonePortal::{self, Role as PortalRole},
-    submitBatchCall,
-};
+use tempo_primitives::TempoHeader;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio_util::sync::CancellationToken;
 use zone_chainspec::{ZoneChainSpec, test_utils::set_tempo_fork};
@@ -163,7 +165,7 @@ where
     let zone_token = ITIP20::new(PATH_USD_ADDRESS, provider);
     let approve_pending = zone_token
         .approve(ZONE_OUTBOX_ADDRESS, U256::MAX)
-        .gas_price(TEMPO_T0_BASE_FEE as u128)
+        .gas_price(u128::from(TEMPO_T0_BASE_FEE))
         .gas(TIP20_TX_GAS)
         .send()
         .await?;
@@ -2057,8 +2059,8 @@ impl L1TestNode {
         threshold: u8,
         config: ZoneCreationConfig,
     ) -> eyre::Result<Address> {
-        use tempo_precompiles::PATH_USD_ADDRESS;
         use tempo_contracts::zones::ZoneFactory;
+        use tempo_precompiles::PATH_USD_ADDRESS;
 
         let l1_provider = self.dev_provider();
         let create_zone = ZoneFactory::createZoneCall {
@@ -3131,8 +3133,8 @@ impl ZoneAccount {
         recipient: Address,
         tempo_refund_recipient: Address,
     ) -> eyre::Result<()> {
-        use tempo_precompiles::PATH_USD_ADDRESS;
         use tempo_contracts::zones::ZonePortal;
+        use tempo_precompiles::PATH_USD_ADDRESS;
 
         let (key_index, encrypted) = self.prepare_deposit(recipient, B256::ZERO).await?;
 
@@ -3194,8 +3196,7 @@ impl ZoneAccount {
         timeout: Duration,
         zone: &ZoneTestNode,
     ) -> eyre::Result<U256> {
-        use tempo_contracts::precompiles::ITIP20;
-        use tempo_contracts::zones::ZonePortal;
+        use tempo_contracts::{precompiles::ITIP20, zones::ZonePortal};
 
         // Approve portal for this specific token
         ITIP20::new(token, &self.l1_provider)
@@ -3286,9 +3287,8 @@ impl ZoneAccount {
         recipient: Address,
         memo: B256,
     ) -> eyre::Result<u64> {
-        use tempo_contracts::precompiles::ITIP20;
+        use tempo_contracts::{precompiles::ITIP20, zones::ZonePortal};
         use tempo_precompiles::PATH_USD_ADDRESS;
-        use tempo_contracts::zones::ZonePortal;
 
         let portal_address = self.portal_address;
         if !self.l1_portal_approved {
@@ -3504,8 +3504,7 @@ impl ZoneAccount {
     ///
     /// Reuses a successful max approval for subsequent withdrawals of the same token.
     pub(crate) async fn approve_outbox(&mut self, token: Address) -> eyre::Result<()> {
-        use tempo_contracts::precompiles::ITIP20;
-        use tempo_contracts::zones::ZONE_OUTBOX_ADDRESS;
+        use tempo_contracts::{precompiles::ITIP20, zones::ZONE_OUTBOX_ADDRESS};
 
         if self.l2_outbox_approved_tokens.contains(&token) {
             return Ok(());
@@ -3942,6 +3941,20 @@ pub(crate) async fn start_real_p2p_network_chaos_cluster(
     ))
 }
 
+/// Returns a loopback address for a node's P2P listener, which Commonware binds later itself.
+///
+/// The accepted side closes first and leaves the port in `TIME_WAIT`. Until the node binds it,
+/// the kernel skips the port for other processes' `bind(0)` calls and outbound connections,
+/// while the node's `SO_REUSEADDR` listener can still claim it.
+fn available_address() -> eyre::Result<SocketAddr> {
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let address = listener.local_addr()?;
+    let client = TcpStream::connect(address)?;
+    drop(listener.accept()?);
+    drop(client);
+    Ok(address)
+}
+
 #[derive(Clone, Copy)]
 enum L1ProxyMode {
     Direct,
@@ -3967,11 +3980,6 @@ async fn start_real_p2p_cluster_inner(
         (2..=3).contains(&active_nodes),
         "real P2P test cluster requires two or three active nodes, got {active_nodes}"
     );
-
-    fn available_address() -> eyre::Result<SocketAddr> {
-        let listener = TcpListener::bind("127.0.0.1:0")?;
-        Ok(listener.local_addr()?)
-    }
 
     let l1 = match l1_block_time {
         Some(block_time) => {
@@ -4135,11 +4143,6 @@ async fn start_real_p2p_cluster_inner(
 /// Start a three-node multi-sequencer cluster with identical genesis state and authenticated
 /// P2P identities. Node 0 bootstraps as the leader.
 pub(crate) async fn start_local_p2p_cluster(seed_blocks: u64) -> eyre::Result<P2pCluster> {
-    fn available_address() -> eyre::Result<SocketAddr> {
-        let listener = TcpListener::bind("127.0.0.1:0")?;
-        Ok(listener.local_addr()?)
-    }
-
     let addresses = [
         available_address()?,
         available_address()?,
@@ -4248,10 +4251,6 @@ pub(crate) async fn start_local_p2p_cluster(seed_blocks: u64) -> eyre::Result<P2
 }
 
 pub(crate) fn leader_p2p_config(listen: SocketAddr) -> eyre::Result<P2pConfig> {
-    fn available_address() -> eyre::Result<SocketAddr> {
-        Ok(TcpListener::bind("127.0.0.1:0")?.local_addr()?)
-    }
-
     let identities = [
         Ed25519PrivateKey::from_seed(201),
         Ed25519PrivateKey::from_seed(202),
@@ -4347,28 +4346,14 @@ fn build_auth_token(
     alloy_primitives::hex::encode([sig.as_rsy().as_slice(), &fields].concat())
 }
 
-fn build_auth_token_with_signature(
-    signature: TempoSignature,
-    zone_id: u32,
-    chain_id: u64,
-) -> String {
-    use zone_node::rpc::auth::build_token_fields;
-
-    let now = now_secs();
-    let expires_at = now + 600;
-
-    let (fields, _) = build_token_fields(zone_id, chain_id, now, expires_at);
-    auth_tokens::build_token_with_signature(signature, &fields)
-}
-
 fn build_p256_auth_token(signing_key: &P256SigningKey, zone_id: u32, chain_id: u64) -> String {
     let now = now_secs();
     let expires_at = now + 600;
-    let (_, digest) = zone_node::rpc::auth::build_token_fields(zone_id, chain_id, now, expires_at);
-    build_auth_token_with_signature(
+    let (fields, digest) =
+        zone_node::rpc::auth::build_token_fields(zone_id, chain_id, now, expires_at);
+    auth_tokens::build_token_with_signature(
         sign_p256_signature(digest, signing_key).expect("p256 signing failed"),
-        zone_id,
-        chain_id,
+        &fields,
     )
 }
 
@@ -4380,12 +4365,12 @@ fn build_webauthn_auth_token(
 ) -> String {
     let now = now_secs();
     let expires_at = now + 600;
-    let (_, digest) = zone_node::rpc::auth::build_token_fields(zone_id, chain_id, now, expires_at);
-    build_auth_token_with_signature(
+    let (fields, digest) =
+        zone_node::rpc::auth::build_token_fields(zone_id, chain_id, now, expires_at);
+    auth_tokens::build_token_with_signature(
         sign_webauthn_signature(signing_key, challenge_digest.unwrap_or(digest))
             .expect("webauthn signing failed"),
-        zone_id,
-        chain_id,
+        &fields,
     )
 }
 
@@ -4398,12 +4383,13 @@ fn build_keychain_auth_token(
 ) -> (String, Address) {
     let now = now_secs();
     let expires_at = now + 600;
-    let (_, digest) = zone_node::rpc::auth::build_token_fields(zone_id, chain_id, now, expires_at);
+    let (fields, digest) =
+        zone_node::rpc::auth::build_token_fields(zone_id, chain_id, now, expires_at);
     let (signature, key_id) = sign_keychain_signature(digest, signing_key, root_account, version)
         .expect("keychain signing failed");
 
     (
-        build_auth_token_with_signature(signature, zone_id, chain_id),
+        auth_tokens::build_token_with_signature(signature, &fields),
         key_id,
     )
 }
