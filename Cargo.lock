@@ -12142,7 +12142,7 @@ dependencies = [
 [[package]]
 name = "revmc"
 version = "0.1.0"
-source = "git+https://github.com/paradigmxyz/revmc?rev=3a355f1039a1f3b425e3ee34c5c1f4325f55e6c8#3a355f1039a1f3b425e3ee34c5c1f4325f55e6c8"
+source = "git+https://github.com/paradigmxyz/revmc?rev=75729a0f5e65d9cbc549af07e5f2fbc91b6dbd98#75729a0f5e65d9cbc549af07e5f2fbc91b6dbd98"
 dependencies = [
  "revm-bytecode",
  "revm-context-interface",
@@ -12162,7 +12162,7 @@ dependencies = [
 [[package]]
 name = "revmc-backend"
 version = "0.1.0"
-source = "git+https://github.com/paradigmxyz/revmc?rev=3a355f1039a1f3b425e3ee34c5c1f4325f55e6c8#3a355f1039a1f3b425e3ee34c5c1f4325f55e6c8"
+source = "git+https://github.com/paradigmxyz/revmc?rev=75729a0f5e65d9cbc549af07e5f2fbc91b6dbd98#75729a0f5e65d9cbc549af07e5f2fbc91b6dbd98"
 dependencies = [
  "eyre",
  "ruint",
@@ -12171,12 +12171,12 @@ dependencies = [
 [[package]]
 name = "revmc-build"
 version = "0.1.0"
-source = "git+https://github.com/paradigmxyz/revmc?rev=3a355f1039a1f3b425e3ee34c5c1f4325f55e6c8#3a355f1039a1f3b425e3ee34c5c1f4325f55e6c8"
+source = "git+https://github.com/paradigmxyz/revmc?rev=75729a0f5e65d9cbc549af07e5f2fbc91b6dbd98#75729a0f5e65d9cbc549af07e5f2fbc91b6dbd98"
 
 [[package]]
 name = "revmc-builtins"
 version = "0.1.0"
-source = "git+https://github.com/paradigmxyz/revmc?rev=3a355f1039a1f3b425e3ee34c5c1f4325f55e6c8#3a355f1039a1f3b425e3ee34c5c1f4325f55e6c8"
+source = "git+https://github.com/paradigmxyz/revmc?rev=75729a0f5e65d9cbc549af07e5f2fbc91b6dbd98#75729a0f5e65d9cbc549af07e5f2fbc91b6dbd98"
 dependencies = [
  "paste",
  "revm-bytecode",
@@ -12191,7 +12191,7 @@ dependencies = [
 [[package]]
 name = "revmc-codegen"
 version = "0.1.0"
-source = "git+https://github.com/paradigmxyz/revmc?rev=3a355f1039a1f3b425e3ee34c5c1f4325f55e6c8#3a355f1039a1f3b425e3ee34c5c1f4325f55e6c8"
+source = "git+https://github.com/paradigmxyz/revmc?rev=75729a0f5e65d9cbc549af07e5f2fbc91b6dbd98#75729a0f5e65d9cbc549af07e5f2fbc91b6dbd98"
 dependencies = [
  "alloy-primitives",
  "bitflags 2.11.1",
@@ -12222,7 +12222,7 @@ dependencies = [
 [[package]]
 name = "revmc-context"
 version = "0.1.0"
-source = "git+https://github.com/paradigmxyz/revmc?rev=3a355f1039a1f3b425e3ee34c5c1f4325f55e6c8#3a355f1039a1f3b425e3ee34c5c1f4325f55e6c8"
+source = "git+https://github.com/paradigmxyz/revmc?rev=75729a0f5e65d9cbc549af07e5f2fbc91b6dbd98#75729a0f5e65d9cbc549af07e5f2fbc91b6dbd98"
 dependencies = [
  "revm-context",
  "revm-context-interface",
@@ -12237,7 +12237,7 @@ dependencies = [
 [[package]]
 name = "revmc-llvm"
 version = "0.1.0"
-source = "git+https://github.com/paradigmxyz/revmc?rev=3a355f1039a1f3b425e3ee34c5c1f4325f55e6c8#3a355f1039a1f3b425e3ee34c5c1f4325f55e6c8"
+source = "git+https://github.com/paradigmxyz/revmc?rev=75729a0f5e65d9cbc549af07e5f2fbc91b6dbd98#75729a0f5e65d9cbc549af07e5f2fbc91b6dbd98"
 dependencies = [
  "alloy-primitives",
  "cc",
@@ -12250,7 +12250,7 @@ dependencies = [
 [[package]]
 name = "revmc-runtime"
 version = "0.1.0"
-source = "git+https://github.com/paradigmxyz/revmc?rev=3a355f1039a1f3b425e3ee34c5c1f4325f55e6c8#3a355f1039a1f3b425e3ee34c5c1f4325f55e6c8"
+source = "git+https://github.com/paradigmxyz/revmc?rev=75729a0f5e65d9cbc549af07e5f2fbc91b6dbd98#75729a0f5e65d9cbc549af07e5f2fbc91b6dbd98"
 dependencies = [
  "alloy-primitives",
  "crossbeam-channel",

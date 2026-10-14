@@ -132,7 +132,7 @@ panic = "abort"
 incremental = false
 
 [workspace.dependencies]
-revmc = { git = "https://github.com/paradigmxyz/revmc", rev = "3a355f1039a1f3b425e3ee34c5c1f4325f55e6c8", default-features = false, features = ["llvm-prefer-dynamic"] }
+revmc = { git = "https://github.com/paradigmxyz/revmc", rev = "75729a0f5e65d9cbc549af07e5f2fbc91b6dbd98", default-features = false, features = ["llvm-prefer-dynamic"] }
 humantime = "2"
 tempo-state-bloat = { path = "crates/state-bloat" }
 aws-lc-rs = { version = "1.17.0", default-features = false, features = ["alloc", "non-fips", "ring-sig-verify"] }
