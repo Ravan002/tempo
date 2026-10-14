@@ -4580,3 +4580,105 @@ fn test_aa_tx_transfer_calls_format_no_extra_250k() -> eyre::Result<()> {
 
     Ok(())
 }
+
+#[cfg(feature = "jit")]
+mod jit_tests {
+    use super::*;
+    use crate::jit::{JitBackend, RuntimeConfig};
+
+    #[test]
+    fn jit_storage_credit_equivalence() -> eyre::Result<()> {
+        let key_pair = P256KeyPair::random();
+        let caller = key_pair.address;
+        let contract = Address::repeat_byte(0x6c);
+        for spec in [TempoHardfork::T6, TempoHardfork::T7, TempoHardfork::T13] {
+            for mode in [CreditMode::Refund, CreditMode::Preserve, CreditMode::Direct] {
+                for revert in [false, true] {
+                    for gas_limit in [100_000, 2_000_000] {
+                        let backend = JitBackend::new(RuntimeConfig {
+                            enabled: true,
+                            blocking: true,
+                            single_error: false,
+                            gas_params: Some(tempo_gas_params(spec)),
+                            ..Default::default()
+                        })?;
+                        // Clear, restore, then create a fresh slot. This exercises credit minting,
+                        // consumption and rollback, including the pre-storage-credit fork.
+                        let mut body = bytes!("600060005560026000556003600155").to_vec();
+                        body.extend_from_slice(if revert {
+                            &hex!("60006000fd")
+                        } else {
+                            &[opcode::STOP]
+                        });
+                        let code = if spec.is_t7() {
+                            bytecode_with_tip1060_mode(mode, &body)
+                        } else {
+                            Bytecode::new_raw(body.into())
+                        };
+                        let mut results = Vec::new();
+                        let mut states = Vec::new();
+                        for compiled in [false, true] {
+                            let mut evm = create_funded_evm_at_spec_with_timestamp(caller, 1, spec);
+                            evm.ctx.db_mut().insert_account_info(
+                                contract,
+                                AccountInfo {
+                                    code: Some(code.clone()),
+                                    ..Default::default()
+                                },
+                            );
+                            evm.ctx.db_mut().insert_account_storage(
+                                contract,
+                                U256::ZERO,
+                                U256::ONE,
+                            )?;
+                            seed_storage_credit_balance(&mut evm, contract, 2);
+                            if compiled {
+                                evm.set_jit_backend(backend.clone(), spec);
+                            }
+                            let tx = TxBuilder::new()
+                                .call(contract, &[])
+                                .gas_limit(gas_limit)
+                                .build();
+                            results.push(evm.transact_commit(TempoTxEnv::from_recovered_tx(
+                                &key_pair.sign_tx(tx)?,
+                                caller,
+                            ))?);
+                            states.push(
+                                evm.ctx
+                                    .db()
+                                    .cache
+                                    .accounts
+                                    .iter()
+                                    .map(|(address, account)| {
+                                        (
+                                            *address,
+                                            (
+                                                account.info.clone(),
+                                                account.storage.clone(),
+                                                account.account_state.clone(),
+                                            ),
+                                        )
+                                    })
+                                    .collect::<std::collections::BTreeMap<_, _>>(),
+                            );
+                        }
+                        assert_eq!(
+                            results[0], results[1],
+                            "{spec:?} {mode:?} revert={revert} gas={gas_limit}"
+                        );
+                        assert_eq!(
+                            states[0], states[1],
+                            "{spec:?} {mode:?} revert={revert} gas={gas_limit}"
+                        );
+                        assert!(
+                            backend.stats().lookup_hits > 0,
+                            "compiled code must execute"
+                        );
+                        assert_eq!(backend.stats().compilations_failed, 0);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
