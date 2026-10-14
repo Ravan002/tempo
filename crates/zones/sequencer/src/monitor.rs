@@ -75,7 +75,7 @@ pub struct ZoneMonitorConfig {
     pub outbox_address: Address,
     /// ZoneInbox contract address on Zone L2.
     pub inbox_address: Address,
-    /// Fallback interval for reconciling the canonical head when no notification arrives.
+    /// Interval for sampling the persisted head and reconciling missed batch notifications.
     pub poll_interval: Duration,
     /// ZonePortal contract address on Tempo L1.
     pub portal_address: Address,
@@ -135,9 +135,7 @@ pub struct ZoneMonitor<P: ZoneSequencerProvider> {
     repair_notify: Arc<Notify>,
     /// Commitments used to seed the preparation task.
     preparation_cursor: BatchCursor,
-    /// Persisted Zone head observed by preparation.
-    observed_zone_block: Arc<AtomicU64>,
-    /// Zone height confirmed by submission and observed by preparation.
+    /// Zone height confirmed by submission and sampled by the head observer.
     submitted_zone_block: Arc<AtomicU64>,
     /// Backpressured SPF and Nitro attestation worker required before configured settlement.
     settlement_prover: Option<SettlementProver>,
@@ -180,9 +178,7 @@ struct BatchPreparer<P: ZoneSequencerProvider> {
     provider: P,
     batch_submitter: Arc<BatchSubmitter>,
     cursor: BatchCursor,
-    latest_observed_zone_block: u64,
-    observed_zone_block: Arc<AtomicU64>,
-    submitted_zone_block: Arc<AtomicU64>,
+    latest_scanned_zone_block: u64,
     settlement_prover: Option<SettlementProver>,
 }
 
@@ -284,14 +280,9 @@ impl<P: ZoneSequencerProvider> ZoneMonitor<P> {
         );
 
         metrics
-            .latest_zone_block_observed
-            .set(last_submitted_zone_block as f64);
-        metrics
             .latest_zone_block_submitted_to_l1
             .set(last_submitted_zone_block as f64);
-        metrics.zone_to_l1_submission_lag_blocks.set(0.0);
 
-        let observed_zone_block = Arc::new(AtomicU64::new(last_submitted_zone_block));
         let submitted_zone_block = Arc::new(AtomicU64::new(last_submitted_zone_block));
         let preparation_cursor = BatchCursor {
             zone_height: last_submitted_zone_block,
@@ -309,7 +300,6 @@ impl<P: ZoneSequencerProvider> ZoneMonitor<P> {
             withdrawal_notify,
             repair_notify,
             preparation_cursor,
-            observed_zone_block,
             submitted_zone_block,
             settlement_prover,
         };
@@ -343,26 +333,40 @@ impl<P: ZoneSequencerProvider> ZoneMonitor<P> {
         let (ready_tx, mut ready_rx) = mpsc::channel(1);
         let mut preparation_task = AbortOnDropHandle::new(tokio::spawn(preparation.run(ready_tx)));
 
-        loop {
-            tokio::select! {
-                biased;
-                () = shutdown.cancelled() => {
-                    info!("Zone monitor observed shutdown");
-                    return Ok(());
-                }
-                joined = &mut preparation_task => {
-                    return joined.wrap_err("batch preparation task panicked")?;
-                }
-                _ = self.repair_notify.notified() => {
-                    self.refill_withdrawal_cache().await;
-                }
-                ready = ready_rx.recv() => {
-                    let Some(ready) = ready else {
-                        return Err(eyre::eyre!("batch preparation channel closed"));
-                    };
-                    self.submit_ready_batch(ready).await?;
+        // Poll the head even while proving, queue backpressure, or L1 submission is pending.
+        let observation = observe_zone_head(
+            self.provider.clone(),
+            self.metrics.clone(),
+            self.submitted_zone_block.clone(),
+            self.config.poll_interval,
+        );
+        let submission = async {
+            loop {
+                tokio::select! {
+                    biased;
+                    () = shutdown.cancelled() => {
+                        info!("Zone monitor observed shutdown");
+                        return Ok(());
+                    }
+                    joined = &mut preparation_task => {
+                        return joined.wrap_err("batch preparation task panicked")?;
+                    }
+                    _ = self.repair_notify.notified() => {
+                        self.refill_withdrawal_cache().await;
+                    }
+                    ready = ready_rx.recv() => {
+                        let Some(ready) = ready else {
+                            return Err(eyre::eyre!("batch preparation channel closed"));
+                        };
+                        self.submit_ready_batch(ready).await?;
+                    }
                 }
             }
+        };
+        tokio::select! {
+            biased;
+            () = observation => Ok(()),
+            result = submission => result,
         }
     }
 
@@ -373,9 +377,7 @@ impl<P: ZoneSequencerProvider> ZoneMonitor<P> {
             provider: self.provider.clone(),
             batch_submitter: self.batch_submitter.clone(),
             cursor: self.preparation_cursor,
-            latest_observed_zone_block: self.preparation_cursor.zone_height,
-            observed_zone_block: self.observed_zone_block.clone(),
-            submitted_zone_block: self.submitted_zone_block.clone(),
+            latest_scanned_zone_block: self.preparation_cursor.zone_height,
             settlement_prover: self.settlement_prover.clone(),
         }
     }
@@ -390,23 +392,14 @@ impl<P: ZoneSequencerProvider> BatchPreparer<P> {
             .provider
             .last_block_number()
             .map_err(|error| eyre::eyre!(error))?;
-        let scan_from = self.latest_observed_zone_block.saturating_add(1);
+        let scan_from = self.latest_scanned_zone_block.saturating_add(1);
         if latest_zone_block < scan_from {
             return Ok(());
         }
 
         self.process_block_range(scan_from, latest_zone_block, ready_tx)
             .await?;
-        self.latest_observed_zone_block = latest_zone_block;
-        self.observed_zone_block
-            .store(latest_zone_block, Ordering::Relaxed);
-        self.metrics
-            .latest_zone_block_observed
-            .set(latest_zone_block as f64);
-        self.metrics.zone_to_l1_submission_lag_blocks.set(
-            latest_zone_block.saturating_sub(self.submitted_zone_block.load(Ordering::Relaxed))
-                as f64,
-        );
+        self.latest_scanned_zone_block = latest_zone_block;
         Ok(())
     }
 }
@@ -787,7 +780,6 @@ impl<P: ZoneSequencerProvider> ZoneMonitor<P> {
                     self.metrics
                         .latest_zone_block_submitted_to_l1
                         .set(last_zone_block as f64);
-                    self.update_submission_lag();
 
                     if let Some(portal_index) = portal_index {
                         if !withdrawals.is_empty() {
@@ -908,16 +900,34 @@ impl<P: ZoneSequencerProvider> ZoneMonitor<P> {
         read_zone_block_snapshot(provider, inbox_address, zone_block_number)
     }
 
-    fn update_submission_lag(&self) {
-        let latest_observed_zone_block = self.observed_zone_block.load(Ordering::Relaxed);
-        let submitted_zone_block = self.submitted_zone_block();
-        self.metrics
-            .zone_to_l1_submission_lag_blocks
-            .set(latest_observed_zone_block.saturating_sub(submitted_zone_block) as f64);
-    }
-
     fn submitted_zone_block(&self) -> u64 {
         self.submitted_zone_block.load(Ordering::Relaxed)
+    }
+}
+
+/// Sample persisted head and settlement lag without advancing the batch preparation cursor.
+async fn observe_zone_head<P: ZoneSequencerProvider>(
+    provider: P,
+    metrics: crate::metrics::ZoneMonitorMetrics,
+    submitted_zone_block: Arc<AtomicU64>,
+    poll_interval: Duration,
+) {
+    let mut interval = tokio::time::interval(poll_interval);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        interval.tick().await;
+        let head = match provider.last_block_number() {
+            Ok(head) => head,
+            Err(error) => {
+                // A metrics read failure must not cancel an in-flight submission.
+                error!(%error, "Failed to read persisted zone head for submission metrics");
+                continue;
+            }
+        };
+        metrics.latest_zone_block_observed.set(head as f64);
+        metrics
+            .zone_to_l1_submission_lag_blocks
+            .set(head.saturating_sub(submitted_zone_block.load(Ordering::Relaxed)) as f64);
     }
 }
 
@@ -1010,6 +1020,7 @@ mod tests {
     use alloy_rpc_types_eth::Header as RpcHeader;
     use alloy_sol_types::{SolEvent, SolValue};
     use alloy_transport::mock::Asserter;
+    use reth_metrics::metrics::Gauge;
     use reth_provider::test_utils::MockEthProvider;
     use tempo_alloy::rpc::TempoHeaderResponse;
     use tempo_chainspec::hardfork::TempoHardfork;
@@ -1139,7 +1150,6 @@ mod tests {
             withdrawal_notify: Arc::new(Notify::new()),
             repair_notify: Arc::new(Notify::new()),
             preparation_cursor: cursor,
-            observed_zone_block: Arc::new(AtomicU64::new(50)),
             submitted_zone_block: Arc::new(AtomicU64::new(10)),
             settlement_prover: None,
         }
@@ -1179,6 +1189,123 @@ mod tests {
             certificate: None,
             withdrawals: Vec::new(),
         }
+    }
+
+    fn record_gauge(gauge: &mut Gauge) -> Arc<AtomicU64> {
+        let recorded = Arc::new(AtomicU64::new(0));
+        *gauge = Gauge::from_arc(recorded.clone());
+        recorded
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn head_metrics_advance_while_batch_preparation_is_blocked_or_fails() {
+        let zone = mock_zone_provider(B256::with_last_byte(11), 11, B256::ZERO);
+        zone.add_receipts(
+            11,
+            vec![TempoReceipt {
+                tx_type: TempoTxType::Legacy,
+                success: true,
+                cumulative_gas_used: 0,
+                logs: vec![Log {
+                    address: Address::repeat_byte(0x22),
+                    data: abi::IZoneOutbox::BatchFinalized {
+                        withdrawalQueueHash: B256::ZERO,
+                        withdrawalBatchIndex: 1,
+                    }
+                    .encode_log_data(),
+                }],
+            }],
+        );
+        let mut monitor = test_monitor(Asserter::new(), zone.clone());
+        let observed = record_gauge(&mut monitor.metrics.latest_zone_block_observed);
+        let lag = record_gauge(&mut monitor.metrics.zone_to_l1_submission_lag_blocks);
+        let observation = observe_zone_head(
+            zone.clone(),
+            monitor.metrics.clone(),
+            monitor.submitted_zone_block.clone(),
+            monitor.config.poll_interval,
+        );
+        tokio::pin!(observation);
+        assert!(futures::poll!(&mut observation).is_pending());
+        assert_eq!(f64::from_bits(observed.load(Ordering::Relaxed)), 11.0);
+        assert_eq!(f64::from_bits(lag.load(Ordering::Relaxed)), 1.0);
+
+        let mut preparer = monitor.batch_preparer();
+        let (ready_tx, ready_rx) = mpsc::channel(1);
+        ready_tx.try_send(ready_batch(test_batch_data())).unwrap();
+        {
+            let preparation = preparer.process_available_blocks(&ready_tx);
+            tokio::pin!(preparation);
+            assert!(futures::poll!(&mut preparation).is_pending());
+
+            let mut block = Block::default();
+            block.header.inner.number = 12;
+            zone.add_block(B256::with_last_byte(12), block);
+            zone.add_receipts(12, Vec::new());
+            tokio::time::advance(monitor.config.poll_interval).await;
+            assert!(futures::poll!(&mut observation).is_pending());
+            assert!(futures::poll!(&mut preparation).is_pending());
+            assert_eq!(f64::from_bits(observed.load(Ordering::Relaxed)), 12.0);
+            assert_eq!(f64::from_bits(lag.load(Ordering::Relaxed)), 2.0);
+        }
+        assert_eq!(preparer.latest_scanned_zone_block, 10);
+        assert_eq!(preparer.cursor.zone_height, 10);
+
+        drop(ready_rx);
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            preparer.process_available_blocks(&ready_tx),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert_eq!(error.to_string(), "batch submission worker stopped");
+        assert_eq!(preparer.latest_scanned_zone_block, 10);
+        assert_eq!(preparer.cursor.zone_height, 10);
+
+        let mut header = TempoHeader::default();
+        header.inner.number = 13;
+        zone.add_header(B256::with_last_byte(13), header);
+        tokio::time::advance(monitor.config.poll_interval).await;
+        assert!(futures::poll!(&mut observation).is_pending());
+        assert_eq!(f64::from_bits(observed.load(Ordering::Relaxed)), 13.0);
+        assert_eq!(f64::from_bits(lag.load(Ordering::Relaxed)), 3.0);
+
+        monitor.submitted_zone_block.store(13, Ordering::Relaxed);
+        tokio::time::advance(monitor.config.poll_interval).await;
+        assert!(futures::poll!(&mut observation).is_pending());
+        assert_eq!(f64::from_bits(observed.load(Ordering::Relaxed)), 13.0);
+        assert_eq!(f64::from_bits(lag.load(Ordering::Relaxed)), 0.0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn head_sampling_retries_read_errors_without_resetting_metrics() {
+        let zone = TestZoneProvider::new();
+        let mut monitor = test_monitor(Asserter::new(), zone.clone());
+        let observed = record_gauge(&mut monitor.metrics.latest_zone_block_observed);
+        let lag = record_gauge(&mut monitor.metrics.zone_to_l1_submission_lag_blocks);
+        monitor.metrics.latest_zone_block_observed.set(12.0);
+        monitor.metrics.zone_to_l1_submission_lag_blocks.set(2.0);
+
+        let observation = observe_zone_head(
+            zone.clone(),
+            monitor.metrics.clone(),
+            monitor.submitted_zone_block.clone(),
+            monitor.config.poll_interval,
+        );
+        tokio::pin!(observation);
+        // An empty provider cannot supply its best block number.
+        assert!(futures::poll!(&mut observation).is_pending());
+        assert_eq!(f64::from_bits(observed.load(Ordering::Relaxed)), 12.0);
+        assert_eq!(f64::from_bits(lag.load(Ordering::Relaxed)), 2.0);
+
+        let mut header = TempoHeader::default();
+        header.inner.number = 15;
+        zone.add_header(B256::with_last_byte(15), header);
+        tokio::time::advance(monitor.config.poll_interval).await;
+        assert!(futures::poll!(&mut observation).is_pending());
+        assert_eq!(f64::from_bits(observed.load(Ordering::Relaxed)), 15.0);
+        assert_eq!(f64::from_bits(lag.load(Ordering::Relaxed)), 5.0);
     }
 
     #[tokio::test]
