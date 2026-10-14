@@ -95,6 +95,11 @@ struct Args {
     /// Must be at least the validators' `--consensus.max-message-size-bytes`.
     #[arg(long, default_value_t = 16 * 1024 * 1024)]
     max_message_size: u32,
+    /// Must equal the validators' `--consensus.wait-before-peers-reping`:
+    /// 50s by default, 5s with `--consensus.use-local-defaults`. A mismatch
+    /// stalls the connection behind rate-limited pings.
+    #[arg(long, default_value = "50s")]
+    ping_frequency: tempo_consensus::PositiveDuration,
 }
 
 fn main() -> eyre::Result<()> {
@@ -442,6 +447,7 @@ async fn run(
             listen: args.listen,
             validators,
             max_message_size: args.max_message_size,
+            ping_frequency: args.ping_frequency.into_duration(),
         },
     )?;
 
