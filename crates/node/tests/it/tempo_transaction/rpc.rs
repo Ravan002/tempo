@@ -255,9 +255,22 @@ impl super::types::TestEnv for RpcEnv {
             .await;
 
         match result {
-            Ok(_) => Err(eyre::eyre!(
-                "Transaction should be rejected, but was accepted"
-            )),
+            Ok(tx_hash) => {
+                let start = self.provider.get_block_number().await?;
+                poll_until_with(RPC_POLL, format!("3 blocks past {start}"), || async {
+                    Ok((self.provider.get_block_number().await? >= start + 3).then_some(()))
+                })
+                .await?;
+                let receipt: Option<serde_json::Value> = self
+                    .provider
+                    .raw_request("eth_getTransactionReceipt".into(), [tx_hash])
+                    .await?;
+                eyre::ensure!(
+                    receipt.is_none(),
+                    "Transaction should be rejected, but was included: {tx_hash}"
+                );
+                Ok(())
+            }
             Err(RpcError::Transport(_)) => {
                 // Transport error that persisted through all retries — not a
                 // real rejection, so we must not count it as a test pass.
