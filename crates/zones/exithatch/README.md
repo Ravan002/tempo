@@ -32,9 +32,9 @@ helpers. Stateful execution lives in the Zone inbox and outbox precompiles.
 
 ## Activation
 
-Forced exits require a coordinated Tempo hard fork that installs the forced-exit
-portal runtime. Historical portal runtimes remain in use before that fork and do
-not support forced requests. After the fork, each portal's `forcedExitVersion`
+Forced exits require Tempo T14, which installs the forced-exit portal runtime on
+Tempo L1 (`T14_ZONE_PORTAL_RUNTIME`). Historical portal runtimes remain in use
+before T14 and do not support forced requests. After the fork, each portal's `forcedExitVersion`
 storage value starts at 0 and `requestForcedExit` reverts with
 `ForcedExitsNotActivated`. The portal admin enables admission by calling
 `activateForcedExits()`, which irreversibly sets `forcedExitVersion` to 1 and emits

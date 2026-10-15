@@ -20,10 +20,9 @@ async fn forced_exit_uses_ordinary_delivery_failure_and_private_bounceback() -> 
 async fn forced_exit_flow(bounce: bool) -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
     let timeout = Duration::from_secs(90);
-    let l1 = L1TestNode::start_with_reference_zone_runtimes().await?;
+    let l1 = L1TestNode::start().await?;
     let factory = l1.native_zone_factory().await?;
     let portal_address = l1.create_zone(factory).await?;
-    l1.assert_reference_zone_runtimes().await?;
     let portal_admin = ZonePortal::new(portal_address, l1.admin_provider());
     assert_eq!(portal_admin.forcedExitVersion().call().await?, 0);
     let activation = portal_admin
@@ -206,6 +205,5 @@ async fn forced_exit_flow(bounce: bool) -> eyre::Result<()> {
             1,
         ),
     );
-    l1.assert_reference_zone_runtimes().await?;
     Ok(())
 }
