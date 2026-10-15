@@ -250,6 +250,9 @@ tempo_hardfork!(
 );
 
 impl TempoHardfork {
+    /// Oldest hardfork this release executes. Raise it when removing a hardfork's rules.
+    pub const MINIMUM_SUPPORTED: Self = Self::Genesis;
+
     /// Returns the position of this hardfork in [`Self::VARIANTS`].
     ///
     /// Useful for storing the hardfork in an atomic, see [`Self::from_variant_index`].

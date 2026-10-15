@@ -60,9 +60,6 @@ pub use tempo_revm::{
 #[cfg(test)]
 mod test_utils;
 
-/// Oldest hardfork this release executes. Raise it when removing a hardfork's rules.
-pub const MIN_SUPPORTED_HARDFORK: TempoHardfork = TempoHardfork::Genesis;
-
 /// Tempo-related EVM configuration.
 #[derive(Debug, Clone)]
 pub struct TempoEvmConfig {
@@ -118,7 +115,7 @@ impl TempoEvmConfig {
 
     fn supported_hardfork_at(&self, timestamp: u64) -> Result<TempoHardfork, TempoEvmError> {
         let spec = self.chain_spec().tempo_hardfork_at(timestamp);
-        if spec < MIN_SUPPORTED_HARDFORK {
+        if spec < TempoHardfork::MINIMUM_SUPPORTED {
             return Err(TempoEvmError::UnsupportedHardfork(spec));
         }
         Ok(spec)
@@ -418,11 +415,11 @@ mod tests {
             };
             match evm_config.evm_env(&header) {
                 Ok(env) => {
-                    assert!(spec >= MIN_SUPPORTED_HARDFORK, "{spec}");
+                    assert!(spec >= TempoHardfork::MINIMUM_SUPPORTED, "{spec}");
                     assert_eq!(env.cfg_env.spec, spec);
                 }
                 Err(error) => assert!(
-                    spec < MIN_SUPPORTED_HARDFORK
+                    spec < TempoHardfork::MINIMUM_SUPPORTED
                         && matches!(error, TempoEvmError::UnsupportedHardfork(f) if f == spec),
                     "{spec}: {error}"
                 ),

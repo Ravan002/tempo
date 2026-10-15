@@ -28,7 +28,7 @@ after the last frozen era run in the live node. A frozen era's required `checkpo
 canonical block, and checkpoints strictly increase. The built-in development catalog
 (`bin/tempo/eras.json`) is empty. Unmatched chains, custom genesis, and custom fork schedules use
 the native path. Independently of the catalog, the live binary refuses to execute blocks older than
-its compiled `tempo_evm::MIN_SUPPORTED_HARDFORK`, on every execution path.
+its compiled `TempoHardfork::MINIMUM_SUPPORTED`, on every execution path.
 
 Workers inherit the selected genesis, datadir, custom static-file/RocksDB paths, and resolved SDK
 `EthConfig` through private temporary files. Gas, simulation, memory, and tracing settings retain

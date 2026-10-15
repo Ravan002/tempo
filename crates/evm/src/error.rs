@@ -14,7 +14,7 @@ pub enum TempoEvmError {
     #[error("invalid EVM configuration: {0}")]
     InvalidEvmConfig(String),
 
-    /// The block's hardfork predates [`crate::MIN_SUPPORTED_HARDFORK`].
+    /// The block's hardfork predates [`TempoHardfork::MINIMUM_SUPPORTED`].
     #[error("{0} blocks are executed by their frozen era binary, not this release")]
     UnsupportedHardfork(TempoHardfork),
 }
