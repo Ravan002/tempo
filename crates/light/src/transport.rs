@@ -9,11 +9,13 @@ use serde_json::{Value, json};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tempo_finality::CertifiedHeader;
 use tempo_state_proof::ProofTargets;
+use tokio::sync::Semaphore;
 use url::Url;
 
 struct Endpoint {
     url: Url,
     standard_only: AtomicBool,
+    proof_permits: Semaphore,
 }
 
 /// Endpoint state is capability/availability only. All providers share the client's verifier.
@@ -22,11 +24,14 @@ pub struct Upstreams {
     http: reqwest::Client,
     endpoints: Vec<Endpoint>,
     max_bytes: usize,
+    proof_concurrency: usize,
 }
 
 impl Upstreams {
     pub fn new(urls: Vec<Url>, limits: &Limits) -> Result<Self, Error> {
-        if urls.is_empty()
+        if limits.proof_concurrency == 0
+            || limits.proof_concurrency > Limits::MAX_PROOF_CONCURRENCY
+            || urls.is_empty()
             || urls.len() > 8
             || urls
                 .iter()
@@ -43,11 +48,13 @@ impl Upstreams {
         Ok(Self {
             http,
             max_bytes: limits.max_response_bytes,
+            proof_concurrency: limits.proof_concurrency,
             endpoints: urls
                 .into_iter()
                 .map(|url| Endpoint {
                     url,
                     standard_only: AtomicBool::new(false),
+                    proof_permits: Semaphore::new(limits.proof_concurrency),
                 })
                 .collect(),
         })
@@ -122,7 +129,7 @@ impl Upstreams {
                 .await
             }
         }))
-        .buffer_unordered(2)
+        .buffer_unordered(self.proof_concurrency)
         .try_collect()
         .await
     }
@@ -135,6 +142,19 @@ impl Upstreams {
         budget: &AtomicUsize,
     ) -> Result<T, Error> {
         let endpoint = self.endpoints.get(provider).ok_or(Error::Configuration)?;
+        // Share the provider budget across multiproofs and standard fallback requests from
+        // every job. Waiting is bounded by job admission and the caller's operation deadline.
+        let _permit = if matches!(method, "eth_getProof" | "eth_getMultiProof") {
+            Some(
+                endpoint
+                    .proof_permits
+                    .acquire()
+                    .await
+                    .map_err(|_| Error::Configuration)?,
+            )
+        } else {
+            None
+        };
         let body = serde_json::to_vec(
             &json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}),
         )
@@ -220,7 +240,7 @@ struct RpcFailure {
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("configure between one and eight HTTP(S) upstream endpoints")]
+    #[error("configure between one and eight HTTP(S) upstream endpoints and proof RPC concurrency between one and {max}", max = Limits::MAX_PROOF_CONCURRENCY)]
     Configuration,
     #[error("upstream {0} request unavailable or timed out")]
     Unavailable(usize),

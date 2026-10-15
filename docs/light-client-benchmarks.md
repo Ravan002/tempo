@@ -1,10 +1,11 @@
-# Light-client smoke measurements
+# Light-client performance measurements
 
-These are **debug-build, loopback smoke measurements**, not production budgets or a complete
-performance evaluation. The reproducible harness is `scripts/light-client-devnet.py`; see
-[operation and trust documentation](light-client.md). The task remains open for sustained load,
-proof-generation CPU/IO, memory/bandwidth profiling, cold reads, multi-token scaling and a fair
-unverified-read baseline.
+The historical devnet runs below are **debug-build, loopback smoke measurements**, not production
+budgets or a complete performance evaluation. Their reproducible harness is
+`scripts/light-client-devnet.py`; see [operation and trust documentation](light-client.md).
+The [fresh-proof release experiment](#fresh-proof-release-experiment) measures generated proof
+workloads and simulated RPC delay separately. Sustained load, upstream proof-generation CPU/IO,
+memory/WAN bandwidth, multi-token scaling and a fair unverified-read baseline remain unqualified.
 
 ## Recorded run
 
@@ -105,3 +106,114 @@ the historical runs or qualification of sustained active-token workloads.
 
 No numerical production resource/performance guarantees are inferred from these results.
 Current resource ceilings remain provisional safety limits pending representative measurements.
+
+## Fresh-proof release experiment
+
+This experiment assesses whether local proof-node reuse is worth implementing with existing RPCs.
+It does **not** implement an optimized verifier or persistent node cache. The opt-in harness is
+`crates/light/tests/performance.rs`; no production code, public API or generated fixture changed.
+
+```sh
+TEMPO_LIGHT_BENCH_SAMPLES=100 cargo test --release -p tempo-light \
+  --features rpc-server --test performance --locked --offline -- --ignored --nocapture
+```
+
+The default is 30 measured samples per case; the environment variable accepts 10–200. Three
+warm-up bursts per case are excluded. The test is ignored in ordinary test runs and refuses to
+measure an unoptimized build.
+
+### Method and limitations
+
+Recorded on 2026-10-07: Apple M4 Max, 14 logical CPUs, 36 GiB RAM, macOS 26.7.1, Rust 1.96.0,
+workspace release profile (`opt-level=3`, thin LTO). The machine was not CPU-isolated; background
+system/app activity contributed to socket/scheduler noise. No other Cargo work ran during the two
+primary measured runs. Local raw logs are `/tmp/tempo-light-proof-benchmark/run-4.log` and
+`run-5.log`; earlier runs were exploratory. A final 10-sample run passed after simplifying the
+harness's derived slot representation.
+
+- Generated, valid secure MPT proofs for one token with 100,000 nonzero holder balances; account
+  proofs traverse a state trie containing the token and 4,096 background accounts.
+- A deterministic test DKG signs every snapshot. These are modeled states, not executed validator
+  blocks. Equal balance debits/credits change 25% of 1,024 tracked holders plus 200 unrelated holders
+  at each snapshot. The one-slot case reads a changing holder; larger batches include unchanged
+  holders. Both token storage root and global state root must change between successive snapshots.
+- The real `Client::read` runs with default limits over a local JSON-RPC provider. Its response delay
+  is 0, 20 or 80 ms. These delays model RPC waiting time, **not** WAN packet propagation or transfer
+  bandwidth. Provider and client share a four-worker Tokio runtime; verification uses the client's
+  real blocking workers.
+- Cases contain 1, 32 or 128 balances per read, with one or eight simultaneous disjoint portfolios.
+  Each burst selects a new authenticated root. Assertions require one proof RPC per read, the exact
+  selected block hash and every expected balance. Each primary run contains 8,100 measured reads
+  and 8,100 proof RPCs: neither warm hits nor coalescing can hide fresh verification work.
+- Proofs are generated before timing. Provider response selection/serialization, HTTP transport,
+  client parsing, scheduling, verification, local decoding and cache publication are included in
+  client read latency. Head authentication/checkpoint persistence, provider database/proof generation,
+  TLS, compression, packet loss and memory profiling are excluded. Burst reads/second in raw output
+  excludes between-burst work and is **not sustained production throughput**.
+- Isolated parsing measurements approximate the current JSON-DOM-then-typed-result path, omitting
+  envelope validation. Verification and publication call the existing shared APIs. Isolated timings
+  are not additive concurrent-client stage measurements.
+
+### Components
+
+Ranges are the p50 values across the two primary runs, rounded. Node counts include account proofs;
+new nodes are byte-distinct from the preceding snapshot's same requested proof set.
+
+| Balances | JSON response bytes | Node occurrences / unique / new | DOM + typed parsing | Verification | Publication |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 1 | 8,289 | 11 / 11 / 11 | 0.003 ms | 0.0074 ms | 0.0010–0.0014 ms |
+| 32 | 146,526 | 195 / 146 / 71 | 0.042 ms | 0.128–0.129 ms | 0.0036–0.0050 ms |
+| 128 | 573,918 | 761 / 492 / 214 | 0.160–0.161 ms | 0.502–0.503 ms | 0.0109–0.0115 ms |
+
+Verification p95 was 0.509–0.517 ms for 128 balances.
+
+### End-to-end fresh reads
+
+Each cell is **p50 / p95 in milliseconds**, with ranges across both runs. Eight-way concurrency
+uses disjoint requests, not eight callers sharing one proof job. The variation, especially in
+zero-delay/concurrent cases, is a reason not to infer precise throughput or tail-latency guarantees.
+
+| Balances/read | Injected RPC delay | One caller | Eight concurrent callers |
+| --- | ---: | ---: | ---: |
+| 1 | 0 ms | 0.35–0.41 / 0.54–0.58 | 0.59–0.65 / 1.36–1.39 |
+| 32 | 0 ms | 1.33–1.72 / 1.85–2.31 | 1.03–2.41 / 3.24–3.69 |
+| 128 | 0 ms | 2.13 / 3.56–4.17 | 3.03–3.18 / 3.72–4.26 |
+| 1 | 20 ms | 22.54–22.59 / 22.88–23.13 | 22.53–22.91 / 22.93–24.84 |
+| 32 | 20 ms | 23.77–24.41 / 24.45–26.14 | 25.12–26.13 / 26.33–28.56 |
+| 128 | 20 ms | 26.69–27.41 / 28.12–28.89 | 27.39–30.75 / 30.05–33.95 |
+| 1 | 80 ms | 82.54–82.66 / 83.04–83.14 | 82.72–83.11 / 83.72–84.89 |
+| 32 | 80 ms | 82.98–83.59 / 84.00–84.96 | 83.59–85.77 / 85.80–88.50 |
+| 128 | 80 ms | 87.32–88.68 / 88.61–90.86 | 86.66–95.14 / 91.46–99.71 |
+
+### Node-reuse probes and decision
+
+The harness also times hashing/decoding nodes without path verification. A simple byte-keyed
+`HashSet` memo probe includes byte hashing, exact equality and insertion, skipping hash/decode work
+on hits. The batch probe starts empty; the previous-snapshot probe starts with the preceding proof
+set. This is a **work-elision microprobe**, not an authenticated cache or alternate verifier: it does
+not retain decoded nodes, check proof paths, preserve target/error contracts or budget residency.
+Previous-cache setup/eviction and decoded-node retention are excluded. More sophisticated indexing
+could differ; these probes do not establish optimized read latency.
+
+| Balances | Hash/decode every occurrence | Batch memo | Previous-snapshot memo |
+| --- | ---: | ---: | ---: |
+| 1 | 6.7 µs | 8.3 µs | 8.5 µs |
+| 32 | 118–119 µs | 111–112 µs | 63–64 µs |
+| 128 | 463–466 µs | 372–375 µs | 199–200 µs |
+
+For 128 balances, processing unique nodes alone took 252–255 µs, but lookup/insertion overhead
+reduced the batch memo's saving to about **0.09 ms**. The previous-snapshot probe saved about
+**0.26–0.27 ms**, before real cache maintenance and verifier integration. For 32 balances that
+saving was about **0.055 ms**; for a single changing balance the memo added overhead.
+
+The previous-snapshot saving is roughly **1%** of the measured serial 128-balance read with 20 ms
+injected delay, and **0.3%** with 80 ms delay. These are comparisons of CPU-work budgets, not measured
+end-to-end speedups. Zero-delay large-portfolio reads have more potential: that same budget is about
+12% of their median latency, and CPU-limited throughput/queuing could be more sensitive.
+
+**Decision:** defer a persistent proof-node cache for ordinary remote-provider balance reads.
+Consider shared-node verification if a deployment is co-located with a provider or demonstrably
+verification-CPU-limited. Compact/cache-aware transport remains a more promising way to avoid
+redundant downloads, but requires a separate end-to-end evaluation, including compression and
+upstream proof-generation cost. Multi-token portfolios and lower-powered client CPUs remain
+unmeasured; no production performance guarantee follows from this experiment.

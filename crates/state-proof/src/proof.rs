@@ -20,15 +20,19 @@ pub struct ProofLimits {
     pub max_node_bytes: usize,
     pub max_total_bytes: usize,
 }
+impl ProofLimits {
+    /// Default work ceilings, also available to const cache configurations.
+    pub const DEFAULT: Self = Self {
+        max_accounts: 64,
+        max_slots: 1024,
+        max_nodes: 65_536,
+        max_node_bytes: 4096,
+        max_total_bytes: 8 * 1024 * 1024,
+    };
+}
 impl Default for ProofLimits {
     fn default() -> Self {
-        Self {
-            max_accounts: 64,
-            max_slots: 1024,
-            max_nodes: 65_536,
-            max_node_bytes: 4096,
-            max_total_bytes: 8 * 1024 * 1024,
-        }
+        Self::DEFAULT
     }
 }
 

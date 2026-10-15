@@ -16,13 +16,13 @@ use std::{
     path::Path,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{SystemTime, UNIX_EPOCH},
 };
 use tempo_state_proof::{
-    CacheError, CacheLimits, ProofError, ProofTargets, RetentionDelta, StorageReadKey,
-    VerifiedBatch, VerifiedCache,
+    CacheError, ProofError, ProofTargets, RetentionDelta, StorageReadKey, VerifiedBatch,
+    VerifiedCache,
 };
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, watch};
 use url::Url;
@@ -38,7 +38,8 @@ struct Inner {
     cache: Mutex<VerifiedCache>,
     refresh: Arc<Mutex<()>>,
     permits: Arc<Semaphore>,
-    in_flight: Mutex<HashMap<QueryKey, watch::Receiver<Option<ReadOutcome>>>>,
+    waiters: Semaphore,
+    in_flight: Mutex<HashMap<(B256, StorageReadKey), ProofReceiver>>,
     integrity_failures: AtomicU64,
 }
 struct State {
@@ -47,8 +48,16 @@ struct State {
     failure: Option<FailureKind>,
     persistence_paused: bool,
 }
-type QueryKey = (B256, Vec<ReadRequest>);
 type ReadOutcome = Result<Arc<VerifiedReads>, Arc<Error>>;
+type ProofOutcome = Result<Arc<SharedProof>, Arc<Error>>;
+type ProofReceiver = watch::Receiver<Option<ProofOutcome>>;
+
+/// One canonical batch per job. Publication is serialized by the cache lock; this monotonic
+/// marker prevents coalesced callers from republishing it. It does not assert cache residency.
+struct SharedProof {
+    batch: VerifiedBatch,
+    published: AtomicBool,
+}
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -128,9 +137,10 @@ impl Client {
                 None,
             ),
         };
-        let cache = VerifiedCache::new(CacheLimits::new(limits.account_cache, limits.slot_cache))
+        let cache = VerifiedCache::new(limits.cache_limits().map_err(Error::Configuration)?)
             .map_err(|_| Error::Configuration("invalid authenticated cache capacities"))?;
         let permits = Arc::new(Semaphore::new(limits.read_concurrency));
+        let waiters = Semaphore::new(limits.max_read_waiters);
         Ok(Self(Arc::new(Inner {
             network,
             limits,
@@ -145,6 +155,7 @@ impl Client {
             cache: Mutex::new(cache),
             refresh: Arc::new(Mutex::new(())),
             permits,
+            waiters,
             in_flight: Mutex::new(HashMap::new()),
             integrity_failures: AtomicU64::new(0),
         })))
@@ -307,32 +318,33 @@ impl Client {
         Err(integrity.unwrap_or(last))
     }
 
-    /// Latest-only, snapshot-consistent batch. Identical in-flight queries share one bounded job.
-    /// New jobs fail Busy instead of forming an unbounded queue. Stale valid heads remain labelled
-    /// with their actual timestamp; provider proof lag never selects a different/older snapshot.
+    /// Latest-only, snapshot-consistent batch, preserving order and duplicate requests.
+    /// Overlapping reads share pending slots at the same block, independent of request order.
+    /// Proof jobs and waiters have separate, non-queuing admission bounds. Stale valid heads
+    /// remain labelled with their actual timestamp; failover never substitutes another snapshot.
     pub async fn read(&self, requests: Vec<ReadRequest>) -> ReadOutcome {
         if requests.is_empty() || requests.len() > self.0.limits.max_reads {
-            return Err(Arc::new(Error::RequestLimit));
+            return Err(Error::RequestLimit.into());
         }
-        let token_error = |error| Arc::new(Error::Token(error));
+        let _waiter = self.0.waiters.try_acquire().map_err(|_| Error::Busy)?;
         let keys = requests
             .iter()
             .map(|request| request.key())
             .collect::<Result<Vec<_>, _>>()
-            .map_err(token_error)?;
-        if token::targets(&requests).map_err(token_error)?.len() > self.0.limits.proofs.max_accounts
-        {
-            return Err(Arc::new(Error::RequestLimit));
+            .map_err(Error::from)?;
+        let accounts = keys
+            .iter()
+            .map(|key| key.account)
+            .collect::<std::collections::HashSet<_>>();
+        if accounts.len() > self.0.limits.proofs.max_accounts {
+            return Err(Error::RequestLimit.into());
         }
         let snapshot = {
             let state = self.0.state.lock().await;
             if state.persistence_paused {
-                return Err(Arc::new(Error::PersistencePaused));
+                return Err(Error::PersistencePaused.into());
             }
-            state
-                .tracker
-                .snapshot()
-                .ok_or_else(|| Arc::new(Error::NoHead))?
+            state.tracker.snapshot().ok_or(Error::NoHead)?
         };
         if self
             .0
@@ -340,56 +352,25 @@ impl Client {
             .unsupported_layout_from
             .is_some_and(|timestamp| snapshot.header().timestamp() >= timestamp)
         {
-            return Err(Arc::new(Error::UnsupportedLayout));
+            return Err(Error::UnsupportedLayout.into());
         }
-        let key = (snapshot.evidence().digest, requests);
-        let mut in_flight = self.0.in_flight.lock().await;
-        let mut rx = if let Some(rx) = in_flight.get(&key) {
-            rx.clone()
-        } else {
-            let permit = Arc::new(
-                self.0
-                    .permits
-                    .clone()
-                    .try_acquire_owned()
-                    .map_err(|_| Arc::new(Error::Busy))?,
-            );
-            let (tx, rx) = watch::channel(None);
-            in_flight.insert(key.clone(), rx.clone());
-            let client = self.clone();
-            tokio::spawn(async move {
-                let work = client.read_inner(snapshot, keys, permit.clone());
-                let result = tokio::time::timeout(client.0.limits.read_timeout, work)
-                    .await
-                    .unwrap_or(Err(Error::Deadline));
-                let result = result.map(Arc::new).map_err(Arc::new);
-                tx.send_replace(Some(result));
-                client.0.in_flight.lock().await.remove(&key);
-            });
-            rx
-        };
-        drop(in_flight);
-        loop {
-            if let Some(result) = rx.borrow().clone() {
-                return result;
-            }
-            rx.changed().await.map_err(|_| Arc::new(Error::Worker))?;
-        }
+        tokio::time::timeout(self.0.limits.read_timeout, self.read_inner(snapshot, keys))
+            .await
+            .unwrap_or_else(|_| Err(Error::Deadline.into()))
+            .map(Arc::new)
     }
 
     async fn read_inner(
         &self,
         snapshot: Snapshot,
         keys: Vec<StorageReadKey>,
-        permit: Arc<OwnedSemaphorePermit>,
-    ) -> Result<VerifiedReads, Error> {
+    ) -> Result<VerifiedReads, Arc<Error>> {
         let root = snapshot.header().state_root();
         let mut reads = keys.into_iter().map(|key| (key, None)).collect::<Vec<_>>();
         let missing = {
             let mut cache = self.0.cache.lock().await;
             let mut targets = ProofTargets::new();
-            // Keep the all-warm path allocation-light: no batch maps, normalization or publication.
-            // Copies live only in this immutable-snapshot operation, not another shared authority.
+            // Warm reads only capture raw values; no proof permit, evidence maps or publication.
             for (key, hit) in &mut reads {
                 *hit = cache
                     .get(root, *key)
@@ -400,38 +381,137 @@ impl Client {
             }
             targets
         };
-        // Active tokens commonly change storage roots every block. Request all missing slots
-        // directly rather than speculating on an account-only proof followed by another RPC.
-        let batch = if missing.is_empty() {
-            VerifiedBatch::empty(root)
-        } else {
-            self.fetch_verified(&snapshot, &missing, &permit).await?
-        };
-        // Decode only owned evidence, outside the cache lock, before publishing any new mappings.
+        let jobs = self.proof_jobs(&snapshot, missing).await?;
+        let mut proofs = Vec::with_capacity(jobs.len());
+        for mut rx in jobs {
+            loop {
+                if let Some(result) = rx.borrow().clone() {
+                    proofs.push(result?);
+                    break;
+                }
+                rx.changed().await.map_err(|_| Error::Worker)?;
+            }
+        }
+        // All jobs succeeded before decoding or publishing. A cancelled/failed read publishes
+        // nothing itself; other successful callers may independently publish shared evidence.
         let values = reads
             .into_iter()
             .map(|(key, hit)| {
                 let (account, word) = match &hit {
                     Some((account, word)) => (account.as_ref(), *word),
                     None => {
-                        let account = batch.accounts().get(&key.account).ok_or(Error::Worker)?;
-                        (account.account(), batch.word(key).ok_or(Error::Worker)?)
+                        let (proof, word) = proofs
+                            .iter()
+                            .find_map(|proof| proof.batch.word(key).map(|word| (proof, word)))
+                            .ok_or(Error::Worker)?;
+                        (proof.batch.accounts()[&key.account].account(), word)
                     }
                 };
-                token::decode(key, account, word).map_err(Error::from)
+                Ok(token::decode(key, account, word).map_err(Error::from)?)
             })
-            .collect::<Result<Vec<_>, _>>()?;
-        if !batch.accounts().is_empty() {
-            self.0
-                .cache
-                .lock()
-                .await
-                .publish(&[(root, &batch)], &RetentionDelta::default())?;
+            .collect::<Result<Vec<_>, Arc<Error>>>()?;
+        if proofs
+            .iter()
+            .any(|proof| !proof.published.load(Ordering::Relaxed))
+        {
+            let mut cache = self.0.cache.lock().await;
+            let publication = proofs
+                .iter()
+                .filter(|proof| !proof.published.load(Ordering::Relaxed))
+                .map(|proof| (root, &proof.batch))
+                .collect::<Vec<_>>();
+            cache
+                .publish(&publication, &RetentionDelta::default())
+                .map_err(Error::from)?;
+            // Every previously unpublished proof was included above. Keep marking under the
+            // cache lock so another caller cannot select the same evidence for publication.
+            for proof in &proofs {
+                proof.published.store(true, Ordering::Relaxed);
+            }
         }
         Ok(VerifiedReads {
             block: (&snapshot).into(),
             values,
         })
+    }
+
+    /// Capture existing jobs once, and group only uncovered slots into one new bounded job.
+    /// The index holds one receiver per slot, not separate authorities or copied evidence.
+    async fn proof_jobs(
+        &self,
+        snapshot: &Snapshot,
+        missing: ProofTargets,
+    ) -> Result<Vec<ProofReceiver>, Arc<Error>> {
+        if missing.is_empty() {
+            return Ok(Vec::new());
+        }
+        let hash = snapshot.evidence().digest;
+        let mut in_flight = self.0.in_flight.lock().await;
+        let mut jobs: Vec<ProofReceiver> = Vec::new();
+        let mut uncovered = ProofTargets::new();
+        for (account, slots) in missing {
+            for slot in slots {
+                let key = (hash, StorageReadKey::new(account, slot));
+                if let Some(rx) = in_flight.get(&key) {
+                    if !jobs.iter().any(|job| job.same_channel(rx)) {
+                        jobs.push(rx.clone());
+                    }
+                } else {
+                    uncovered.entry(account).or_default().insert(slot);
+                }
+            }
+        }
+        if !uncovered.is_empty() {
+            let permit = Arc::new(
+                self.0
+                    .permits
+                    .clone()
+                    .try_acquire_owned()
+                    .map_err(|_| Error::Busy)?,
+            );
+            let (tx, rx) = watch::channel(None);
+            for (&account, slots) in &uncovered {
+                for &slot in slots {
+                    in_flight.insert((hash, StorageReadKey::new(account, slot)), rx.clone());
+                }
+            }
+            jobs.push(rx);
+            let client = self.clone();
+            let selected = snapshot.clone();
+            tokio::spawn(async move {
+                let work = async {
+                    let batch = client
+                        .fetch_verified(&selected, &uncovered, &permit)
+                        .await?;
+                    // A shared job may include more targets than a subset caller needs. Accept
+                    // every token before making its evidence available for publication.
+                    for (&account, evidence) in batch.accounts() {
+                        token::validate_token(account, evidence.account())?;
+                    }
+                    Ok(batch)
+                };
+                let result = tokio::time::timeout(client.0.limits.read_timeout, work)
+                    .await
+                    .unwrap_or(Err(Error::Deadline));
+                tx.send_replace(Some(
+                    result
+                        .map(|batch| {
+                            Arc::new(SharedProof {
+                                batch,
+                                published: AtomicBool::new(false),
+                            })
+                        })
+                        .map_err(Arc::new),
+                ));
+                let mut in_flight = client.0.in_flight.lock().await;
+                for (account, slots) in uncovered {
+                    for slot in slots {
+                        in_flight.remove(&(hash, StorageReadKey::new(account, slot)));
+                    }
+                }
+            });
+        }
+        Ok(jobs)
     }
 
     // Provider failover retains the operation's original snapshot, deadline and admission permit.

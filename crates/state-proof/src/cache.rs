@@ -1,5 +1,5 @@
 use crate::{
-    CompositionError, ProofTargets, StorageReadKey, VerifiedAccount, VerifiedBatch,
+    CompositionError, ProofLimits, ProofTargets, StorageReadKey, VerifiedAccount, VerifiedBatch,
     proof::{check_account, check_word, storage_root},
 };
 use alloy_primitives::{Address, B256};
@@ -37,15 +37,22 @@ pub struct CacheLimits {
 }
 
 impl CacheLimits {
-    /// Single-batch publication bounded by capacity, without retention.
+    /// Single-batch publication with default proof work ceilings, without retention.
+    /// Resident capacities only determine eviction, not how much evidence may be published.
+    /// Consumers with other proof or multi-batch budgets must set the publication fields explicitly.
     pub const fn new(accounts: NonZeroU32, words: NonZeroU32) -> Self {
+        const fn publication_limit(count: usize) -> NonZeroU32 {
+            assert!(count <= u32::MAX as usize, "default proof limit fits u32");
+            NonZeroU32::new(count as u32).expect("default proof limit is nonzero")
+        }
+        let proofs = ProofLimits::DEFAULT;
         Self {
             accounts,
             words,
             max_retained_accounts: 0,
             max_publication_batches: NonZeroU32::MIN,
-            max_publication_accounts: accounts,
-            max_publication_words: words,
+            max_publication_accounts: publication_limit(proofs.max_accounts),
+            max_publication_words: publication_limit(proofs.max_slots),
             max_retention_updates: NonZeroU32::MIN,
         }
     }
@@ -450,6 +457,22 @@ mod tests {
                 .keys()
                 .all(|key| cache.evictable.peek(key).is_none())
         );
+    }
+
+    #[test]
+    fn publication_work_is_independent_of_resident_capacity() {
+        const LIMITS: CacheLimits = CacheLimits::new(NonZeroU32::MIN, NonZeroU32::MIN);
+        let mut cache = VerifiedCache::new(LIMITS).unwrap();
+        let mut evidence = batch(1, 10, [(0, 42), (1, 43)]);
+        let mut second = evidence.accounts[&Address::ZERO].clone();
+        second.account.as_mut().unwrap().storage_root = B256::with_last_byte(11);
+        evidence.accounts.insert(Address::repeat_byte(1), second);
+        publish(&mut cache, &evidence);
+        assert_eq!(cache.stats().accounts, 1);
+        assert_eq!(cache.stats().words, 1);
+        assert_eq!(evidence.accounts.len(), 2);
+        assert_eq!(evidence.word(read(0)), Some(B256::with_last_byte(42)));
+        assert_bounds(&cache);
     }
 
     #[test]

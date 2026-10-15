@@ -156,6 +156,142 @@ async fn critical_publication_failure_pauses_reads_and_successful_refresh_recove
 }
 
 #[tokio::test]
+async fn standard_proofs_use_a_provider_wide_concurrency_budget() {
+    use alloy_primitives::{Address, B256, keccak256};
+    use alloy_trie::{HashBuilder, Nibbles, TrieAccount, proof::ProofRetainer};
+    use std::collections::{BTreeMap, BTreeSet};
+    use tempo_state_proof::{ProofTargets, test_utils::fixture, verify_multi_proof};
+    use tokio::sync::{Semaphore, mpsc};
+
+    // Genuine account-only proofs for four accounts under one root.
+    let mut responses = (0..4)
+        .map(|index| {
+            let (_, _, mut response) = fixture(1, 42);
+            response.address = Address::with_last_byte(index);
+            response.storage_proof.clear();
+            response
+        })
+        .collect::<Vec<_>>();
+    let leaves = responses
+        .iter()
+        .map(|response| {
+            let account = TrieAccount {
+                nonce: response.nonce,
+                balance: response.balance,
+                storage_root: response.storage_hash,
+                code_hash: response.code_hash,
+            };
+            (
+                Nibbles::unpack(keccak256(response.address)),
+                alloy_rlp::encode(account),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut root = B256::ZERO;
+    for response in &mut responses {
+        let path = Nibbles::unpack(keccak256(response.address));
+        let mut builder =
+            HashBuilder::default().with_proof_retainer(ProofRetainer::new(vec![path]));
+        for (path, value) in &leaves {
+            builder.add_leaf(*path, value);
+        }
+        root = builder.root();
+        response.account_proof = builder
+            .take_proof_nodes()
+            .into_nodes_sorted()
+            .into_iter()
+            .map(|(_, node)| node)
+            .collect();
+    }
+    let targets = responses
+        .iter()
+        .map(|response| (response.address, BTreeSet::new()))
+        .collect::<ProofTargets>();
+    verify_multi_proof(root, &targets, &responses, ProofLimits::default()).unwrap();
+
+    let (started_tx, mut started) = mpsc::unbounded_channel();
+    let release = Arc::new(Semaphore::new(0));
+    let active = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let server = Server::builder().build("127.0.0.1:0").await.unwrap();
+    let address = server.local_addr().unwrap();
+    let mut module = RpcModule::new((
+        responses,
+        started_tx,
+        release.clone(),
+        active.clone(),
+        peak.clone(),
+    ));
+    module
+        .register_method("eth_getMultiProof", |_, _, _| {
+            Err::<Value, _>(ErrorObjectOwned::owned(
+                -32601,
+                "method not found",
+                None::<()>,
+            ))
+        })
+        .unwrap();
+    module
+        .register_async_method("eth_getProof", |params, context, _| async move {
+            let (responses, started, release, active, peak) = context.as_ref();
+            let (account, slots, selector): (Address, Vec<B256>, Value) = params.parse()?;
+            assert!(slots.is_empty());
+            assert_eq!(
+                selector,
+                json!({"blockHash": B256::ZERO, "requireCanonical": true})
+            );
+            let count = active.fetch_add(1, Ordering::SeqCst) + 1;
+            peak.fetch_max(count, Ordering::SeqCst);
+            started.send(account).unwrap();
+            release.acquire().await.unwrap().forget();
+            active.fetch_sub(1, Ordering::SeqCst);
+            Ok::<_, ErrorObjectOwned>(
+                responses
+                    .iter()
+                    .find(|response| response.address == account)
+                    .unwrap()
+                    .clone(),
+            )
+        })
+        .unwrap();
+    let handle = server.start(module);
+    let transport = Upstreams::new(
+        vec![format!("http://{address}").parse().unwrap()],
+        &Limits {
+            proof_concurrency: 4,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let transport = Arc::new(transport);
+    let spawn = || {
+        let transport = transport.clone();
+        let targets = targets.clone();
+        tokio::spawn(async move { transport.proofs(0, B256::ZERO, &targets).await })
+    };
+    let first = spawn();
+    for _ in 0..4 {
+        tokio::time::timeout(std::time::Duration::from_secs(5), started.recv())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    // One fallback batch can use all four permits; another batch cannot multiply the budget.
+    let second = spawn();
+    tokio::task::yield_now().await;
+    assert!(started.try_recv().is_err());
+    release.add_permits(8);
+    let (first, second) = tokio::join!(first, second);
+    for responses in [first.unwrap().unwrap(), second.unwrap().unwrap()] {
+        verify_multi_proof(root, &targets, &responses, ProofLimits::default()).unwrap();
+    }
+    assert_eq!(peak.load(Ordering::SeqCst), 4);
+    assert_eq!(active.load(Ordering::SeqCst), 0);
+    handle.stop().unwrap();
+    handle.stopped().await;
+}
+
+#[tokio::test]
 async fn proof_window_expiry_is_availability_not_selector_capability() {
     let fixture: Value =
         serde_json::from_str(include_str!("../fixtures/mpt-finality-v1.json")).unwrap();

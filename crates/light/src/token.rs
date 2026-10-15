@@ -67,15 +67,21 @@ pub(crate) fn decode(
     account: Option<&TrieAccount>,
     word: B256,
 ) -> Result<U256, Error> {
-    if !is_tip20_prefix(key.account) {
-        return Err(Error::UnsupportedToken(key.account));
+    validate_token(key.account, account)?;
+    Ok(U256::from_be_bytes(word.0))
+}
+
+#[cfg(any(feature = "client", test))]
+pub(crate) fn validate_token(token: Address, account: Option<&TrieAccount>) -> Result<(), Error> {
+    if !is_tip20_prefix(token) {
+        return Err(Error::UnsupportedToken(token));
     }
     if account
         .is_none_or(|account| account.code_hash.is_zero() || account.code_hash == KECCAK_EMPTY)
     {
-        return Err(Error::UninitializedToken(key.account));
+        return Err(Error::UninitializedToken(token));
     }
-    Ok(U256::from_be_bytes(word.0))
+    Ok(())
 }
 
 #[cfg(test)]

@@ -33,6 +33,11 @@ Account mappings use `(state_root, account)`; words use `(account, slot, storage
 is reusable only with account evidence at the selected root. Presence is checked before absence,
 including present empty accounts. Authenticated empty storage derives zero without retaining words.
 
+`CacheLimits::new` uses the default proof account/slot ceilings for single-batch publication,
+independently of resident capacities. Smaller caches evict entries rather than rejecting valid
+in-budget publications. Consumers with larger or multi-batch workloads must set explicit
+publication occurrence budgets; retention capacity remains a separate hard bound.
+
 The consumer owns synchronization, transport, scheduling, checkpoint/attempt lifetimes and metrics.
 Required account mappings can be retained independently of the ordinary LRU.
 Released mappings may be discarded immediately; old-root words and operation-owned evidence survive.

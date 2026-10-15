@@ -51,8 +51,15 @@ pub(crate) struct LightArgs {
     pub read_timeout_ms: u64,
     #[arg(id = "light_poll_interval_ms", long = "light.poll-interval-ms", default_value_t = 500, value_parser = clap::value_parser!(u64).range(100..=60_000), requires = "light")]
     pub poll_interval_ms: u64,
+    /// Maximum owned proof jobs, including workers finishing after a deadline.
     #[arg(id = "light_read_concurrency", long = "light.read-concurrency", default_value_t = 8, value_parser = clap::value_parser!(u32).range(1..=64), requires = "light")]
     pub read_concurrency: u32,
+    /// Maximum concurrent readers, including callers sharing pending proofs.
+    #[arg(id = "light_read_waiters", long = "light.read-waiters", default_value_t = Limits::default().max_read_waiters as u32, value_parser = clap::value_parser!(u32).range(1..=Limits::MAX_READ_WAITERS as i64), requires = "light")]
+    pub read_waiters: u32,
+    /// Maximum simultaneous proof RPCs per provider, shared across proof jobs.
+    #[arg(id = "light_proof_concurrency", long = "light.proof-concurrency", default_value_t = Limits::default().proof_concurrency as u32, value_parser = clap::value_parser!(u32).range(1..=Limits::MAX_PROOF_CONCURRENCY as i64), requires = "light")]
+    pub proof_concurrency: u32,
     #[arg(
         id = "light_account_cache",
         long = "light.account-cache",
@@ -187,6 +194,8 @@ pub(crate) async fn run(chain: Arc<TempoChainSpec>, args: LightArgs) -> eyre::Re
         read_timeout: Duration::from_millis(args.read_timeout_ms),
         poll_interval: Duration::from_millis(args.poll_interval_ms),
         read_concurrency: args.read_concurrency as usize,
+        max_read_waiters: args.read_waiters as usize,
+        proof_concurrency: args.proof_concurrency as usize,
         account_cache: args.account_cache,
         slot_cache: args.slot_cache,
         max_transition_search: args.transition_search,
@@ -246,6 +255,10 @@ mod tests {
                 UPSTREAM,
                 "--chain",
                 "moderato",
+                "--light.read-waiters",
+                "32",
+                "--light.proof-concurrency",
+                "4",
             ])
             .unwrap();
         validate_options(&command, &matches).unwrap();
@@ -255,6 +268,8 @@ mod tests {
         };
         assert!(!node.ext.has_consensus_engine(false));
         assert!(!node.ext.has_gossip(false));
+        assert_eq!(node.ext.light.read_waiters, 32);
+        assert_eq!(node.ext.light.proof_concurrency, 4);
         let debug = format!("{:?}", node.ext);
         assert!(!debug.contains("__light_endpoint_secret__"));
         assert!(!debug.contains("private-api-key"));
@@ -296,6 +311,36 @@ mod tests {
             args.extend(extra);
             let matches = command.clone().try_get_matches_from(args).unwrap();
             assert!(validate_options(&command, &matches).is_err());
+        }
+    }
+
+    #[test]
+    fn proof_and_waiter_limits_are_bounded_and_require_light_mode() {
+        crate::tests::init_defaults_once();
+        for (flag, maximum) in [
+            ("--light.read-waiters", Limits::MAX_READ_WAITERS),
+            ("--light.proof-concurrency", Limits::MAX_PROOF_CONCURRENCY),
+        ] {
+            for value in [0, maximum + 1] {
+                assert!(
+                    TempoCli::command()
+                        .try_get_matches_from([
+                            "tempo",
+                            "node",
+                            "--light",
+                            "--light.upstream",
+                            UPSTREAM,
+                            flag,
+                            &value.to_string(),
+                        ])
+                        .is_err()
+                );
+            }
+            assert!(
+                TempoCli::command()
+                    .try_get_matches_from(["tempo", "node", flag, "1"])
+                    .is_err()
+            );
         }
     }
 

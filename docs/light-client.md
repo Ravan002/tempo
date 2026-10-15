@@ -40,7 +40,9 @@ and follow defaults remain unchanged.
 | `--light.request-timeout-ms` | 3000 |
 | `--light.read-timeout-ms` | 15000 |
 | `--light.poll-interval-ms` | 500 |
-| `--light.read-concurrency` | 8 |
+| `--light.read-concurrency` | 8 owned proof jobs |
+| `--light.read-waiters` | 64 concurrent callers |
+| `--light.proof-concurrency` | 8 proof RPCs per provider |
 | `--light.account-cache` | 4096 entries |
 | `--light.slot-cache` | 16384 entries |
 | `--light.transition-search` | 32 boundary queries per provider |
@@ -160,25 +162,37 @@ changes can exceed search/deadline bounds and fail explicitly; adjust limits or 
 trusted updated anchor, not RPC-discovered trust.
 
 Proof transport prefers `eth_getMultiProof`, falling back to hash-pinned `eth_getProof` **only**
-on method-not-found. Standard proofs have concurrency two and a shared response-byte budget.
+on method-not-found. Standard account requests run concurrently up to `--light.proof-concurrency`.
+All proof RPCs, including multiproofs, share that provider-wide concurrency budget across jobs.
+Standard fallback requests retain one aggregate response-byte budget per job/provider attempt.
 Provider lag, unavailable execution state or pruned proofs fail over within the operation deadline.
 All reads retain their original block; no “helpful” older/latest root substitution is permitted.
 Upstreams must retain a recent proof window covering in-flight requests (Reth's
 `--rpc.eth-proof-window`), and required historical boundary certificates for catch-up. The devnet
 harness configures 128 blocks; choose a production window from cadence/deadline/pruning budgets. Ordinary reads do not require an archive.
 
-Identical in-flight reads share one owned job. Distinct reads have bounded, non-queuing admission;
-blocking proof workers retain admission permits after asynchronous deadline expiry until they
-finish. Typed batches derive ordered storage keys once before admission and deduplicate missing proof
-targets after cache lookup. The daemon also caps inbound API handlers/connections at 64, request bodies
-at 64 KiB and responses at 256 KiB.
+In-flight proof slots are indexed by `(block_hash, storage_key)`. Reordered, duplicate, subset and
+partially overlapping reads reuse existing jobs; only uncovered slots are grouped into a new job.
+There is no batching delay. Disjoint cold reads remain separate jobs rather than waiting in a
+collection queue. Each caller retains its own order and duplicate values. Ordered keys are derived
+once, then missing targets are deduplicated after cache lookup.
 
-Defaults cap upstream response bytes at 8 MiB per provider proof attempt, read batches at 128,
+Proof jobs and callers have separate, non-queuing admission bounds (`--light.read-concurrency` and
+`--light.read-waiters`). Joining existing work needs no new proof-job permit. All-warm reads need
+no proof-job permit or spawned worker. Cancelling a caller does not cancel an owned proof job;
+blocking proof workers retain job admission after asynchronous deadline expiry until they finish.
+The daemon also caps inbound API handlers/connections at 64, request bodies at 64 KiB and responses
+at 256 KiB, so raising the library waiter bound alone does not raise the daemon handler ceiling.
+
+Defaults cap upstream response bytes at 8 MiB per job/provider attempt, read batches at 128,
 proof accounts at 64, slots at 1024, aggregate nodes at 65536, nodes at 4096 bytes and aggregate
-proof bytes at 8 MiB per verification stage. A read has one proof stage for all missing slots,
-sharing one operation deadline and admission permit across failover; each configured provider
-can be attempted once. Head certificates are at most 16 KiB and extra data at most 1 MiB.
-These are provisional safety ceilings, **not measured production budgets**.
+proof bytes at 8 MiB per job verification stage. A caller has one read deadline and can join at most
+`read_concurrency` jobs. Each job retains its own deadline and admission permit across failover;
+each configured provider can be attempted once per job. Joining a job does not extend its deadline.
+Cache publication budgets bound all joined batch occurrences independently of cache residency.
+Small caches evict entries without rejecting otherwise supported read batches. Head certificates
+are at most 16 KiB and extra data at most 1 MiB. These are provisional safety ceilings, **not
+measured production budgets**.
 
 Reads capture authenticated cache hits at the selected root and request full account/storage proofs
 for all missing slots directly. Active payment tokens commonly change their whole storage root,
@@ -187,12 +201,16 @@ add a sequential RPC round. There is no strategy option or account-only probe.
 Cached words remain reusable whenever their account/storage root is already authenticated at the
 selected global root, including authentication established by an earlier read.
 
-New evidence lives in one operation-owned verified batch; successful native decoding and all cache
-conflict checks precede atomic publication. All-warm reads copy authenticated raw values under the
-lock and decode outside it without building or republishing batch maps. A proof or decoding failure
-publishes neither a partial result nor new account mappings. Independent account-mapping eviction
-does not invalidate retained raw slots, but reads need authenticated account evidence at their root
-before those slots can be used again.
+New evidence lives in job-owned verified batches shared immutably with their callers. Every job
+validates all its native tokens before making evidence available. A caller waits for all required
+jobs and decodes every requested value before publishing the accepted batches atomically, without
+cloning their evidence maps. Each job's evidence is published at most once; coalesced callers do not
+repeat cache normalization or reinsert evicted entries. All-warm reads copy authenticated raw values
+under the lock and decode outside it without building or republishing batch maps. A failed or
+cancelled caller publishes no partial result or new mappings itself; another successful caller may
+independently publish shared valid evidence. Account-mapping eviction does not invalidate retained
+raw slots, but reads need authenticated account evidence at their root before those slots can be
+used again.
 
 Provider failover never weakens selectors, accepts unverified values or substitutes another snapshot.
 Integrity failures remain counted, and a later availability failure does not hide earlier integrity
