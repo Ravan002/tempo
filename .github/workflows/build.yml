@@ -5,6 +5,19 @@ permissions: {}
 on:
   workflow_dispatch:
     inputs:
+      binary:
+        default: "tempo"
+        description: "Binary to build ('all' builds every listed binary)"
+        type: choice
+        options:
+          - "tempo"
+          - "tempo-sidecar"
+          - "tempo-zone"
+          - "tempo-zone-xtask"
+          - "tempo-zone-prover-utils"
+          - "tempo-zone-prover-enclave"
+          - "tempo-vsock-proxy"
+          - "all"
       profile:
         default: "maxperf"
         description: "Build profile"
@@ -19,6 +32,8 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
+  # Allow Aegis to finish its 90-second Socket lookup before Cargo times out.
+  CARGO_HTTP_TIMEOUT: "180"
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: full
   RUSTC_WRAPPER: "sccache"
@@ -28,19 +43,26 @@ jobs:
     name: Build
     runs-on: depot-ubuntu-latest-16
     permissions:
+      id-token: write
       contents: read
     strategy:
       matrix:
-        binary: [tempo, tempo-sidecar]
+        binary: ${{ fromJSON(inputs.binary == 'all' && '["tempo","tempo-sidecar","tempo-zone","tempo-zone-xtask","tempo-zone-prover-utils","tempo-zone-prover-enclave","tempo-vsock-proxy"]' || format('["{0}"]', inputs.binary || 'tempo')) }}
     steps:
+      - name: Secure runner
+        uses: tempoxyz/gh-actions/actions/secure-runner@947d9a3ccb2425a9c94d563fd721cc0e33c89e26 # 2026-10-15T00-15-06Z-947d9a3c
+
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
-      - uses: tempoxyz/gh-actions/vendor/dtolnay/rust-toolchain@3626124474a987bc74b41fc7ae65b2e23f8e4e4e
-      - uses: tempoxyz/gh-actions/actions/setup-mold@a65420ff2c90fcc46fe778c044aa7998ae9f246c
-      - uses: tempoxyz/gh-actions/vendor/mozilla-actions/sccache-action@3626124474a987bc74b41fc7ae65b2e23f8e4e4e
+      - uses: tempoxyz/gh-actions/vendor/dtolnay/rust-toolchain@947d9a3ccb2425a9c94d563fd721cc0e33c89e26 # 2026-10-15T00-15-06Z-947d9a3c
+      - uses: tempoxyz/gh-actions/actions/setup-mold@947d9a3ccb2425a9c94d563fd721cc0e33c89e26 # 2026-10-15T00-15-06Z-947d9a3c
+      - uses: tempoxyz/gh-actions/vendor/mozilla-actions/sccache-action@947d9a3ccb2425a9c94d563fd721cc0e33c89e26 # 2026-10-15T00-15-06Z-947d9a3c
       - name: Build
-        run: cargo build --bin ${{ matrix.binary }} --profile ${{ inputs.profile || 'dev' }}
+        env:
+          BINARY: ${{ matrix.binary }}
+          PROFILE: ${{ inputs.profile || 'dev' }}
+        run: cargo build --locked --bin "$BINARY" --profile "$PROFILE"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         id: binary_upload
         with:

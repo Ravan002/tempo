@@ -19,6 +19,8 @@ updates:
       default-days: 7
   - package-ecosystem: "cargo"
     directory: "/"
+    allow:
+      - dependency-type: "all"
     schedule:
       interval: "weekly"
     labels:
@@ -35,6 +37,17 @@ updates:
       default-days: 7
   - package-ecosystem: "docker"
     directory: "/"
+    schedule:
+      interval: "weekly"
+    labels:
+      - "A-dependencies"
+    commit-message:
+      prefix: "chore(docker)"
+    open-pull-requests-limit: 1
+    cooldown:
+      default-days: 7
+  - package-ecosystem: "docker"
+    directory: "/zones/docker"
     schedule:
       interval: "weekly"
     labels:

@@ -15,6 +15,7 @@ pub mod tip_fee_manager;
 pub mod validator_config;
 pub mod validator_config_v2;
 pub mod zone_factory;
+pub mod zone_verifier;
 
 pub use account_keychain::*;
 pub use address_registry::*;
@@ -33,12 +34,13 @@ pub use tip403_registry::*;
 pub use validator_config::*;
 pub use validator_config_v2::*;
 pub use zone_factory::*;
+pub use zone_verifier::*;
 
 use alloy_primitives::{Address, address};
 use tempo_hardfork::TempoHardfork;
+pub use tempo_hardfork::constants::{OUSD_ADDRESS, PATH_USD_ADDRESS};
 
 pub const TIP_FEE_MANAGER_ADDRESS: Address = address!("0xfeec000000000000000000000000000000000000");
-pub const PATH_USD_ADDRESS: Address = address!("0x20C0000000000000000000000000000000000000");
 pub const DEFAULT_FEE_TOKEN: Address = PATH_USD_ADDRESS;
 pub const TIP403_REGISTRY_ADDRESS: Address = address!("0x403C000000000000000000000000000000000000");
 pub const TIP20_FACTORY_ADDRESS: Address = address!("0x20FC000000000000000000000000000000000000");
@@ -78,4 +80,5 @@ pub const SYSTEM_PRECOMPILES: &[(Address, TempoHardfork)] = &[
     (STORAGE_CREDITS_ADDRESS, TempoHardfork::T7),
     (CURRENT_COMMITTEE_ADDRESS, TempoHardfork::T8),
     (ZONE_FACTORY_ADDRESS, TempoHardfork::T10),
+    (ZONE_VERIFIER_ADDRESS, TempoHardfork::T13),
 ];

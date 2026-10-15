@@ -10,9 +10,17 @@ permissions:
 
 jobs:
   stale:
+    permissions:
+      actions: write # lets actions/stale delete its _state cache between runs
+      issues: write
+      pull-requests: write
+      id-token: write
     if: ${{ github.event_name != 'schedule' || github.repository == 'tempoxyz/tempo' }}
     runs-on: ubuntu-latest
     steps:
+      - name: Secure runner
+        uses: tempoxyz/gh-actions/actions/secure-runner@947d9a3ccb2425a9c94d563fd721cc0e33c89e26 # 2026-10-15T00-15-06Z-947d9a3c
+
       - uses: actions/stale@b5d41d4e1d5dceea10e7104786b73624c18a190f # v10.2.0
         with:
           days-before-pr-stale: 7

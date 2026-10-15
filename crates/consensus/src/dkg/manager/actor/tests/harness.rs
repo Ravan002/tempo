@@ -11,13 +11,19 @@ use std::{
     time::SystemTime,
 };
 
-use alloy_consensus::Header;
+use crate::{
+    epoch::SchemeProvider,
+    gossip::Certificate,
+    test_utils::{dkg_fixture, make_certificate},
+};
+use alloy_consensus::{Header, Sealable as _};
+use alloy_primitives::B256;
 use commonware_actor::{Feedback, Unreliable};
 use commonware_codec::Encode as _;
 use commonware_consensus::{
     Heightable as _, Reporter as _,
     marshal::{Update, core::DigestFallback},
-    types::{Epoch, Epocher as _, FixedEpocher, Height},
+    types::{Epoch, Epocher as _, FixedEpocher, Height, Round as ConsensusRound},
 };
 use commonware_cryptography::{
     Signer as _,
@@ -35,25 +41,27 @@ use commonware_cryptography::{
 use commonware_math::algebra::Random as _;
 use commonware_p2p::{CheckedSender, LimitedSender, Receiver, Recipients};
 use commonware_parallel::Sequential;
-use commonware_runtime::{
-    Clock, Handle, IoBufs, Supervisor as _, deterministic::Context,
-    telemetry::metrics::histogram::Timed,
-};
+use commonware_runtime::{Handle, IoBufs, Supervisor as _, deterministic::Context};
 use commonware_utils::{
     Acknowledgement as _, N3f1, TryFromIterator as _, acknowledgement::Exact, ordered,
 };
 use futures::{StreamExt as _, channel::mpsc};
 use rand::{SeedableRng as _, rngs::StdRng};
 use rand_core::CryptoRng;
+use reth_ethereum::chainspec::EthChainSpec as _;
 use reth_node_core::primitives::SealedBlock;
+use tempo_chainspec::{NetworkIdentity, TempoChainSpec, TempoHardfork, spec::DEV};
 use tempo_dkg_onchain_artifacts::OnchainDkgOutcome;
-use tempo_primitives::{BlockBody, TempoHeader};
+use tempo_primitives::{BlockBody, TempoConsensusContext, TempoHeader};
+use tokio::sync::oneshot;
 
 use super::super::{
     super::{Config, Mailbox, init},
-    Block, Digest, EpochManager, ExecutionLayer, Marshal, State,
+    Actor, Block, Digest, EpochManager, ExecutionLayer, Marshal, State,
     state::{self, Round, ShareState},
 };
+
+type TestActor = Actor<Context, StubExecutionProvider, StubMarshal>;
 
 pub(super) struct Harness {
     context: Context,
@@ -62,6 +70,8 @@ pub(super) struct Harness {
     identity: PrivateKey,
     last_finalized_height: Height,
     initial_state: Option<State>,
+    network_identity: NetworkIdentity,
+    finalized_tip: Option<(Height, Certificate)>,
     storage: Option<state::Storage<Context>>,
     mailbox: Option<Mailbox>,
     handle: Option<Handle<()>>,
@@ -70,6 +80,7 @@ pub(super) struct Harness {
     pub(super) execution: StubExecutionProvider,
     pub(super) marshal: StubMarshal,
     pub(super) epoch_manager: StubEpochManager,
+    pub(super) scheme_provider: SchemeProvider,
 }
 
 enum InitialState {
@@ -85,6 +96,8 @@ pub(super) struct HarnessBuilder {
     identity: PrivateKey,
     last_finalized_height: Height,
     initial_state: InitialState,
+    network_identity: Option<NetworkIdentity>,
+    finalized_tip: Option<(Height, Certificate)>,
     execution: StubExecutionProvider,
     marshal: StubMarshal,
     epoch_manager: StubEpochManager,
@@ -119,6 +132,16 @@ impl HarnessBuilder {
         self
     }
 
+    pub(super) fn startup(
+        mut self,
+        identity: NetworkIdentity,
+        tip: Option<(Height, Certificate)>,
+    ) -> Self {
+        self.network_identity = Some(identity);
+        self.finalized_tip = tip;
+        self
+    }
+
     pub(super) fn execution(mut self, execution: StubExecutionProvider) -> Self {
         self.execution = execution;
         self
@@ -134,6 +157,47 @@ impl HarnessBuilder {
             InitialState::None => None,
             InitialState::Epoch(epoch) => Some(dkg_state(&mut self.context, epoch, 4, false).0),
             InitialState::State(state) => Some(*state),
+        };
+        if let Some(state) = &initial_state {
+            let boundary = state.epoch.previous().map_or(Height::zero(), |epoch| {
+                self.epoch_strategy.last(epoch).unwrap()
+            });
+            self.execution
+                .headers
+                .lock()
+                .unwrap()
+                .entry(boundary)
+                .or_insert_with(|| outcome_header(boundary, state));
+        }
+        let (network_identity, finalized_tip) = if let Some(identity) = self.network_identity {
+            (identity, self.finalized_tip)
+        } else {
+            // Most actor tests exercise recovery and ceremonies. Model a newer
+            // binary bootstrapping from historical data; startup verification
+            // tests supply their own identity and certificate explicitly.
+            let tip_epoch = self
+                .epoch_strategy
+                .containing(self.last_finalized_height)
+                .unwrap()
+                .epoch();
+            let identity_epoch = initial_state
+                .as_ref()
+                .map_or(tip_epoch, |state| state.epoch.max(tip_epoch))
+                .next();
+            let fixture = dkg_fixture(&mut self.context, identity_epoch);
+            let tip = (!self.last_finalized_height.is_zero()).then(|| {
+                let header = header(self.last_finalized_height);
+                let certificate =
+                    make_certificate(Digest(header.hash_slow()), tip_epoch, 1, &fixture.schemes);
+                (self.last_finalized_height, certificate)
+            });
+            (
+                NetworkIdentity {
+                    from_epoch: identity_epoch.get(),
+                    identity: *fixture.outcome.network_identity(),
+                },
+                tip,
+            )
         };
         let storage = if let Some(state) = initial_state.clone() {
             Some(
@@ -156,6 +220,8 @@ impl HarnessBuilder {
             identity: self.identity,
             last_finalized_height: self.last_finalized_height,
             initial_state,
+            network_identity,
+            finalized_tip,
             storage,
             mailbox: None,
             handle: None,
@@ -164,6 +230,7 @@ impl HarnessBuilder {
             execution: self.execution,
             marshal: self.marshal,
             epoch_manager: self.epoch_manager,
+            scheme_provider: SchemeProvider::new(),
         }
     }
 }
@@ -177,6 +244,8 @@ impl Harness {
             identity: PrivateKey::from_seed(0),
             last_finalized_height: Height::new(9),
             initial_state: InitialState::None,
+            network_identity: None,
+            finalized_tip: None,
             execution: StubExecutionProvider::default(),
             marshal: StubMarshal::default(),
             epoch_manager: StubEpochManager::default(),
@@ -202,31 +271,38 @@ impl Harness {
             .expect("DKG storage is not open while the actor is running")
     }
 
-    pub(super) async fn start(&mut self) {
+    pub(super) async fn init(&mut self) -> eyre::Result<(TestActor, Mailbox)> {
         assert!(self.handle.is_none(), "DKG actor is already running");
         drop(self.storage.take());
-        let (actor, mailbox) = init(
+        init(
             self.context.child("actor"),
             Config {
                 epoch_strategy: self.epoch_strategy.clone(),
-                epoch_manager: self.epoch_manager.clone(),
                 namespace: crate::config::NAMESPACE.to_vec(),
                 me: self.identity.clone(),
                 mailbox_size: NonZeroUsize::new(1).unwrap(),
                 marshal: self.marshal.clone(),
                 last_finalized_height: self.last_finalized_height,
+                finalized_tip: self.finalized_tip.clone(),
+                network_identity: self.network_identity.clone(),
+                scheme_provider: self.scheme_provider.clone(),
                 partition_prefix: self.partition_prefix.clone(),
                 execution_node: self.execution.clone(),
                 initial_share: None,
             },
         )
         .await
-        .unwrap();
+    }
 
+    pub(super) async fn start(&mut self) {
+        let (actor, mailbox) = self.init().await.unwrap();
         self.mailbox = Some(mailbox);
+        let epoch_manager = self.epoch_manager.clone();
         self.handle = Some(match &self.network {
-            Some(network) => actor.start(network.register(self.identity.public_key())),
-            None => actor.start((self.sender.clone(), InertReceiver)),
+            Some(network) => {
+                actor.start(epoch_manager, network.register(self.identity.public_key()))
+            }
+            None => actor.start(epoch_manager, (self.sender.clone(), InertReceiver)),
         });
     }
 
@@ -239,6 +315,7 @@ impl Harness {
     }
 
     pub(super) async fn report_finalized_header(&mut self, header: TempoHeader) {
+        self.execution.add_header(header.clone());
         let (acknowledgement, waiter) = Exact::handle();
         assert!(
             self.mailbox
@@ -494,16 +571,42 @@ impl CheckedSender for RecordingCheckedSender {
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub(super) struct StubExecutionProvider {
+    pub(super) chain_spec: Arc<TempoChainSpec>,
     headers: Arc<Mutex<BTreeMap<Height, TempoHeader>>>,
     reads: Arc<Mutex<Vec<Height>>>,
-    next_players: Arc<Mutex<ordered::Set<PublicKey>>>,
-    fail_next_players: Arc<AtomicBool>,
-    fail_next_full_dkg_epoch: Arc<AtomicBool>,
+}
+
+impl Default for StubExecutionProvider {
+    fn default() -> Self {
+        Self {
+            chain_spec: DEV.clone(),
+            headers: Default::default(),
+            reads: Default::default(),
+        }
+    }
 }
 
 impl StubExecutionProvider {
+    pub(super) fn set_t12_activation(&mut self, activation: Option<u64>) {
+        let mut genesis = DEV.genesis().clone();
+        for &fork in TempoHardfork::VARIANTS {
+            if fork > TempoHardfork::T12 {
+                genesis
+                    .config
+                    .extra_fields
+                    .remove(&format!("{}Time", fork.name().to_lowercase()));
+            }
+        }
+        genesis
+            .config
+            .extra_fields
+            .insert_value("t12Time".into(), activation)
+            .unwrap();
+        self.chain_spec = Arc::new(TempoChainSpec::from_genesis(genesis));
+    }
+
     pub(super) fn add_header(&self, header: TempoHeader) {
         self.headers
             .lock()
@@ -514,98 +617,89 @@ impl StubExecutionProvider {
     pub(super) fn reads(&self) -> Vec<Height> {
         self.reads.lock().unwrap().clone()
     }
-
-    pub(super) fn set_next_players(&self, players: ordered::Set<PublicKey>) {
-        *self.next_players.lock().unwrap() = players;
-    }
-
-    pub(super) fn fail_next_players(&self) {
-        self.fail_next_players.store(true, Ordering::SeqCst);
-    }
-
-    pub(super) fn fail_next_full_dkg_epoch(&self) {
-        self.fail_next_full_dkg_epoch.store(true, Ordering::SeqCst);
-    }
 }
 
 impl ExecutionLayer for StubExecutionProvider {
+    fn chain_spec(&self) -> Arc<TempoChainSpec> {
+        self.chain_spec.clone()
+    }
+
     fn finalized_header(&self, height: Height) -> eyre::Result<Option<TempoHeader>> {
         self.reads.lock().unwrap().push(height);
         Ok(self.headers.lock().unwrap().get(&height).cloned())
     }
-
-    fn next_players(&self, _digest: Digest) -> eyre::Result<ordered::Set<PublicKey>> {
-        if self.fail_next_players.load(Ordering::SeqCst) {
-            eyre::bail!("next players unavailable");
-        }
-        Ok(self.next_players.lock().unwrap().clone())
-    }
-
-    fn next_full_dkg_epoch(&self, _digest: Digest) -> eyre::Result<u64> {
-        if self.fail_next_full_dkg_epoch.load(Ordering::SeqCst) {
-            eyre::bail!("full DKG schedule unavailable");
-        }
-        Ok(0)
-    }
 }
+
+type BlockSubscribers = BTreeMap<Digest, Vec<oneshot::Sender<Arc<Block>>>>;
 
 #[derive(Clone, Default)]
 pub(super) struct StubMarshal {
     blocks: Arc<Mutex<BTreeMap<Height, Block>>>,
     reads: Arc<Mutex<Vec<Height>>>,
-    ancestry_reads: Arc<Mutex<Vec<Digest>>>,
-    empty_ancestry: Arc<AtomicBool>,
+    subscriptions: Arc<Mutex<Vec<(Digest, DigestFallback)>>>,
+    pending: Arc<Mutex<BlockSubscribers>>,
+    closed: Arc<AtomicBool>,
 }
 
 impl StubMarshal {
     pub(super) fn add_block(&self, block: Block) {
-        self.blocks.lock().unwrap().insert(block.height(), block);
+        self.blocks
+            .lock()
+            .unwrap()
+            .insert(block.height(), block.clone());
+        let block = Arc::new(block);
+        if let Some(subscribers) = self.pending.lock().unwrap().remove(&block.digest()) {
+            for subscriber in subscribers {
+                self.reads.lock().unwrap().push(block.height());
+                let _ = subscriber.send(block.clone());
+            }
+        }
     }
 
     pub(super) fn reads(&self) -> Vec<Height> {
         self.reads.lock().unwrap().clone()
     }
 
-    pub(super) fn ancestry_reads(&self) -> Vec<Digest> {
-        self.ancestry_reads.lock().unwrap().clone()
+    pub(super) fn subscriptions(&self) -> Vec<(Digest, DigestFallback)> {
+        self.subscriptions.lock().unwrap().clone()
     }
 
-    pub(super) fn return_empty_ancestry(&self) {
-        self.empty_ancestry.store(true, Ordering::SeqCst);
+    pub(super) fn close_subscriptions(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+        self.pending.lock().unwrap().clear();
     }
 }
 
 impl Marshal for StubMarshal {
-    type Ancestry = futures::stream::Iter<std::vec::IntoIter<Arc<Block>>>;
-
     async fn get_block(&self, height: Height) -> Option<Block> {
         self.reads.lock().unwrap().push(height);
         self.blocks.lock().unwrap().get(&height).cloned()
     }
 
-    async fn ancestry<C>(
+    fn subscribe_by_digest(
         &self,
-        _clock: Arc<C>,
-        (_, digest): (DigestFallback, Digest),
-        _fetch_duration: Timed,
-    ) -> Option<Self::Ancestry>
-    where
-        C: Clock,
-    {
-        if self.empty_ancestry.load(Ordering::SeqCst) {
-            return Some(futures::stream::iter(Vec::new()));
+        digest: Digest,
+        fallback: DigestFallback,
+    ) -> oneshot::Receiver<Arc<Block>> {
+        let (sender, receiver) = oneshot::channel();
+        self.subscriptions.lock().unwrap().push((digest, fallback));
+        if self.closed.load(Ordering::SeqCst) {
+            return receiver;
         }
 
-        let block = self
-            .blocks
-            .lock()
-            .unwrap()
-            .values()
-            .find(|block| block.digest() == digest)
-            .cloned()?;
-        self.ancestry_reads.lock().unwrap().push(digest);
-        self.reads.lock().unwrap().push(block.height());
-        Some(futures::stream::iter(vec![Arc::new(block)]))
+        let blocks = self.blocks.lock().unwrap();
+        if let Some(block) = blocks.values().find(|block| block.digest() == digest) {
+            self.reads.lock().unwrap().push(block.height());
+            let _ = sender.send(Arc::new(block.clone()));
+        } else {
+            self.pending
+                .lock()
+                .unwrap()
+                .entry(digest)
+                .or_default()
+                .push(sender);
+        }
+        receiver
     }
 }
 
@@ -664,19 +758,33 @@ pub(super) fn header(height: Height) -> TempoHeader {
     }
 }
 
+/// Returns a block at `height`, proposed in `round`, whose digest differs for
+/// each `tag`. Use it for requests whose parent is not a block that the test
+/// reports.
+pub(super) fn parent_block(round: ConsensusRound, height: Height, tag: u8) -> Arc<Block> {
+    let mut header = header(height);
+    header.inner.mix_hash = B256::repeat_byte(tag);
+    header.consensus_context = Some(TempoConsensusContext {
+        epoch: round.epoch().get(),
+        view: round.view().get(),
+        parent_view: round.view().get().saturating_sub(1),
+        proposer: crate::utils::public_key_to_tempo_primitive(
+            &PrivateKey::from_seed(0).public_key(),
+        ),
+    });
+    Arc::new(block(header))
+}
+
 pub(super) fn block(header: TempoHeader) -> Block {
-    Block::from_execution_block_unchecked(
-        SealedBlock::seal_slow(tempo_primitives::Block {
-            header,
-            body: BlockBody::default(),
-        }),
-        None,
-    )
+    Block::from_execution_block_unchecked(SealedBlock::seal_slow(tempo_primitives::Block {
+        header,
+        body: BlockBody::default(),
+    }))
 }
 
 pub(super) fn outcome_header(height: Height, state: &State) -> TempoHeader {
     let outcome = OnchainDkgOutcome {
-        epoch: state.epoch,
+        epoch: state.epoch.get(),
         output: state.output.clone(),
         next_players: state.players().clone(),
         is_next_full_dkg: state.is_full_dkg,
@@ -728,7 +836,7 @@ pub(super) struct RevealedRecoveryFixture {
     pub(super) identity: PrivateKey,
     pub(super) recovered_share: Share,
     signed_logs: Vec<SignedDealerLog<MinSig, PrivateKey>>,
-    recovered_state: State,
+    pub(super) recovered_state: State,
 }
 
 /// Run a dealer round offline and return each dealer's signed log, checked
@@ -784,9 +892,10 @@ pub(super) fn signed_dealer_logs<R: CryptoRng>(
 pub(super) fn revealed_recovery_fixture(
     rng: &mut impl CryptoRng,
     ceremony_epoch: Epoch,
+    t12_active: bool,
 ) -> RevealedRecoveryFixture {
     let (ceremony_state, keys, _) = dkg_state(rng, ceremony_epoch, 4, true);
-    let round = Round::from_state(&ceremony_state, crate::config::NAMESPACE);
+    let round = Round::from_state(&ceremony_state, crate::config::NAMESPACE, t12_active);
     let identity = keys[0].clone();
     // The recovering player sends no ACK, so each dealer log reveals its dealing for it.
     let dealers = keys

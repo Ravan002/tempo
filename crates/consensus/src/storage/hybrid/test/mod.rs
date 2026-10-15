@@ -16,7 +16,7 @@ use commonware_runtime::{Runner as _, Spawner, deterministic};
 use commonware_utils::NZU64;
 
 use super::*;
-use crate::storage::PRUNABLE_ITEMS_PER_SECTION;
+use crate::{consensus::block::Error as BlockError, storage::PRUNABLE_ITEMS_PER_SECTION};
 use utils::{StubProvider, fresh_prunable_with_section_size, make_block, make_chain};
 
 /// Force every height into its own section so the prunable archive's
@@ -29,6 +29,40 @@ const PER_HEIGHT_SECTION: std::num::NonZeroU64 = NZU64!(1);
 /// pruning path with a handful of blocks while still leaving room to
 /// observe pre-prune behavior.
 const RETENTION: u64 = 4;
+
+#[test]
+fn execution_fallback_rejects_bal() {
+    let block = SealedBlock::seal_slow(tempo_primitives::Block {
+        header: TempoHeader {
+            inner: alloy_consensus::Header {
+                block_access_list_hash: Some(B256::repeat_byte(42)),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        body: Default::default(),
+    });
+
+    let error = validate_execution_block(block.into())
+        .expect_err("a stored BAL block is unsupported, not a miss");
+    let error = error
+        .as_other()
+        .and_then(|error| error.downcast_ref::<BlockError>())
+        .expect("stored block should fail consensus block validation");
+    assert_eq!(
+        error.to_string(),
+        reth_consensus::ConsensusError::BlockAccessListHashUnexpected.to_string()
+    );
+}
+
+#[test]
+fn execution_fallback_without_bal_remains_available() {
+    let block = make_block(42, B256::ZERO);
+    assert_eq!(
+        validate_execution_block(block.clone().into_execution_block()).unwrap(),
+        block
+    );
+}
 
 struct SetupHybrid {
     retention: u64,
@@ -90,6 +124,103 @@ fn get_returns_block_from_prunable_archive() {
             .expect("get by digest")
             .expect("present");
         assert_eq!(by_digest, blocks[2]);
+    });
+}
+
+#[test_traced]
+fn get_header_uses_cache_above_execution_finalized_watermark() {
+    deterministic::Runner::default().start(|context| async move {
+        let (mut hybrid, provider) = SetupHybrid::default().build(&context).await;
+        let block = make_block(10, B256::ZERO);
+        hybrid = hybrid.put(block.clone()).await.expect("put");
+        provider.set_reth_finalized(9);
+        provider.set_fail(true);
+
+        for id in [Identifier::Index(10), Identifier::Key(&block.digest())] {
+            let header = hybrid.get_header(id).await.expect("read cached header");
+            assert_eq!(header.as_ref(), Some(block.block().header()));
+        }
+    });
+}
+
+#[test_traced]
+fn get_header_reads_execution_headers_without_bodies() {
+    deterministic::Runner::default().start(|context| async move {
+        let (hybrid, provider) = SetupHybrid::default().build(&context).await;
+        let genesis = make_block(0, B256::ZERO);
+        provider.add_header(genesis.block().header().clone());
+        assert_eq!(
+            hybrid
+                .get_header(Identifier::Index(0))
+                .await
+                .unwrap()
+                .as_ref(),
+            Some(genesis.block().header()),
+        );
+
+        let block = make_block(10, B256::ZERO);
+        let digest = block.digest();
+        provider.add_header(block.block().header().clone());
+
+        // Exact hash reads do not require execution to have finalized the header.
+        assert_eq!(
+            hybrid
+                .get_header(Identifier::Key(&digest))
+                .await
+                .unwrap()
+                .as_ref(),
+            Some(block.block().header()),
+        );
+        assert!(
+            hybrid
+                .get_header(Identifier::Index(10))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        provider.set_reth_finalized(9);
+        assert!(
+            hybrid
+                .get_header(Identifier::Index(10))
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        provider.set_reth_finalized(10);
+        assert_eq!(
+            hybrid
+                .get_header(Identifier::Index(10))
+                .await
+                .unwrap()
+                .as_ref(),
+            Some(block.block().header()),
+        );
+        // Headers remain available even though neither store has the block body.
+        assert!(hybrid.get(Identifier::Index(10)).await.unwrap().is_none());
+        assert!(
+            hybrid
+                .get(Identifier::Key(&digest))
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        assert!(
+            hybrid
+                .get_header(Identifier::Index(1))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let missing = make_block(1, B256::ZERO).digest();
+        assert!(
+            hybrid
+                .get_header(Identifier::Key(&missing))
+                .await
+                .unwrap()
+                .is_none()
+        );
     });
 }
 
@@ -842,5 +973,12 @@ fn reth_provider_errors_propagate_to_caller() {
             matches!(result, Err(Error::Provider(_))),
             "expected Error::Provider on digest path, got {result:?}"
         );
+
+        for id in [Identifier::Index(99), Identifier::Key(&digest)] {
+            assert!(matches!(
+                hybrid.get_header(id).await,
+                Err(Error::Provider(_))
+            ));
+        }
     });
 }
