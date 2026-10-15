@@ -19,7 +19,10 @@ use alloy::{
 use alloy_eips::Encodable2718;
 use reth_e2e_test_utils::wait::{PollOpts, poll_until_with};
 use reth_primitives_traits::transaction::TxHashRef;
-use std::time::Duration;
+use std::{
+    sync::atomic::{AtomicU32, Ordering},
+    time::Duration,
+};
 use tempo_chainspec::{
     hardfork::{TempoHardfork, TempoHardforks},
     spec::{DEV, MODERATO, PRESTO},
@@ -261,25 +264,32 @@ impl super::types::TestEnv for RpcEnv {
                     Ok((self.provider.get_block_number().await? >= start + 3).then_some(()))
                 })
                 .await?;
-                let tx = settled(
+                let nulls = AtomicU32::new(0);
+                poll_until_with(
+                    RPC_POLL,
+                    format!("expected-rejection tx {tx_hash} to leave the pool"),
                     || async {
-                        Ok(self
+                        let tx = self
                             .provider
                             .raw_request::<_, Option<serde_json::Value>>(
                                 "eth_getTransactionByHash".into(),
                                 [tx_hash],
                             )
-                            .await?)
+                            .await?;
+                        match tx {
+                            Some(tx) if !tx["blockNumber"].is_null() => eyre::bail!(
+                                "Transaction should be rejected, but was included: {tx_hash} (block {})",
+                                tx["blockNumber"]
+                            ),
+                            Some(_) => {
+                                nulls.store(0, Ordering::Relaxed);
+                                Ok(None)
+                            }
+                            None => Ok((nulls.fetch_add(1, Ordering::Relaxed) >= 20).then_some(())),
+                        }
                     },
-                    Option::is_some,
                 )
                 .await?;
-                if let Some(tx) = tx {
-                    eyre::bail!(
-                        "Transaction should be rejected, but was accepted: {tx_hash} (block {})",
-                        tx["blockNumber"]
-                    );
-                }
                 Ok(())
             }
             Err(RpcError::Transport(_)) => {
