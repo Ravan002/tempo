@@ -261,14 +261,25 @@ impl super::types::TestEnv for RpcEnv {
                     Ok((self.provider.get_block_number().await? >= start + 3).then_some(()))
                 })
                 .await?;
-                let receipt: Option<serde_json::Value> = self
-                    .provider
-                    .raw_request("eth_getTransactionReceipt".into(), [tx_hash])
-                    .await?;
-                eyre::ensure!(
-                    receipt.is_none(),
-                    "Transaction should be rejected, but was included: {tx_hash}"
-                );
+                let tx = settled(
+                    || async {
+                        Ok(self
+                            .provider
+                            .raw_request::<_, Option<serde_json::Value>>(
+                                "eth_getTransactionByHash".into(),
+                                [tx_hash],
+                            )
+                            .await?)
+                    },
+                    Option::is_some,
+                )
+                .await?;
+                if let Some(tx) = tx {
+                    eyre::bail!(
+                        "Transaction should be rejected, but was accepted: {tx_hash} (block {})",
+                        tx["blockNumber"]
+                    );
+                }
                 Ok(())
             }
             Err(RpcError::Transport(_)) => {
