@@ -45,7 +45,7 @@ pub struct ZonePcrHistory {
 
 impl ZonePcrHistory {
     pub async fn run(self) -> eyre::Result<()> {
-        info!(rpc_url = %self.rpc_url, "Connecting for PCR history scan");
+        info!("Connecting for PCR history scan");
         let provider = ProviderBuilder::new_with_network::<TempoNetwork>()
             .connect(&self.rpc_url)
             .await?;
@@ -84,7 +84,7 @@ impl ZonePcrHistory {
         };
         if portals.is_empty() {
             info!("no portals to scan");
-            return Ok(Vec::new());
+            return Ok(intervals);
         }
         for interval in &mut intervals {
             info!(hardfork = %interval.hardfork, "sampling hardfork interval");

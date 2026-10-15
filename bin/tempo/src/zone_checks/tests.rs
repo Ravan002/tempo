@@ -317,6 +317,30 @@ async fn portal_discovery() {
     assert!(rpc.read_q().is_empty());
 }
 
+#[tokio::test]
+async fn empty_portal_discovery_preserves_intervals() {
+    for next in [0u32, 1] {
+        let (rpc, provider) = mock();
+        rpc.push_success(&schedule(&[("T13", 0), ("T14", 1)]));
+        rpc.push_success(&header(1, 1));
+        rpc.push_success(&header(0, 0));
+        rpc.push_success(&Bytes::from(
+            IZoneFactory::nextZoneIdCall::abi_encode_returns(&next),
+        ));
+        let mut cmd = command(0, 1);
+        cmd.portal = None;
+        let intervals = cmd.scan(&provider).await.unwrap();
+        assert_eq!(
+            serde_json::to_value(intervals).unwrap(),
+            json!([
+                {"hardfork": "T14", "observed_pcrs": null},
+                {"hardfork": "T13", "observed_pcrs": null},
+            ])
+        );
+        assert!(rpc.read_q().is_empty());
+    }
+}
+
 #[test]
 fn nitro_decoding() {
     let portals = BTreeSet::from([PORTAL]);
