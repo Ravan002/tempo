@@ -200,6 +200,72 @@ pub(crate) fn forge_bytecode(contract: &str) -> eyre::Result<alloy_primitives::B
     ))
 }
 
+/// Compiled shared runtimes for testing contract changes before they are synced to Tempo.
+fn reference_zone_runtimes() -> eyre::Result<Vec<(Address, alloy_primitives::Bytes)>> {
+    use tempo_contracts::zones::{
+        ZONE_MESSENGER_ADDRESS, ZONE_PORTAL_IMPL_ADDRESS, ZONE_VERIFIER_ADDRESS,
+    };
+    [
+        (ZONE_PORTAL_IMPL_ADDRESS, "ZonePortal"),
+        (ZONE_VERIFIER_ADDRESS, "Verifier"),
+        (ZONE_MESSENGER_ADDRESS, "ZoneMessenger"),
+    ]
+    .into_iter()
+    .map(|(address, contract)| {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(format!("../contracts/out/{contract}.sol/{contract}.json"));
+        let artifact: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).wrap_err_with(|| {
+                format!(
+                    "read {}; run `forge build` in crates/zones/contracts",
+                    path.display()
+                )
+            })?)?;
+        let code = artifact["deployedBytecode"]["object"]
+            .as_str()
+            .ok_or_else(|| eyre::eyre!("missing deployed bytecode for {contract}"))?;
+        let code = alloy_primitives::hex::decode(code)?;
+        // Keep the test verifier redirect that the default L1 genesis applies.
+        let code = if address == ZONE_PORTAL_IMPL_ADDRESS {
+            redirect_portal_verifier(&code)?
+        } else {
+            code.into()
+        };
+        Ok((address, code))
+    })
+    .collect()
+}
+
+/// Redirect a portal runtime's proof-call target to the `0xBEEF` verifier stub.
+fn redirect_portal_verifier(code: &[u8]) -> eyre::Result<alloy_primitives::Bytes> {
+    let mut code = code.to_vec();
+    // (2**160 - 1) & sload(16): this unique sequence loads the proof-call target.
+    // Replace PUSH1 0x10; SLOAD with PUSH2 0xBEEF, preserving all jump offsets.
+    // solc emits the address mask as either `1 << 160; 1; swap; sub` (Tempo's pinned
+    // runtime) or `1; dup; 1 << 160; sub` (the locally compiled reference runtime).
+    const VERIFIER_SLOAD: [u8; 4] = alloy_primitives::hex!("60105416");
+    const ADDRESS_MASKS: [&[u8]; 2] = [
+        &alloy_primitives::hex!("600160a01b60019003"),
+        &alloy_primitives::hex!("60018060a01b03"),
+    ];
+    let mut matches = ADDRESS_MASKS.iter().flat_map(|mask| {
+        let len = mask.len() + VERIFIER_SLOAD.len();
+        code.windows(len)
+            .enumerate()
+            .filter_map(move |(offset, bytes)| {
+                (bytes.starts_with(mask) && bytes.ends_with(&VERIFIER_SLOAD))
+                    .then_some(offset + mask.len())
+            })
+    });
+    let offset = matches
+        .next()
+        .ok_or_else(|| eyre::eyre!("portal verifier load changed"))?;
+    eyre::ensure!(matches.next().is_none(), "ambiguous portal verifier load");
+    drop(matches);
+    code[offset..offset + 3].copy_from_slice(&[0x61, 0xbe, 0xef]);
+    Ok(code.into())
+}
+
 fn install_native_zone_factory(genesis: &mut Genesis, owner: Address) -> eyre::Result<()> {
     for account in t13_zone_factory_state(owner) {
         let storage = account
@@ -222,20 +288,7 @@ fn install_native_zone_factory(genesis: &mut Genesis, owner: Address) -> eyre::R
         mock_verifier,
     );
     let portal = genesis.alloc.get_mut(&ZONE_PORTAL_IMPL_ADDRESS).unwrap();
-    let mut code = portal.code.as_ref().unwrap().to_vec();
-    // (2**160 - 1) & sload(16): this unique sequence loads the proof-call target.
-    // Replace PUSH1 0x10; SLOAD with PUSH2 0xBEEF, preserving all jump offsets.
-    const VERIFIER_LOAD: [u8; 13] = alloy_primitives::hex!("600160a01b6001900360105416");
-    let mut matches = code
-        .windows(VERIFIER_LOAD.len())
-        .enumerate()
-        .filter_map(|(offset, bytes)| (bytes == VERIFIER_LOAD).then_some(offset));
-    let offset = matches
-        .next()
-        .ok_or_else(|| eyre::eyre!("portal verifier load changed"))?;
-    eyre::ensure!(matches.next().is_none(), "ambiguous portal verifier load");
-    code[offset + 9..offset + 12].copy_from_slice(&[0x61, 0xbe, 0xef]);
-    portal.code = Some(code.into());
+    portal.code = Some(redirect_portal_verifier(portal.code.as_ref().unwrap())?);
 
     // The native factory requires the initial token's TIP-403 policy binding to exist.
     let token_policy_slot =
@@ -1128,6 +1181,34 @@ impl ZoneTestNode {
     ) -> eyre::Result<Self> {
         let (genesis, _) = build_l1_anchored_genesis(l1_http_url, portal_address).await?;
 
+        let signer = l1_dev_signer();
+        Self::launch_with_genesis_and_withdrawal_batch_interval(
+            l1_ws_url.to_string(),
+            portal_address,
+            next_unique_chain_id(),
+            Some(genesis),
+            signer,
+            withdrawal_batch_interval_blocks,
+            None,
+            true,
+        )
+        .await
+    }
+
+    pub(crate) async fn start_from_l1_with_forced_exits(
+        l1_http_url: &url::Url,
+        l1_ws_url: &url::Url,
+        portal_address: Address,
+        withdrawal_batch_interval_blocks: u64,
+    ) -> eyre::Result<Self> {
+        let (mut genesis, _) = build_l1_anchored_genesis(l1_http_url, portal_address).await?;
+
+        // Explicit Zone execution fork; the L1 fixture must separately install a
+        // compatible portal runtime and activate it through the admin transaction.
+        genesis
+            .config
+            .extra_fields
+            .insert("t13Time".into(), serde_json::json!(0));
         let signer = l1_dev_signer();
         Self::launch_with_genesis_and_withdrawal_batch_interval(
             l1_ws_url.to_string(),
@@ -2449,16 +2530,7 @@ impl L1TestNode {
         )
         .ok_or_else(|| eyre::eyre!("ECIES encryption failed"))?;
 
-        Ok((
-            key_index,
-            tempo_contracts::zones::DepositPayload {
-                ephemeralPubkeyX: enc.eph_pub_x,
-                ephemeralPubkeyYParity: enc.eph_pub_y_parity,
-                ciphertext: enc.ciphertext.into(),
-                nonce: alloy_primitives::FixedBytes(enc.nonce),
-                tag: alloy_primitives::FixedBytes(enc.tag),
-            },
-        ))
+        Ok((key_index, enc))
     }
 
     /// Transfer a specific TIP-20 token from the dev account to a recipient on L1.
@@ -2673,6 +2745,39 @@ impl L1TestNode {
     /// Start an L1 dev node with the default configuration (500ms block time).
     pub(crate) async fn start() -> eyre::Result<Self> {
         Self::start_with(|_| {}).await
+    }
+
+    /// Run candidate Solidity runtimes before they are published in Tempo.
+    /// Use the normal L1 fork configuration and settlement path.
+    pub(crate) async fn start_with_reference_zone_runtimes() -> eyre::Result<Self> {
+        use reth_chainspec::EthChainSpec as _;
+        let runtimes = reference_zone_runtimes()?;
+        let node = Self::start_with(|config| {
+            let mut genesis = config.chain.genesis().clone();
+            for (address, code) in &runtimes {
+                genesis
+                    .alloc
+                    .get_mut(address)
+                    .expect("shared runtime allocated")
+                    .code = Some(code.clone());
+            }
+            config.chain = Arc::new(TempoChainSpec::from_genesis(genesis));
+        })
+        .await?;
+        node.assert_reference_zone_runtimes().await?;
+        Ok(node)
+    }
+
+    /// Check after transactions too, so runtime replacement cannot go unnoticed.
+    pub(crate) async fn assert_reference_zone_runtimes(&self) -> eyre::Result<()> {
+        for (address, expected) in reference_zone_runtimes()? {
+            let actual = self.provider().get_code_at(address).await?;
+            eyre::ensure!(
+                actual == expected,
+                "candidate Zone runtime replaced at {address}"
+            );
+        }
+        Ok(())
     }
 
     /// Start an L1 dev node, applying a closure to customise the [`NodeConfig`]
@@ -3320,7 +3425,7 @@ impl ZoneAccount {
         recipient: Address,
         memo: B256,
     ) -> eyre::Result<(U256, tempo_contracts::zones::DepositPayload)> {
-        use tempo_contracts::zones::{DepositPayload, ZonePortal};
+        use tempo_contracts::zones::ZonePortal;
         use zone_precompiles::ecies;
 
         let portal = ZonePortal::new(self.portal_address, &self.l1_provider);
@@ -3342,16 +3447,7 @@ impl ZoneAccount {
         )
         .ok_or_else(|| eyre::eyre!("ECIES encryption failed"))?;
 
-        Ok((
-            key_index,
-            DepositPayload {
-                ephemeralPubkeyX: enc.eph_pub_x,
-                ephemeralPubkeyYParity: enc.eph_pub_y_parity,
-                ciphertext: enc.ciphertext.into(),
-                nonce: alloy_primitives::FixedBytes(enc.nonce),
-                tag: alloy_primitives::FixedBytes(enc.tag),
-            },
-        ))
+        Ok((key_index, enc))
     }
 
     /// Approve the ZoneOutbox, then request a withdrawal on L2.
@@ -5230,6 +5326,8 @@ impl L1Fixture {
                     self.seed_no_receive_policy_at(block_number, deposit.to)
                         .expect("event receive-policy fixture seed must be admitted");
                 }
+                // Forced recipients remain encrypted until inbox execution.
+                L1Deposit::ForcedExit(_) => {}
                 L1Deposit::Deposit(deposit) => {
                     if let Some(decrypted) = zone_precompiles::ecies::decrypt_deposit(
                         &Self::encryption_key(),
@@ -5435,7 +5533,7 @@ impl L1Fixture {
         let (shared_secret_x, _) = compressed_x_and_parity(&shared_affine);
 
         // HKDF-SHA256 key derivation (matching ecies.rs)
-        let info = hkdf_info(&portal_address, &key_index, &eph_pub_x, &sender);
+        let info = hkdf_info(&portal_address, &key_index, &eph_pub_x, &sender, None);
         let aes_key = hkdf_sha256(&shared_secret_x, b"ecies-aes-key", &info);
 
         // Build and encrypt plaintext (deterministic zero nonce)
