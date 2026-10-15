@@ -1,6 +1,5 @@
 //! Release metadata. Runtime node options remain owned by Tempo's ordinary CLI.
 
-use crate::manifest::resolve_path;
 use alloy_eips::BlockNumHash;
 use alloy_primitives::U64;
 use eyre::{Context, OptionExt, ensure};
@@ -32,7 +31,9 @@ impl Catalog {
 
     pub fn resolve_binaries(&mut self, parent: &Path) {
         for era in self.chains.iter_mut().flat_map(|chain| &mut chain.eras) {
-            resolve_path(parent, &mut era.binary);
+            if era.binary.is_relative() {
+                era.binary = parent.join(&era.binary);
+            }
         }
     }
 
@@ -40,6 +41,12 @@ impl Catalog {
         let mut chain_ids = HashSet::new();
         for chain in &self.chains {
             chain.boundaries()?;
+            ensure!(
+                chain.eras.is_sorted_by(|previous, next| {
+                    previous.checkpoint.number < next.checkpoint.number
+                }),
+                "era checkpoints must strictly increase"
+            );
             ensure!(
                 chain_ids.insert(chain.chain_id),
                 "duplicate chain ID in era catalog"
@@ -65,9 +72,30 @@ pub struct ChainEras {
 }
 
 impl ChainEras {
-    /// Validates the eras and returns each one's exclusive end timestamp.
+    /// Validates the eras and returns each one's `until` activation on this chain.
     pub fn boundaries(&self) -> eyre::Result<Vec<u64>> {
-        era_boundaries(self.chain_id, &self.eras)
+        let mut boundaries: Vec<u64> = Vec::new();
+        for era in &self.eras {
+            ensure!(
+                !era.binary.as_os_str().is_empty(),
+                "era {era} requires an executable"
+            );
+            let end = era
+                .until
+                .activation_timestamp(self.chain_id.to())
+                .ok_or_eyre(format!(
+                    "{} has no activation on chain {}",
+                    era.until, self.chain_id
+                ))?;
+            ensure!(
+                boundaries
+                    .last()
+                    .map_or(end > 0, |previous| *previous < end),
+                "era {era} must activate after its predecessor"
+            );
+            boundaries.push(end);
+        }
+        Ok(boundaries)
     }
 }
 
@@ -77,47 +105,16 @@ impl ChainEras {
 pub struct FrozenEra {
     /// First hardfork this era does not execute.
     pub until: TempoHardfork,
-    /// Frozen executable, resolved relative to the release catalog or manifest.
+    /// Frozen executable, resolved relative to the release catalog.
     pub binary: PathBuf,
-    /// Last canonical block to execute before handing storage to the next era.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub checkpoint: Option<BlockNumHash>,
+    /// Last canonical block of this era.
+    pub checkpoint: BlockNumHash,
 }
 
 impl fmt::Display for FrozenEra {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "pre-{}", self.until)
     }
-}
-
-/// Validates ordered frozen eras and returns their `until` activation timestamps on `chain_id`.
-/// Each era must be non-empty and scheduled in [`tempo_hardfork::constants`].
-pub(crate) fn era_boundaries<'a>(
-    chain_id: U64,
-    eras: impl IntoIterator<Item = &'a FrozenEra>,
-) -> eyre::Result<Vec<u64>> {
-    let mut boundaries: Vec<u64> = Vec::new();
-    for era in eras {
-        ensure!(
-            !era.binary.as_os_str().is_empty(),
-            "era {era} requires an executable"
-        );
-        let end = era
-            .until
-            .activation_timestamp(chain_id.to())
-            .ok_or_eyre(format!(
-                "{} has no activation on chain {chain_id}",
-                era.until
-            ))?;
-        ensure!(
-            boundaries
-                .last()
-                .map_or(end > 0, |previous| *previous < end),
-            "era {era} must activate after its predecessor"
-        );
-        boundaries.push(end);
-    }
-    Ok(boundaries)
 }
 
 #[cfg(test)]
@@ -127,10 +124,11 @@ mod tests {
 
     #[test]
     fn boundaries_come_from_hardfork_constants() {
+        let checkpoint = |number| BlockNumHash::new(number, Default::default());
         let mut catalog: Catalog = serde_json::from_value(serde_json::json!({
             "chains":[{"chain_id":"0x1079", "eras":[
-                {"until":"T1", "binary":"t0-tempo"},
-                {"until":"T11", "binary":"t10-tempo"}
+                {"until":"T1", "binary":"t0-tempo", "checkpoint":checkpoint(2)},
+                {"until":"T11", "binary":"t10-tempo", "checkpoint":checkpoint(3)}
             ]}]
         }))
         .unwrap();
@@ -162,6 +160,21 @@ mod tests {
         );
         chain.chain_id = U64::from(1);
         assert_eq!(invalid(&chain), "T0 has no activation on chain 1");
+
+        let mut missing = serde_json::to_value(&catalog.chains[0].eras[0]).unwrap();
+        missing.as_object_mut().unwrap().remove("checkpoint");
+        assert_eq!(
+            serde_json::from_value::<FrozenEra>(missing)
+                .unwrap_err()
+                .to_string(),
+            "missing field `checkpoint`"
+        );
+        let mut invalid = catalog.clone();
+        invalid.chains[0].eras[1].checkpoint = checkpoint(2);
+        assert_eq!(
+            invalid.validate().unwrap_err().to_string(),
+            "era checkpoints must strictly increase"
+        );
 
         let mut duplicate = serde_json::to_value(&catalog.chains[0]).unwrap();
         duplicate["chain_id"] = serde_json::json!("0x01079");

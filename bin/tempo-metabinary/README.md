@@ -24,10 +24,11 @@ to its ordered frozen eras:
 A frozen era executes blocks before its `until` hardfork. Its boundary is that fork's activation
 timestamp in `tempo-hardfork`'s constants, so only mainnet and moderato can have frozen eras, and
 `until` must be an already scheduled fork. Executables resolve relative to the catalog, and blocks
-after the last frozen era run in the live node. A frozen era's optional `checkpoint` pins its last
-canonical block. Network sync handoff requires it. The built-in development catalog
+after the last frozen era run in the live node. A frozen era's required `checkpoint` pins its last
+canonical block, and checkpoints strictly increase. The built-in development catalog
 (`bin/tempo/eras.json`) is empty. Unmatched chains, custom genesis, and custom fork schedules use
-the native path.
+the native path. Independently of the catalog, the live binary refuses to execute blocks older than
+its compiled `tempo_evm::MIN_SUPPORTED_HARDFORK`, on every execution path.
 
 Workers inherit the selected genesis, datadir, custom static-file/RocksDB paths, and resolved SDK
 `EthConfig` through private temporary files. Gas, simulation, memory, and tracing settings retain
@@ -41,11 +42,14 @@ transport limits remain global. Historical workers are selected by requests, reg
 - Execution requests read native headers and transaction metadata to choose an era by timestamp.
   Historical forwarding pins tags other than `pending`, and preserves explicit hashes and
   `requireCanonical`. Pool and missing transactions stay native. Positional and named parameters
-  are supported. Simulations select their generated child blocks' eras, including gap fillers. The
-  base state may belong to an older era.
-- Requests crossing eras return `-32004`, including trace filters, multi-block simulations, call
-  bundles, and timestamp overrides. Split ranges rather than transferring speculative state
-  between processes. Unreviewed execution methods fail closed until their selectors are supported.
+  are supported.
+- Simulations and bundles (`eth_simulateV1`, `tempo_simulateV1`, `eth_callBundle`,
+  `mev_simBundle`, `eth_callMany`, `debug_traceCallMany`) run only on a live base block or
+  `pending`, with explicit override timestamps in the live era. Historical bases return `-32004`.
+- Requests crossing eras return `-32004`, including trace filters and timestamp overrides. Split
+  ranges rather than transferring speculative state between processes. Methods not reviewed as
+  non-executing fail closed until their selectors are supported, including unknown namespaces
+  such as `testing` and `flashbots`. The live binary never executes a frozen era's blocks.
 - Native transports retain their registries, authentication, CORS, compression, subscriptions,
   batching, and limits. Metadata resolution works even when eth is disabled publicly.
   Live debug trace subscriptions stay native, and historical debug trace subscriptions are rejected.
@@ -66,42 +70,18 @@ and detected child exits are retried on demand after a 30-second cooldown. Faile
 graceful shutdown before forced termination, and their RocksDB secondary directories are removed
 after reaping, including after crashes.
 
-## Canonical-file bootstrap
-
-`tempo-metabinary` sequentially imports finite canonical block files through frozen eras. Run the
-ordinary `tempo node` entrypoint afterward for public RPC and live execution.
-
-```sh
-cargo build --release -p tempo -p tempo-metabinary --bin tempo --bin tempo-metabinary
-
-tempo-metabinary --manifest /path/to/eras-manifest.json bootstrap
-```
-
-Copy the [example manifest](examples/eras-manifest.json) and replace its illustrative identity,
-`until` forks, executable paths, and checkpoints. Binary, datadir, and explicit chain-spec paths are
-manifest-relative. Paths inside import arguments should be absolute. Import commands share storage
-and run one at a time. Checkpoint inspection uses the same private read-only worker manager as the
-ordinary node, with an automatically selected loopback port. Partial startup failures clean up
-owned children.
-
-Each manifest entry pairs a frozen era, with a required trusted `checkpoint`, and the `args` of an
-ordinary `import` command. Its file ends immediately before the `until` fork's activation. The wrapper forces
-`--fail-on-invalid-block`, waits for import, opens a reader, and verifies the canonical checkpoint,
-era timestamp, and exact head. Subsequent imports verify the predecessor and first successor.
-No pipeline checkpoints or handoff markers are rewritten. An import failure may leave partial
-progress, which the ordinary Tempo recovery workflow handles.
-
 ## Network sync handoff
 
-Genesis network sync remains native unless the release catalog supplies a `checkpoint` for its one
-frozen era. A checkpointed schedule with more frozen eras fails startup. Handoff is skipped for
 `--dev`, `--debug.tip`, `--debug.max-block`, `--debug.terminate`, `--debug.rpc-consensus-url`, and
-`--etherscan`, and when durable storage already reaches the checkpoint.
+`--etherscan` skip handoff, so they fail unless durable storage already reaches the last frozen
+era's checkpoint.
 
-Otherwise `tempo node` runs the frozen writer with the operator's arguments, minus `--follow*` and
-`TEMPO_FOLLOW`, plus `--history-sync --debug.tip=<hash> --debug.max-block=<number>
---debug.terminate`. It then verifies the durable checkpoint and reaps the writer before launching
-live execution. Interrupted sync resumes from Reth's saved progress.
+Otherwise `tempo node` runs each frozen writer whose checkpoint durable storage has not reached, in
+era order, with the operator's arguments, minus `--follow*` and `TEMPO_FOLLOW`, plus
+`--history-sync --debug.tip=<hash> --debug.max-block=<number> --debug.terminate`. After each
+writer it verifies that storage ends exactly at that era's canonical checkpoint, and reaps the
+writer before the next era or live execution. Each writer resumes from its predecessor's
+checkpoint, and interrupted sync resumes from Reth's saved progress.
 
 Before starting consensus, the live node verifies a recent finalization through the configured
 follow upstream or the chain's default consensus RPC, syncs execution to that certified tip, and
@@ -114,8 +94,9 @@ an EVM.
 ## Re-execution
 
 With a release schedule, `tempo re-execute` splits its range at the first local block of each
-`until` fork, found by searching local header timestamps. Each frozen part runs as `<frozen binary> re-execute` with the operator's arguments and
-only `--from`/`--to` replaced, one era at a time in block order. The live binary then re-executes
+`until` fork, found by searching local header timestamps. Each frozen part runs as
+`<frozen binary> re-execute` with the operator's arguments and only `--from`/`--to` replaced, one
+era at a time in block order. The live binary then re-executes
 the remainder. It does not run if nothing remains or a shutdown signal stopped a frozen child.
 
 - Genesis is skipped, `--to` is clamped to the local head, and ranges exclude `--to`.

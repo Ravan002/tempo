@@ -60,7 +60,7 @@ pub fn decorate(methods: Methods, router: Arc<Router>) -> Result<Methods, Regist
                         Err(error) => Err(error),
                     };
                     let error = match target {
-                        Ok(target) if target.era == live => {
+                        Ok((era, _)) if era == live => {
                             let state = SubscriptionState {
                                 conn_id,
                                 id_provider: &provider,
@@ -99,7 +99,7 @@ pub fn decorate(methods: Methods, router: Arc<Router>) -> Result<Methods, Regist
                             Err(error) => Err(error),
                         };
                         let result = match target {
-                            Ok(target) if target.era == live => {
+                            Ok((era, _)) if era == live => {
                                 return match native {
                                     MethodCallback::Sync(callback) => {
                                         callback(id, params, max_size, extensions)
@@ -110,10 +110,7 @@ pub fn decorate(methods: Methods, router: Arc<Router>) -> Result<Methods, Regist
                                     _ => unreachable!("only ordinary callbacks are decorated"),
                                 };
                             }
-                            Ok(target) => {
-                                let backend = &router.backend;
-                                backend.forward(target.era, name, target.params).await
-                            }
+                            Ok((era, params)) => router.backend.forward(era, name, params).await,
                             Err(error) => Err(error),
                         };
                         MethodResponse::response(id, result.into_response(), max_size)
@@ -174,6 +171,10 @@ mod tests {
             async { unreachable!("no transaction lookups in this fixture") }.boxed()
         }
 
+        fn raw_block_timestamp(&self, _: &RpcParams) -> RpcResult<u64> {
+            unreachable!("no raw blocks in this fixture")
+        }
+
         fn forward<'a>(
             &'a self,
             era: usize,
@@ -203,7 +204,7 @@ mod tests {
             timestamp,
             response,
         });
-        Arc::new(Router::new(1, vec![100], backend))
+        Arc::new(Router::new(vec![100], backend))
     }
 
     async fn invoke(methods: &Methods) -> MethodResponse {

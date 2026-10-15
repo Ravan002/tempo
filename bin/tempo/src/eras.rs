@@ -75,7 +75,6 @@ pub(crate) fn supports_release_catalog(spec: &TempoChainSpec) -> bool {
 
 /// Installs era routing on native RPC transports and owns the historical workers' configuration.
 pub(crate) struct EraRuntime {
-    chain_id: u64,
     boundaries: Vec<u64>,
     workers: Arc<HistoricalWorkers>,
     // Frozen releases parse exactly the live chain's genesis, including custom fork schedules.
@@ -103,7 +102,7 @@ impl EraRuntime {
                 datadir,
                 static_files_path,
                 rocksdb_path,
-                rpc_config: Some(rpc_config_file.path().to_owned()),
+                rpc_config: rpc_config_file.path().to_owned(),
                 chain_id: U64::from(chain.chain_id()),
                 genesis_hash: chain.genesis_hash(),
                 startup_timeout: Duration::from_secs(DEFAULT_STARTUP_TIMEOUT_SECS),
@@ -111,7 +110,6 @@ impl EraRuntime {
             schedule.eras,
         )?;
         Ok(Arc::new(Self {
-            chain_id: chain.chain_id(),
             boundaries,
             workers,
             _chain_file: chain_file,
@@ -125,7 +123,6 @@ impl EraRuntime {
         eth_api: E,
     ) -> eyre::Result<()> {
         let router = Arc::new(Router::new(
-            self.chain_id,
             self.boundaries.clone(),
             Arc::new(NativeBackend {
                 eth_api,

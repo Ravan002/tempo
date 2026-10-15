@@ -226,6 +226,7 @@ mod tests {
     use tempo_metabinary::handshake::WorkerIdentity;
 
     fn command(datadir: &std::path::Path) -> RpcOnly {
+        crate::tests::init_defaults_once();
         RpcOnly::parse_from([
             "rpc-only",
             "--chain=dev",

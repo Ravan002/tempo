@@ -50,7 +50,7 @@ pub struct HistoricalWorkers {
 }
 
 impl HistoricalWorkers {
-    /// `eras` come from a validated `ChainEras` or `Manifest`, which own executable checks.
+    /// `eras` come from a validated `ChainEras`, which owns executable checks.
     pub fn new(context: WorkerContext, eras: Vec<FrozenEra>) -> Result<Arc<Self>> {
         ensure!(
             !context.startup_timeout.is_zero(),
@@ -222,7 +222,7 @@ pub struct WorkerContext {
     pub static_files_path: Option<PathBuf>,
     pub rocksdb_path: Option<PathBuf>,
     /// Private execution configuration produced by the node, without duplicating its CLI.
-    pub rpc_config: Option<PathBuf>,
+    pub rpc_config: PathBuf,
     pub chain_id: U64,
     pub genesis_hash: B256,
     pub startup_timeout: Duration,
@@ -279,9 +279,7 @@ fn spawn(context: &WorkerContext, era: &FrozenEra) -> Result<Process> {
     if let Some(path) = &context.rocksdb_path {
         command.arg("--datadir.rocksdb").arg(path);
     }
-    if let Some(path) = &context.rpc_config {
-        command.arg("--rpc-config").arg(path);
-    }
+    command.arg("--rpc-config").arg(&context.rpc_config);
     drop(reservation);
     let child =
         spawn_child(&mut command).wrap_err_with(|| format!("launching {}", binary.display()))?;
@@ -455,7 +453,7 @@ mod tests {
                     datadir: directory.path().join("data with spaces"),
                     static_files_path: Some(directory.path().join("custom static files")),
                     rocksdb_path: Some(directory.path().join("custom rocksdb")),
-                    rpc_config: None,
+                    rpc_config: directory.path().join("rpc config.json"),
                     chain_id: U64::from(1),
                     genesis_hash: B256::ZERO,
                     startup_timeout: Duration::from_secs(if mode == "stalled" { 2 } else { 5 }),
@@ -463,7 +461,7 @@ mod tests {
                 vec![FrozenEra {
                     until: tempo_hardfork::TempoHardfork::T1,
                     binary: binary.clone(),
-                    checkpoint: None,
+                    checkpoint: Default::default(),
                 }],
             )
             .unwrap();

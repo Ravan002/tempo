@@ -786,7 +786,7 @@ mod tests {
         ZONE_VERIFIER_ADDRESS, initial_zone_factory_config,
     };
 
-    fn init_defaults_once() {
+    pub(super) fn init_defaults_once() {
         static INIT: Once = Once::new();
         INIT.call_once(defaults::init_defaults);
     }

@@ -1,8 +1,7 @@
-//! Transfer exclusive execution storage ownership from the frozen era to the live node.
+//! Transfer exclusive execution storage ownership through the frozen eras to the live node.
 
 use crate::{TempoCli, eras};
-use alloy::eips::BlockNumHash;
-use eyre::{OptionExt as _, Result, bail, ensure};
+use eyre::{OptionExt as _, Result, ensure};
 use reth_cli_commands::common::{AccessRights, EnvironmentArgs};
 use reth_cli_runner::CliRunner;
 use reth_ethereum::{
@@ -13,37 +12,29 @@ use reth_ethereum::{
 use reth_storage_api::{BlockHashReader as _, BlockNumReader as _, ChainStateBlockReader as _};
 use std::{ffi::OsString, num::NonZeroUsize, ops::ControlFlow};
 use tempo_chainspec::spec::TempoChainSpecParser;
-use tempo_metabinary::process::run_child;
+use tempo_metabinary::{catalog::FrozenEra, process::run_child};
 use tempo_node::TempoNode;
 use tokio::process::Command;
 
-/// Runs the frozen writer before live components can open or execute historical storage.
+/// Runs the frozen writers in order before live components can open or execute historical storage.
+/// Modes that skip the writers require storage at the last checkpoint.
 /// The returned flag requests a certified consensus anchor, including after an interrupted handoff.
 pub(crate) fn prepare(cli: &TempoCli) -> Result<ControlFlow<(), bool>> {
     let Commands::Node(node) = &cli.command else {
         return Ok(ControlFlow::Continue(false));
     };
-    if node.dev.dev
+    let Some(schedule) = eras::release_schedule(&node.chain)? else {
+        return Ok(ControlFlow::Continue(false));
+    };
+    let Some(last) = schedule.eras.last().map(|era| era.checkpoint) else {
+        return Ok(ControlFlow::Continue(false));
+    };
+    let skips_handoff = node.dev.dev
         || node.debug.tip.is_some()
         || node.debug.max_block.is_some()
         || node.debug.terminate
         || node.debug.rpc_consensus_url.is_some()
-        || node.debug.etherscan.is_some()
-    {
-        return Ok(ControlFlow::Continue(false));
-    }
-    let Some(schedule) = eras::release_schedule(&node.chain)? else {
-        return Ok(ControlFlow::Continue(false));
-    };
-    if schedule.eras.iter().all(|era| era.checkpoint.is_none()) {
-        return Ok(ControlFlow::Continue(false));
-    }
-    let [era] = schedule.eras.as_slice() else {
-        bail!("network handoff requires one frozen era");
-    };
-    let checkpoint = era
-        .checkpoint
-        .ok_or_eyre("release has no historical sync checkpoint")?;
+        || node.debug.etherscan.is_some();
     let environment = EnvironmentArgs {
         chain: node.chain.clone(),
         datadir: node.datadir.clone(),
@@ -55,42 +46,53 @@ pub(crate) fn prepare(cli: &TempoCli) -> Result<ControlFlow<(), bool>> {
     let runner = CliRunner::try_with_runtime_config(
         RuntimeConfig::default().with_cpu_cores(NonZeroUsize::MIN),
     )?;
-    if let Some((head, finalized)) = durable_progress(&environment, runner.runtime(), checkpoint)?
-        && head >= checkpoint.number
-    {
-        return Ok(ControlFlow::Continue(finalized <= checkpoint.number));
-    }
     runner.block_on(async {
-        eprintln!("Syncing {era} through block {}", checkpoint.number);
-        if run_child(
-            "historical sync",
-            Command::new(&era.binary)
-                .args(frozen_args(std::env::args_os().skip(1)))
-                .env_remove("TEMPO_FOLLOW")
-                .arg("--history-sync")
-                .arg(format!("--debug.tip={}", checkpoint.hash))
-                .arg(format!("--debug.max-block={}", checkpoint.number))
-                .arg("--debug.terminate"),
-        )
-        .await?
-        .is_break()
-        {
-            return Ok(ControlFlow::Break(()));
+        let mut progress = durable_progress(&environment, runner.runtime(), &schedule.eras)?;
+        if skips_handoff {
+            ensure!(
+                progress.is_some_and(|(head, _)| head >= last.number),
+                "--dev and --debug sync modes skip historical sync, which must first reach block {}",
+                last.number
+            );
+            return Ok(ControlFlow::Continue(false));
         }
-        let (head, finalized) = durable_progress(&environment, runner.runtime(), checkpoint)?
-            .ok_or_eyre("historical sync did not initialize storage")?;
-        ensure!(
-            head == checkpoint.number,
-            "historical sync did not finish at its pinned checkpoint"
-        );
-        Ok(ControlFlow::Continue(finalized <= checkpoint.number))
+        for era in &schedule.eras {
+            let checkpoint = era.checkpoint;
+            if progress.is_some_and(|(head, _)| head >= checkpoint.number) {
+                continue;
+            }
+            eprintln!("Syncing {era} through block {}", checkpoint.number);
+            if run_child(
+                &format!("{era} historical sync"),
+                Command::new(&era.binary)
+                    .args(frozen_args(std::env::args_os().skip(1)))
+                    .env_remove("TEMPO_FOLLOW")
+                    .arg("--history-sync")
+                    .arg(format!("--debug.tip={}", checkpoint.hash))
+                    .arg(format!("--debug.max-block={}", checkpoint.number))
+                    .arg("--debug.terminate"),
+            )
+            .await?
+            .is_break()
+            {
+                return Ok(ControlFlow::Break(()));
+            }
+            progress = durable_progress(&environment, runner.runtime(), &schedule.eras)?;
+            let (head, _) = progress.ok_or_eyre("historical sync did not initialize storage")?;
+            ensure!(
+                head == checkpoint.number,
+                "{era} historical sync did not finish at its pinned checkpoint"
+            );
+        }
+        let (_, finalized) = progress.ok_or_eyre("historical sync did not initialize storage")?;
+        Ok(ControlFlow::Continue(finalized <= last.number))
     })
 }
 
 fn durable_progress(
     environment: &EnvironmentArgs<TempoChainSpecParser>,
     runtime: Runtime,
-    checkpoint: BlockNumHash,
+    eras: &[FrozenEra],
 ) -> Result<Option<(u64, u64)>> {
     let datadir = environment
         .datadir
@@ -111,7 +113,11 @@ fn durable_progress(
         "chain specification does not match the database genesis"
     );
     let number = provider.best_block_number()?;
-    if number >= checkpoint.number {
+    for checkpoint in eras
+        .iter()
+        .map(|era| era.checkpoint)
+        .filter(|checkpoint| checkpoint.number <= number)
+    {
         ensure!(
             provider.block_hash(checkpoint.number)? == Some(checkpoint.hash),
             "historical canonical checkpoint hash mismatch"

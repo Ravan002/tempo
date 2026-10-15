@@ -1,7 +1,7 @@
 //! Routing policy and selector rewriting, using one execution-independent metadata fixture.
 use futures::future::BoxFuture;
 use jsonrpsee::core::RpcResult;
-use serde_json::{Value, json};
+use serde_json::{Value, json, value::RawValue};
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
@@ -20,7 +20,7 @@ impl Fixture {
             resolutions: AtomicUsize::new(0),
         });
         let boundaries = (1..count as u64).map(|era| era * 100).collect();
-        let router = Router::new(1, boundaries, backend.clone());
+        let router = Router::new(boundaries, backend.clone());
         Self { router, backend }
     }
 
@@ -28,15 +28,15 @@ impl Fixture {
         self.router
             .route(method, RpcParams(params))
             .await
-            .map(|route| route.era)
+            .map(|(era, _)| era)
             .map_err(|error| error.code())
     }
 
     async fn check(&self, method: &str, params: Value, era: usize, expected: Value) {
         assert!(is_execution_method(method), "{method}");
-        let route = self.router.route(method, RpcParams(params)).await.unwrap();
-        assert_eq!(route.era, era, "{method}");
-        assert_eq!(route.params.0, expected, "{method}");
+        let (actual, params) = self.router.route(method, RpcParams(params)).await.unwrap();
+        assert_eq!(actual, era, "{method}");
+        assert_eq!(params.0, expected, "{method}");
     }
 
     async fn reject(&self, method: &str, params: Value, code: i32) {
@@ -100,60 +100,106 @@ impl Backend for Blocks {
             })
         })
     }
+
+    fn raw_block_timestamp(&self, _: &RpcParams) -> RpcResult<u64> {
+        unreachable!("routing tests use no raw blocks")
+    }
+
+    fn forward<'a>(
+        &'a self,
+        _: usize,
+        _: &'a str,
+        _: RpcParams,
+    ) -> BoxFuture<'a, RpcResult<Box<RawValue>>> {
+        unreachable!("routing does not forward")
+    }
 }
 
 fn hash(number: u64) -> String {
     format!("0x{number:064x}")
 }
 
-fn request(selector: &str) -> Value {
-    json!({"txs":["0x02"], "blockNumber":"0xffff", "stateBlockNumber":selector})
-}
-
 #[tokio::test]
-async fn bundle_pins_numeric_state_and_rejects_invalid_or_crossing_timestamps() {
+async fn simulations_and_bundles_require_a_live_base() {
     let f = Fixture::new(2);
-    for (selector, pinned, era) in [
-        ("safe", "0x1", 0),
-        ("latest", "0x3", 1),
-        ("pending", "pending", 1),
-    ] {
-        f.check(
+    let bundle = |extra: Value| {
+        let mut request = json!({"txs":["0x02"], "blockNumber":"0xffff"});
+        request
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        json!([request])
+    };
+    let call_many = |context: Value, time: Value| json!([[{"transactions":[{}], "blockOverride":{"time":time}}], context]);
+    let mut live = vec![
+        (
             "eth_callBundle",
-            json!([request(selector)]),
-            era,
-            json!([request(pinned)]),
-        )
-        .await;
+            bundle(json!({"stateBlockNumber":"latest"})),
+        ),
+        (
+            "eth_callBundle",
+            bundle(json!({"stateBlockNumber":"0x3", "timestamp":"0x6e"})),
+        ),
+        (
+            "eth_callBundle",
+            bundle(json!({"stateBlockNumber":"pending"})),
+        ),
+        ("eth_callBundle", bundle(json!({}))),
+        ("mev_simBundle", json!({"bundle":{}, "sim_overrides":{}})),
+        ("mev_simBundle", json!([{}, {"parentBlock":"pending"}])),
+        (
+            "mev_simBundle",
+            json!([{}, {"parentBlock":"latest", "timestamp":"0x64"}]),
+        ),
+    ];
+    let mut historical = vec![
+        ("eth_callBundle", bundle(json!({"stateBlockNumber":"safe"}))),
+        // The generated child would be live, but its base state is historical.
+        (
+            "eth_callBundle",
+            bundle(json!({"stateBlockNumber":"0x2", "timestamp":"0x64"})),
+        ),
+        (
+            "eth_callBundle",
+            bundle(json!({"stateBlockNumber":"latest", "timestamp":"0x63"})),
+        ),
+        (
+            "eth_callBundle",
+            bundle(json!({"stateBlockNumber":"pending", "timestamp":"0x63"})),
+        ),
+        ("mev_simBundle", json!([{}, {"parentBlock":"0x2"}])),
+        (
+            "mev_simBundle",
+            json!([{}, {"parentBlock":"pending", "time":"0x63"}]),
+        ),
+    ];
+    for method in ["eth_callMany", "debug_traceCallMany"] {
+        live.push((method, call_many(json!({"blockNumber":null}), Value::Null)));
+        live.push((
+            method,
+            call_many(json!({"blockNumber":"pending"}), json!("0x64")),
+        ));
+        historical.push((method, call_many(json!({"blockNumber":"0x2"}), Value::Null)));
+        historical.push((
+            method,
+            call_many(json!({"blockNumber":"latest"}), json!("0x63")),
+        ));
     }
-    let mut bundle = request("0x2");
-    bundle["timestamp"] = json!("0x62");
-    let named = json!({"request":bundle});
-    f.check("eth_callBundle", named.clone(), 0, named).await;
-    // The generated child timestamp saturates and stays in the parent's era.
-    f.check(
-        "eth_callBundle",
-        json!([request("0x4")]),
-        1,
-        json!([request("0x4")]),
-    )
-    .await;
-
-    for (selector, timestamp, code) in [
-        (json!("0x2"), None, -32004),
-        (json!("0x1"), Some("0x64"), -32004),
-        (json!("latest"), Some("0x63"), -32004),
-        (json!("pending"), Some("0x63"), -32004),
-        (json!({"blockNumber":"0x1"}), None, -32602),
-        (json!({"blockHash":hash(1)}), None, -32602),
-        (Value::Null, None, -32602),
+    for (method, payload, block) in [
+        ("eth_simulateV1", "opts", "blockNumber"),
+        ("tempo_simulateV1", "payload", "block"),
     ] {
-        let mut bundle = request("latest");
-        bundle["stateBlockNumber"] = selector;
-        if let Some(timestamp) = timestamp {
-            bundle["timestamp"] = json!(timestamp);
-        }
-        f.reject("eth_callBundle", json!([bundle]), code).await;
+        let simulation = |base: &str, time: &str| json!({payload:{"blockStateCalls":[{"blockOverrides":{"time":time},"calls":[{}]}]}, block:base});
+        live.push((method, simulation("latest", "0x64")));
+        live.push((method, simulation("pending", "0x6e")));
+        historical.push((method, simulation("0x2", "0x64")));
+        historical.push((method, simulation("latest", "0x63")));
+    }
+    for (method, params) in live {
+        f.check(method, params.clone(), 1, params).await;
+    }
+    for (method, params) in historical {
+        f.reject(method, params, -32004).await;
     }
 }
 
@@ -164,6 +210,10 @@ async fn optional_execution_methods_cannot_bypass_era_policy() {
         "eth_futureExecution",
         "tempo_futureExecution",
         "ots_getContractCreator",
+        "ots_futureExecution",
+        "reth_futureExecution",
+        "testing_buildBlockV1",
+        "flashbots_validateBuilderSubmissionV3",
     ] {
         assert!(is_execution_method(method), "{method}");
         f.reject(method, json!([]), -32004).await;
@@ -175,7 +225,11 @@ async fn optional_execution_methods_cannot_bypass_era_policy() {
         "reth_getBalanceChangesInBlock",
         "ots_hasCode",
         "ots_getBlockDetails",
+        "erigon_getHeaderByNumber",
         "eth_sendRawTransactionConditional",
+        "token_getTokens",
+        "miner_setExtra",
+        "debug_subscribe",
     ] {
         assert!(!is_execution_method(method), "{method}");
     }
@@ -229,38 +283,6 @@ async fn execution_ranges_use_canonical_heights_and_stop_at_the_head() {
 }
 
 #[tokio::test]
-async fn mev_bundle_checks_generated_and_flattened_override_timestamps() {
-    let f = Fixture::new(2);
-    for (params, era, pinned) in [
-        (
-            json!([{}, {"parentBlock":"safe", "time":"0x62"}]),
-            0,
-            json!([{}, {"parentBlock":{"blockHash":hash(1)}, "time":"0x62"}]),
-        ),
-        (
-            json!({"bundle":{}, "sim_overrides":{}}),
-            1,
-            json!({"bundle":{}, "sim_overrides":{"parentBlock":{"blockHash":hash(3)}}}),
-        ),
-        (
-            json!([{}, {"parentBlock":"pending"}]),
-            1,
-            json!([{}, {"parentBlock":"pending"}]),
-        ),
-    ] {
-        f.check("mev_simBundle", params, era, pinned).await;
-    }
-    for overrides in [
-        json!({"parentBlock":"0x2"}),
-        json!({"parentBlock":"0x2", "time":"0x62"}),
-        json!({"parentBlock":"0x1", "timestamp":"0x64"}),
-        json!({"parentBlock":"pending", "time":"0x63"}),
-    ] {
-        f.reject("mev_simBundle", json!([{}, overrides]), -32004)
-            .await;
-    }
-}
-#[tokio::test]
 async fn debug_subscriptions_guard_the_included_range() {
     let f = Fixture::new(2);
     for (params, expected) in [
@@ -299,16 +321,6 @@ async fn execution_routes_and_preserves_native_block_selectors() {
     for (method, params, era) in [
         ("eth_call", json!([{}, id]), 0),
         ("eth_call", json!([{}, "pending"]), 1),
-        (
-            "eth_callMany",
-            json!([[{"transactions":[{}]}], {"blockNumber":id}]),
-            0,
-        ),
-        (
-            "eth_simulateV1",
-            json!([{"blockStateCalls":[{"calls":[{}]}]}, id]),
-            0,
-        ),
         ("debug_traceBlockByHash", json!([hash(1)]), 0),
     ] {
         f.check(method, params.clone(), era, params).await;
@@ -330,18 +342,8 @@ async fn execution_routes_and_preserves_native_block_selectors() {
 }
 
 #[tokio::test]
-async fn simulations_ranges_and_overrides_stay_in_one_era() {
+async fn ranges_and_overrides_stay_in_one_era() {
     let f = Fixture::new(2);
-    // Base state is the last old block; the simulated child is in the new era.
-    for (method, payload_name, block_name) in [
-        ("eth_simulateV1", "opts", "blockNumber"),
-        ("tempo_simulateV1", "payload", "block"),
-    ] {
-        let params = json!({payload_name:{"blockStateCalls":[{"blockOverrides":{"time":"0x64"},"calls":[{}]}]}, block_name:"0x2"});
-        let mut expected = params.clone();
-        expected[block_name] = json!({"blockHash":hash(2)});
-        f.check(method, params, 1, expected).await;
-    }
     f.backend.resolutions.store(0, Ordering::Relaxed);
     f.check(
         "trace_filter",
@@ -353,16 +355,6 @@ async fn simulations_ranges_and_overrides_stay_in_one_era() {
     assert_eq!(f.backend.resolutions.load(Ordering::Relaxed), 1);
     for (method, params, era) in [
         ("eth_call", json!([{}, "0x1", null, {"time":null}]), 0),
-        (
-            "eth_callMany",
-            json!([[{"transactions":[{}]}], {"blockNumber":null}]),
-            1,
-        ),
-        (
-            "eth_simulateV1",
-            json!([{"blockStateCalls":[{"blockOverrides":{"time":null,"number":null}}]}, "0x1"]),
-            0,
-        ),
         (
             "trace_filter",
             json!([{"fromBlock":null,"toBlock":null}]),
@@ -379,19 +371,6 @@ async fn simulations_ranges_and_overrides_stay_in_one_era() {
     for (method, params) in [
         ("eth_call", json!([{}, "0x1", null, {"time":"0x64"}])),
         ("eth_call", json!([{}, "0x1", null, {"timestamp":"0x64"}])),
-        (
-            "eth_simulateV1",
-            json!([{"blockStateCalls":[{"blockOverrides":{"time":"0x63"}},{"blockOverrides":{"time":"0x64"}}]},"0x1"]),
-        ),
-        // Number gaps generate intermediate blocks in the old era before the new requested block.
-        (
-            "eth_simulateV1",
-            json!([{"blockStateCalls":[{"blockOverrides":{"blockNumber":"0x3", "timestamp":"0x6e"}}]},"0x1"]),
-        ),
-        (
-            "debug_traceCallMany",
-            json!([[{"transactions":[{}]}, {"transactions":[{}]}], {"blockNumber":"0x2"}]),
-        ),
         ("trace_filter", json!([{"fromBlock":"0x1"}])),
     ] {
         f.reject(method, params, -32004).await;

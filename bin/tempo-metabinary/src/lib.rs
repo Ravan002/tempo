@@ -7,7 +7,6 @@
 pub mod catalog;
 pub mod decorate;
 pub mod handshake;
-pub mod manifest;
 pub mod process;
 pub mod routing;
 pub mod workers;

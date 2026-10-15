@@ -15,14 +15,10 @@ use serde_json::{Value, json, value::RawValue};
 use std::sync::Arc;
 
 const BLOCK_HASH_HEX_LEN: usize = 2 + 2 * B256::len_bytes();
-// Match Reth's generated bundle environments and its separate simulation fallback.
-const BUNDLE_TIMESTAMP_INCREMENT: u64 = 12;
-const SIMULATE_FALLBACK_TIMESTAMP_INCREMENT: u64 = 12;
 const MAX_EXECUTION_OUTCOME_BLOCKS: u64 = 128;
 
 /// Resolve identifiers through the live node. Frozen workers receive pinned historical IDs.
 pub struct Router {
-    chain_id: u64,
     /// Strictly increasing exclusive end timestamps of the frozen eras, from
     /// [`crate::catalog::ChainEras::boundaries`].
     boundaries: Vec<u64>,
@@ -30,9 +26,8 @@ pub struct Router {
 }
 
 impl Router {
-    pub fn new(chain_id: u64, boundaries: Vec<u64>, backend: Arc<dyn Backend>) -> Self {
+    pub fn new(boundaries: Vec<u64>, backend: Arc<dyn Backend>) -> Self {
         Self {
-            chain_id,
             boundaries,
             backend,
         }
@@ -45,7 +40,12 @@ impl Router {
         self.boundaries.partition_point(|end| *end <= timestamp)
     }
 
-    pub async fn route(&self, method: &str, mut params: RpcParams) -> RpcResult<Route> {
+    /// Returns the selected era, [`Self::live_index`] for native execution, and its parameters.
+    pub async fn route(
+        &self,
+        method: &str,
+        mut params: RpcParams,
+    ) -> RpcResult<(usize, RpcParams)> {
         if !params.0.is_null() && !params.0.is_array() && !params.0.is_object() {
             return Err(invalid("params must be an array or an object"));
         }
@@ -85,11 +85,56 @@ impl Router {
                     live
                 }
             }
-            Policy::Simulation => self.simulation(method, &mut params).await?,
-            Policy::CallBundle => self.call_bundle(&mut params).await?,
-            Policy::MevBundle => self.mev_bundle(&mut params).await?,
+            Policy::Simulation => {
+                let (payload, block): (&[&str], &[&str]) = if method == "eth_simulateV1" {
+                    (&["opts"], &["block_number", "blockNumber"])
+                } else {
+                    (&["payload"], &["block"])
+                };
+                let calls = params
+                    .get(0, payload)
+                    .and_then(|payload| payload.get("blockStateCalls"))
+                    .and_then(Value::as_array);
+                self.live_base(
+                    params.get(1, block),
+                    calls
+                        .into_iter()
+                        .flatten()
+                        .map(|call| call.get("blockOverrides")),
+                )
+                .await?
+            }
+            Policy::CallBundle => {
+                // The bundle request carries its own `timestamp` override.
+                let request = params.get(0, &["request"]);
+                self.live_base(
+                    request.and_then(|request| request.get("stateBlockNumber")),
+                    [request],
+                )
+                .await?
+            }
+            Policy::MevBundle => {
+                let overrides = params.get(1, &["sim_overrides", "simOverrides"]);
+                self.live_base(
+                    overrides.and_then(|overrides| overrides.get("parentBlock")),
+                    [overrides],
+                )
+                .await?
+            }
+            Policy::CallMany => {
+                let bundles = params.get(0, &["bundles"]).and_then(Value::as_array);
+                self.live_base(
+                    params
+                        .get(1, &["state_context", "stateContext"])
+                        .and_then(|context| context.get("blockNumber")),
+                    bundles
+                        .into_iter()
+                        .flatten()
+                        .map(|bundle| bundle.get("blockOverride")),
+                )
+                .await?
+            }
             Policy::ExecutionOutcome => self.execution_outcome(&mut params).await?,
-            Policy::CallMany => self.bundles(method, &mut params).await?,
             Policy::TraceFilter => self.filter(&mut params).await?,
             Policy::RawBlock => self.era(self.backend.raw_block_timestamp(&params)?),
             Policy::Transaction => {
@@ -123,11 +168,31 @@ impl Router {
                 }
             }
             Policy::Native => live,
-            Policy::Execution | Policy::Unrouted => {
+            Policy::Execution => {
                 return Err(unsupported(format!("{method} has no era routing policy")));
             }
         };
-        Ok(Route { era, params })
+        Ok((era, params))
+    }
+
+    /// Generated children never precede their base, so a live base and live overrides stay live.
+    async fn live_base<'a>(
+        &self,
+        base: Option<&Value>,
+        overrides: impl IntoIterator<Item = Option<&'a Value>>,
+    ) -> RpcResult<usize> {
+        let live = self.live_index();
+        for overrides in overrides {
+            self.check_time(live, overrides)?;
+        }
+        if let Some(base) = base.filter(|base| !base.is_null() && *base != "pending")
+            && self.era(self.backend.block(base).await?.timestamp) != live
+        {
+            return Err(unsupported(
+                "historical simulations and bundles require a live base block",
+            ));
+        }
+        Ok(live)
     }
 
     fn check_time(&self, era: usize, overrides: Option<&Value>) -> RpcResult<()> {
@@ -181,76 +246,6 @@ impl Router {
         Ok(era)
     }
 
-    async fn call_bundle(&self, params: &mut RpcParams) -> RpcResult<usize> {
-        let request = params
-            .get_mut(0, &["request"])
-            .filter(|value| value.is_object())
-            .ok_or_else(|| invalid("missing bundle request"))?;
-        // Unlike BlockId, the native bundle API accepts only a block number or tag here.
-        let selector = request
-            .get("stateBlockNumber")
-            .and_then(Value::as_str)
-            .ok_or_else(|| invalid("stateBlockNumber must be a block number or tag"))?;
-        if !matches!(
-            selector,
-            "earliest" | "latest" | "safe" | "finalized" | "pending"
-        ) {
-            quantity(&json!(selector))?;
-        }
-        let timestamp = request
-            .get("timestamp")
-            .filter(|value| !value.is_null())
-            .map(quantity)
-            .transpose()?;
-        if selector == "pending" {
-            let live = self.live_index();
-            if timestamp.is_some_and(|timestamp| self.era(timestamp) != live) {
-                return Err(unsupported("bundle timestamp crosses an era boundary"));
-            }
-            // The native pending environment supplies its own timestamp and remains live.
-            return Ok(live);
-        }
-        let parent = self.backend.block(&json!(selector)).await?;
-        let era = self.era(parent.timestamp);
-        // Era lookup is monotonic, so saturated timestamps select the same era as unbounded ones.
-        let timestamp =
-            timestamp.unwrap_or(parent.timestamp.saturating_add(BUNDLE_TIMESTAMP_INCREMENT));
-        // Reth selects its configuration from the state block before changing its timestamp.
-        // Require both environments to belong to one binary until that native behavior changes.
-        if self.era(timestamp) != era {
-            return Err(unsupported("bundle timestamp crosses an era boundary"));
-        }
-        request["stateBlockNumber"] = parent.number_id();
-        Ok(era)
-    }
-
-    async fn mev_bundle(&self, params: &mut RpcParams) -> RpcResult<usize> {
-        let names = &["sim_overrides", "simOverrides"];
-        let overrides = params
-            .get_mut(1, names)
-            .filter(|value| value.is_object())
-            .ok_or_else(|| invalid("missing bundle simulation overrides"))?;
-        let selector = overrides
-            .get("parentBlock")
-            .filter(|value| !value.is_null())
-            .cloned()
-            .unwrap_or_else(|| json!("latest"));
-        if selector == "pending" {
-            let live = self.live_index();
-            self.check_time(live, Some(overrides))?;
-            return Ok(live);
-        }
-        let parent = self.backend.block(&selector).await?;
-        let era = self.era(parent.timestamp);
-        // Native cfg is selected for the generated child before applying block overrides.
-        if self.era(parent.timestamp.saturating_add(BUNDLE_TIMESTAMP_INCREMENT)) != era {
-            return Err(unsupported("bundle simulation crosses an era boundary"));
-        }
-        self.check_time(era, Some(overrides))?;
-        overrides["parentBlock"] = parent.pin(selector, false);
-        Ok(era)
-    }
-
     async fn execution_outcome(&self, params: &mut RpcParams) -> RpcResult<usize> {
         let count = params
             .get(1, &["count"])
@@ -291,129 +286,6 @@ impl Router {
             }
         }
         params.set(0, &["block_id", "blockId"], first.pin(selector, false));
-        Ok(era)
-    }
-
-    async fn bundles(&self, method: &str, params: &mut RpcParams) -> RpcResult<usize> {
-        let bundles = params
-            .get(0, &["bundles"])
-            .and_then(Value::as_array)
-            .ok_or_else(|| invalid("missing bundles"))?;
-        let names = &["state_context", "stateContext"];
-        let context = params.get(1, names);
-        let selector = context
-            .and_then(|context| context.get("blockNumber"))
-            .filter(|v| !v.is_null())
-            .cloned()
-            .unwrap_or_else(|| json!("latest"));
-        let pending = selector == "pending";
-        let policy_selector = if pending {
-            json!("latest")
-        } else {
-            selector.clone()
-        };
-        let block = self.backend.block(&policy_selector).await?;
-        let era = if pending {
-            self.live_index()
-        } else {
-            self.era(block.timestamp)
-        };
-        // Bundle timestamps never decrease, so the first and last bundles bound every era.
-        let steps = if method == "debug_traceCallMany" {
-            bundles.len().saturating_sub(1) as u64
-        } else {
-            0
-        };
-        let last = block
-            .timestamp
-            .saturating_add(steps.saturating_mul(BUNDLE_TIMESTAMP_INCREMENT));
-        if !bundles.is_empty() && (self.era(block.timestamp) != era || self.era(last) != era) {
-            return Err(unsupported("call bundles span multiple eras"));
-        }
-        for bundle in bundles {
-            self.check_time(era, bundle.get("blockOverride"))?;
-        }
-        if !pending {
-            if context.is_some_and(|context| !context.is_object()) {
-                return Err(invalid("state context must be an object"));
-            }
-            let block = block.pin(selector, false);
-            if let Some(context) = params.get_mut(1, names) {
-                context["blockNumber"] = block;
-            } else {
-                params.set(1, names, json!({"blockNumber":block}));
-            }
-        }
-        Ok(era)
-    }
-
-    async fn simulation(&self, method: &str, params: &mut RpcParams) -> RpcResult<usize> {
-        let (payload_names, block_names): (&[&str], &[&str]) = if method == "eth_simulateV1" {
-            (&["opts"], &["block_number", "blockNumber"])
-        } else {
-            (&["payload"], &["block"])
-        };
-        let payload = params
-            .get(0, payload_names)
-            .ok_or_else(|| invalid("missing simulation payload"))?;
-        let calls = payload
-            .get("blockStateCalls")
-            .and_then(Value::as_array)
-            .ok_or_else(|| invalid("missing blockStateCalls"))?;
-        let selector = params
-            .get(1, block_names)
-            .cloned()
-            .unwrap_or_else(|| json!("latest"));
-        // Pending is always live. Validate explicit timestamps without changing its semantics.
-        if selector == "pending" {
-            let era = self.live_index();
-            for call in calls {
-                self.check_time(era, call.get("blockOverrides"))?;
-            }
-            return Ok(era);
-        }
-        let base = self.backend.block(&selector).await?;
-        let step = alloy_chains::Chain::from(self.chain_id)
-            .average_blocktime_hint()
-            .map(|d| d.as_secs().saturating_add(u64::from(d.subsec_nanos() > 0)))
-            .filter(|s| *s > 0)
-            .unwrap_or(SIMULATE_FALLBACK_TIMESTAMP_INCREMENT);
-        let mut number = base.number;
-        let mut time = base.timestamp;
-        let mut first_time = None;
-        for call in calls {
-            let overrides = call.get("blockOverrides");
-            let next_number = overrides
-                .and_then(|o| o.get("number").or_else(|| o.get("blockNumber")))
-                .filter(|v| !v.is_null())
-                .map(quantity)
-                .transpose()?
-                .unwrap_or(number.saturating_add(1));
-            if next_number <= number {
-                return Err(invalid("simulation block numbers must increase"));
-            }
-            // Reth fills number gaps using the chain's block time hint.
-            let gap = next_number - number;
-            if gap > 1 {
-                first_time.get_or_insert(time.saturating_add(step));
-                time = time.saturating_add(step.saturating_mul(gap - 1));
-            }
-            let next_time = override_time(overrides)?.unwrap_or(time.saturating_add(step));
-            if next_time <= time {
-                return Err(invalid("simulation timestamps must increase"));
-            }
-            first_time.get_or_insert(next_time);
-            number = next_number;
-            time = next_time;
-        }
-        // Era lookup and simulated timestamps are monotonic, so the endpoints bound every block.
-        let era = self.era(first_time.unwrap_or(base.timestamp));
-        if self.era(time) != era {
-            return Err(unsupported(
-                "simulation spans multiple eras; split the request",
-            ));
-        }
-        params.set(1, block_names, base.pin(selector, false));
         Ok(era)
     }
 }
@@ -500,7 +372,7 @@ pub(crate) fn unsupported(message: impl Into<String>) -> ErrorObjectOwned {
     ErrorObjectOwned::owned(-32004, message.into(), None::<()>)
 }
 
-pub fn quantity(value: &Value) -> RpcResult<u64> {
+fn quantity(value: &Value) -> RpcResult<u64> {
     value
         .as_u64()
         .or_else(|| u64::from_str_radix(value.as_str()?.strip_prefix("0x")?, 16).ok())
@@ -544,26 +416,13 @@ pub trait Backend: Send + Sync {
     /// Execution results are opaque to the router.
     fn forward<'a>(
         &'a self,
-        _era: usize,
-        _method: &'a str,
-        _params: RpcParams,
-    ) -> BoxFuture<'a, RpcResult<Box<RawValue>>> {
-        Box::pin(async { Err(unsupported("historical execution is unavailable")) })
-    }
+        era: usize,
+        method: &'a str,
+        params: RpcParams,
+    ) -> BoxFuture<'a, RpcResult<Box<RawValue>>>;
 
     /// Only the chain-specific adapter knows the raw block encoding.
-    fn raw_block_timestamp(&self, _params: &RpcParams) -> RpcResult<u64> {
-        Err(unsupported(
-            "raw-block tracing requires a chain-specific decoder; use debug_traceBlockByHash or debug_traceBlockByNumber",
-        ))
-    }
-}
-
-/// Selected execution era and parameters prepared for its RPC implementation.
-pub struct Route {
-    /// Equals [`Router::live_index`] for native execution.
-    pub era: usize,
-    pub params: RpcParams,
+    fn raw_block_timestamp(&self, params: &RpcParams) -> RpcResult<u64>;
 }
 
 /// Block hashes and EIP-1898 hash objects, as opposed to tags and numbers.
@@ -598,15 +457,13 @@ enum Policy {
     RawBlock,
     /// Guarded through its subscription callback, not as an ordinary execution method.
     TraceChain,
-    /// Rejected: no reviewed selector rule.
+    /// Rejected, including unknown methods.
     Execution,
-    Unrouted,
 }
 
 fn policy(method: &str) -> Policy {
     match method {
         "debug_subscribe" => Policy::TraceChain,
-        "eth_subscribe" | "eth_unsubscribe" | "debug_unsubscribe" => Policy::Unrouted,
         "eth_simulateV1" | "tempo_simulateV1" => Policy::Simulation,
         "eth_callBundle" => Policy::CallBundle,
         "mev_simBundle" => Policy::MevBundle,
@@ -707,9 +564,6 @@ fn policy(method: &str) -> Policy {
         | "eth_getFilterLogs"
         | "eth_getTransactions"
         | "eth_config"
-        | "token_getRoleHistory"
-        | "token_getTokens"
-        | "token_getTokensByAddress"
         | "tempo_fundAddress"
         | "tempo_forkSchedule"
         | "debug_getRawHeader"
@@ -744,30 +598,42 @@ fn policy(method: &str) -> Policy {
         | "debug_standardTraceBlockToFile"
         | "debug_storageRangeAt"
         | "debug_standardTraceBadBlockToFile"
-        | "debug_stateRootWithUpdates" => {
-            Policy::Native
-        }
-        "ots_getContractCreator" => Policy::Execution,
-        _ if ["net_", "web3_", "rpc_", "txpool_", "admin_", "operator_", "consensus_"]
-            .iter()
-            .any(|prefix| method.starts_with(prefix)) =>
+        | "debug_stateRootWithUpdates"
+        | "reth_getBalanceChangesInBlock"
+        | "reth_jit"
+        | "ots_getApiLevel"
+        | "ots_getHeaderByNumber"
+        | "erigon_getHeaderByNumber"
+        | "ots_hasCode"
+        | "ots_getBlockDetails"
+        | "ots_getBlockDetailsByHash"
+        | "ots_getBlockTransactions"
+        | "ots_getTransactionBySenderAndNonce"
+        // Unimplemented in the pinned native backend.
+        | "ots_searchTransactionsBefore"
+        | "ots_searchTransactionsAfter" => Policy::Native,
+        _ if [
+            "net_",
+            "web3_",
+            "rpc_",
+            "txpool_",
+            "admin_",
+            "miner_",
+            "operator_",
+            "consensus_",
+            "token_",
+        ]
+        .iter()
+        .any(|prefix| method.starts_with(prefix)) =>
         {
             Policy::Native
         }
-        _ if ["debug_", "trace_", "eth_", "tempo_"]
-            .iter()
-            .any(|prefix| method.starts_with(prefix)) =>
-        {
-            Policy::Execution
-        }
-        _ => Policy::Unrouted,
+        // Unknown methods may execute blocks, e.g. `testing_buildBlockV1`.
+        _ => Policy::Execution,
     }
 }
 
-/// Decorate execution callbacks and fail closed for unreviewed execution methods.
+/// Whether a method is routed or rejected rather than left native.
 pub fn is_execution_method(method: &str) -> bool {
-    !matches!(
-        policy(method),
-        Policy::Native | Policy::Unrouted | Policy::TraceChain
-    )
+    !matches!(policy(method), Policy::Native | Policy::TraceChain)
 }
