@@ -388,3 +388,82 @@ async fn supports_three_eras() {
         );
     }
 }
+
+#[tokio::test]
+async fn fee_history_routes_by_newest_block_without_splitting_ranges() {
+    let f = Fixture::new(3);
+    for (params, era, pinned) in [
+        (json!(["0x1", "0x0", []]), 0, json!(["0x1", "0x0", []])),
+        // A zero-padded quantity must not resolve as an EIP-1898 hash.
+        (json!(["1", hash(1)]), 0, json!(["1", "0x1"])),
+        (json!(["0x1", "FINALIZED"]), 0, json!(["0x1", "0x1"])),
+        (
+            json!({"block_count": "0x2", "newest_block": "safe", "reward_percentiles": [50]}),
+            0,
+            json!({"block_count": "0x2", "newest_block": "0x1", "reward_percentiles": [50]}),
+        ),
+        (
+            json!({"blockCount": "0x1", "newestBlock": "earliest"}),
+            0,
+            json!({"blockCount": "0x1", "newestBlock": "0x0"}),
+        ),
+        // Earlier entries may cross eras; only the trailing fee needs the newest block's rules.
+        (
+            json!(["0x6", "0x5", [10, 90]]),
+            1,
+            json!(["0x6", "0x5", [10, 90]]),
+        ),
+        (json!(["0x7", "0x6"]), 2, json!(["0x7", "0x6"])),
+        (
+            json!({"blockCount": 8, "newestBlock": "latest"}),
+            2,
+            json!({"blockCount": 8, "newestBlock": "0x7"}),
+        ),
+    ] {
+        f.check("eth_feeHistory", params, era, pinned).await;
+    }
+}
+
+#[tokio::test]
+async fn fee_history_resolves_pending_as_latest() {
+    for (boundary, era) in [(100, 1), (200, 0)] {
+        let mut f = Fixture::new(2);
+        f.router = Router::new(vec![boundary], f.backend.clone());
+        for (params, pinned) in [
+            (json!(["0x1", "pending"]), json!(["0x1", "0x3"])),
+            (json!(["0x1", "PENDING"]), json!(["0x1", "0x3"])),
+            (json!(["0x1", "latest"]), json!(["0x1", "0x3"])),
+            (
+                json!({"block_count": "0x1", "newest_block": "pending"}),
+                json!({"block_count": "0x1", "newest_block": "0x3"}),
+            ),
+        ] {
+            f.backend.resolutions.store(0, Ordering::Relaxed);
+            f.check("eth_feeHistory", params, era, pinned).await;
+            assert_eq!(f.backend.resolutions.load(Ordering::Relaxed), 1);
+        }
+    }
+}
+
+#[tokio::test]
+async fn fee_history_keeps_empty_and_invalid_requests_native() {
+    let f = Fixture::new(2);
+    for params in [
+        json!(["0x0", "0xffff", [101]]),
+        json!([0, "pending"]),
+        json!(["0", "safe"]),
+        json!({"block_count": "0x00", "newest_block": "earliest"}),
+        json!({"blockCount": 0, "newestBlock": "latest"}),
+        json!([]),
+        json!(["0x1"]),
+        json!([null, "0xffff"]),
+        json!(["invalid", "0xffff"]),
+        json!(["0x10000000000000000", "0xffff"]),
+        json!(["0x1", null]),
+        json!(["0x1", {"blockNumber": "0x1"}]),
+        json!(["0x1", format!("0x{}", "11".repeat(32))]),
+    ] {
+        f.check("eth_feeHistory", params.clone(), 1, params).await;
+    }
+    assert_eq!(f.backend.resolutions.load(Ordering::Relaxed), 0);
+}

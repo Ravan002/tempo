@@ -43,16 +43,21 @@ transport limits remain global. Historical workers are selected by requests, reg
   Historical forwarding pins tags other than `pending`, and preserves explicit hashes and
   `requireCanonical`. Pool and missing transactions stay native. Positional and named parameters
   are supported.
+- `eth_feeHistory` routes by its newest block and pins it to a block number. Historical requests
+  use the frozen era's fee rules; `pending` resolves as `latest`, and zero-count requests stay
+  native. Ranges may cross eras because earlier entries use stored data, not re-execution.
 - Simulations and bundles (`eth_simulateV1`, `tempo_simulateV1`, `eth_callBundle`,
   `mev_simBundle`, `eth_callMany`, `debug_traceCallMany`) run only on a live base block or
   `pending`, with explicit override timestamps in the live era. Historical bases return `-32004`.
-- Requests crossing eras return `-32004`, including trace filters and timestamp overrides. Split
-  ranges rather than transferring speculative state between processes. Methods not reviewed as
+- Execution requests crossing eras return `-32004`, including trace filters and timestamp overrides.
+  Split ranges rather than transferring speculative state between processes. Methods not reviewed as
   non-executing fail closed until their selectors are supported, including unknown namespaces
   such as `testing` and `flashbots`. The live binary never executes a frozen era's blocks.
 - Native transports retain their registries, authentication, CORS, compression, subscriptions,
-  batching, and limits. Metadata resolution works even when eth is disabled publicly.
-  Live debug trace subscriptions stay native, and historical debug trace subscriptions are rejected.
+  batching, and limits. The authenticated Engine endpoint's Ethereum execution methods use the
+  same era routing; Engine protocol methods remain native. Metadata resolution works even when
+  eth is disabled publicly. Live debug trace subscriptions stay native, and historical debug trace
+  subscriptions are rejected.
 - Raw-block tracing decodes only the Tempo header to select its execution era. The selected
   executor validates the body with its own transaction codec.
   Bad-block tracing and `ots_getContractCreator` remain unsupported with era routing:

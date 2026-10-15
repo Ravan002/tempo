@@ -9,7 +9,7 @@ use jsonrpsee::{core::RpcResult, types::ErrorObjectOwned};
 use reth_ethereum::{
     chainspec::EthChainSpec as _,
     rpc::{
-        builder::TransportRpcModules,
+        builder::{TransportRpcModules, auth::AuthRpcModule},
         eth::{EthConfig, TransactionSource},
     },
 };
@@ -24,7 +24,7 @@ use std::{sync::Arc, time::Duration};
 use tempo_chainspec::spec::TempoChainSpec;
 use tempo_metabinary::{
     catalog::{Catalog, ChainEras},
-    decorate::decorate,
+    decorate::{RpcApi, decorate},
     routing::{Backend, BlockMetadata, Router, RpcParams, invalid},
     workers::{DEFAULT_STARTUP_TIMEOUT_SECS, HistoricalWorkers, WorkerContext},
 };
@@ -120,6 +120,7 @@ impl EraRuntime {
     pub(crate) fn install<E: FullEthApi>(
         self: &Arc<Self>,
         modules: &mut TransportRpcModules,
+        auth_module: &mut AuthRpcModule,
         eth_api: E,
     ) -> eyre::Result<()> {
         let router = Arc::new(Router::new(
@@ -131,14 +132,16 @@ impl EraRuntime {
         ));
         // Replace callbacks in-place, retaining the existing server configuration and transports.
         if let Some(methods) = modules.http_methods(|_| true) {
-            modules.replace_http(decorate(methods, router.clone())?)?;
+            modules.replace_http(decorate(methods, router.clone(), RpcApi::Eth)?)?;
         }
         if let Some(methods) = modules.ws_methods(|_| true) {
-            modules.replace_ws(decorate(methods, router.clone())?)?;
+            modules.replace_ws(decorate(methods, router.clone(), RpcApi::Eth)?)?;
         }
         if let Some(methods) = modules.ipc_methods(|_| true) {
-            modules.replace_ipc(decorate(methods, router)?)?;
+            modules.replace_ipc(decorate(methods, router.clone(), RpcApi::Eth)?)?;
         }
+        let methods = auth_module.module_mut().clone().into();
+        auth_module.replace_auth_methods(decorate(methods, router, RpcApi::Engine)?)?;
         Ok(())
     }
 

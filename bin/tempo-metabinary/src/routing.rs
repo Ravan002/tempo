@@ -1,7 +1,9 @@
 //! Select an RPC request's era from native block metadata and pin its block selectors.
 //!
-//! `pending` stays live, cross-era requests fail with `-32004`, and unclassified methods fail.
+//! `pending` execution stays live; fee history treats it as `latest`. Cross-era execution
+//! requests fail with `-32004`, and unclassified methods fail.
 
+use alloy_eips::BlockNumberOrTag;
 use alloy_primitives::{B256, U64};
 use futures::future::BoxFuture;
 use jsonrpsee::{
@@ -147,13 +149,33 @@ impl Router {
                     .map_or(live, |timestamp| self.era(timestamp))
             }
             Policy::Block(index, names, number_only) => {
-                let selector = params.get(index, names).cloned().unwrap_or_else(|| {
-                    json!(if method == "eth_estimateGas" {
-                        "pending"
-                    } else {
-                        "latest"
+                let selector = if method == "eth_feeHistory" {
+                    match (
+                        params
+                            .get(0, &["block_count", "blockCount"])
+                            .map(|count| serde_json::from_value::<U64>(count.clone())),
+                        params
+                            .get(index, names)
+                            .map(|block| serde_json::from_value::<BlockNumberOrTag>(block.clone())),
+                    ) {
+                        (Some(Ok(count)), Some(Ok(mut newest))) if !count.is_zero() => {
+                            if newest.is_pending() {
+                                newest = BlockNumberOrTag::Latest;
+                            }
+                            json!(newest)
+                        }
+                        // Native RPC validates invalid params and handles zero count without storage.
+                        _ => return Ok((live, params)),
+                    }
+                } else {
+                    params.get(index, names).cloned().unwrap_or_else(|| {
+                        json!(if method == "eth_estimateGas" {
+                            "pending"
+                        } else {
+                            "latest"
+                        })
                     })
-                });
+                };
                 if selector == "pending" {
                     self.check_overrides(method, &params, live)?;
                     live
@@ -471,6 +493,7 @@ fn policy(method: &str) -> Policy {
         "eth_callMany" | "debug_traceCallMany" => Policy::CallMany,
         "trace_filter" => Policy::TraceFilter,
         "debug_traceBlock" => Policy::RawBlock,
+        "reth_newPayload" | "reth_forkchoiceUpdated" => Policy::Native,
         "debug_traceTransaction"
         | "trace_transaction"
         | "trace_get"
@@ -482,6 +505,7 @@ fn policy(method: &str) -> Policy {
         "eth_call" | "eth_estimateGas" | "eth_createAccessList" => {
             Policy::Block(1, &["block_number", "blockNumber"], false)
         }
+        "eth_feeHistory" => Policy::Block(1, &["newest_block", "newestBlock"], true),
         "debug_traceCall" => Policy::Block(1, &["block_id", "blockId"], false),
         "trace_call" | "trace_rawTransaction" => Policy::Block(2, &["block_id", "blockId"], false),
         "trace_callMany" => Policy::Block(1, &["block_id", "blockId"], false),
@@ -538,7 +562,6 @@ fn policy(method: &str) -> Policy {
         | "eth_maxPriorityFeePerGas"
         | "eth_baseFee"
         | "eth_blobBaseFee"
-        | "eth_feeHistory"
         | "eth_mining"
         | "eth_hashrate"
         | "eth_getWork"
@@ -613,6 +636,8 @@ fn policy(method: &str) -> Policy {
         | "ots_searchTransactionsBefore"
         | "ots_searchTransactionsAfter" => Policy::Native,
         _ if [
+            // Engine payload validation and writes always belong to the live node.
+            "engine_",
             "net_",
             "web3_",
             "rpc_",

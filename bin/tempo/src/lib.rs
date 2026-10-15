@@ -645,7 +645,11 @@ pub fn tempo_main_with(mut overrides: TempoOverrides) -> eyre::Result<()> {
                     }
 
                     if let Some(runtime) = rpc_era_runtime {
-                        runtime.install(ctx.modules, ctx.registry.eth_api().clone())?;
+                        runtime.install(
+                            ctx.modules,
+                            ctx.auth_module,
+                            ctx.registry.eth_api().clone(),
+                        )?;
                     }
 
                     Ok(())

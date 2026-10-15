@@ -24,14 +24,29 @@ impl IdProvider for AllocatedId {
     }
 }
 
-/// Decorate only execution methods already present in a native transport's registry.
+/// The native API whose named execution parameters the registry accepts.
+#[derive(Clone, Copy)]
+pub enum RpcApi {
+    /// Public Ethereum RPC, where `eth_call` names its selector `block_number`.
+    Eth,
+    /// Authenticated Engine RPC, where `eth_call` names its selector `block_id`.
+    Engine,
+}
+
+/// Decorate methods requiring era-specific rules already present in a native transport's registry.
 ///
 /// Live execution invokes the original callback with its original parameters, connection,
 /// extensions, and response limit. Stored-data methods and live subscriptions remain intact.
 /// Chain tracing subscriptions are guarded because they can reexecute historical blocks.
-/// A caller can apply this independently to HTTP, WebSocket, and IPC registries without changing
-/// their namespace selection, authentication, transport settings, or batching behavior.
-pub fn decorate(methods: Methods, router: Arc<Router>) -> Result<Methods, RegisterMethodError> {
+/// A caller can apply this independently to public and authenticated HTTP, WebSocket, and IPC
+/// registries without changing their namespace selection, authentication, transport settings, or
+/// batching behavior. `api` must match the registry's native API. Historical named parameters
+/// are translated to the worker's public API.
+pub fn decorate(
+    methods: Methods,
+    router: Arc<Router>,
+    api: RpcApi,
+) -> Result<Methods, RegisterMethodError> {
     let live = router.live_index();
     let mut registry = jsonrpsee::RpcModule::new(());
     *registry = methods;
@@ -95,7 +110,24 @@ pub fn decorate(methods: Methods, router: Arc<Router>) -> Result<Methods, Regist
                     let router = router.clone();
                     async move {
                         let target = match RpcParams::parse(&params) {
-                            Ok(params) => router.route(name, params).await,
+                            Ok(mut params) => {
+                                if name == "eth_call"
+                                    && matches!(api, RpcApi::Engine)
+                                    && let Value::Object(named) = &mut params.0
+                                {
+                                    // Public-only names must not shadow the Engine selector.
+                                    named.remove("block_number");
+                                    named.remove("blockNumber");
+                                    for (from, to) in
+                                        [("block_id", "block_number"), ("blockId", "blockNumber")]
+                                    {
+                                        if let Some(selector) = named.remove(from) {
+                                            named.insert(to.into(), selector);
+                                        }
+                                    }
+                                }
+                                router.route(name, params).await
+                            }
                             Err(error) => Err(error),
                         };
                         let result = match target {
@@ -144,11 +176,12 @@ mod tests {
     use std::{
         collections::BTreeSet,
         sync::atomic::{AtomicBool, Ordering},
+        time::Duration,
     };
 
     struct FakeBackend {
         timestamp: RpcResult<u64>,
-        response: Option<RpcResult<Box<RawValue>>>,
+        response: Option<(Value, RpcResult<Box<RawValue>>)>,
     }
 
     impl Backend for FakeBackend {
@@ -184,13 +217,12 @@ mod tests {
             async move {
                 assert_eq!(era, 0);
                 assert_eq!(method, "eth_call");
-                assert_eq!(
-                    params.0,
-                    json!({"block":"latest", "block_number":{"blockHash":format!("0x{:064x}", 2)}})
-                );
-                self.response
-                    .clone()
-                    .expect("unexpected historical forwarding")
+                let (expected, response) = self
+                    .response
+                    .as_ref()
+                    .expect("unexpected historical forwarding");
+                assert_eq!(&params.0, expected);
+                response.clone()
             }
             .boxed()
         }
@@ -198,7 +230,7 @@ mod tests {
 
     fn router(
         timestamp: RpcResult<u64>,
-        response: Option<RpcResult<Box<RawValue>>>,
+        response: Option<(Value, RpcResult<Box<RawValue>>)>,
     ) -> Arc<Router> {
         let backend = Arc::new(FakeBackend {
             timestamp,
@@ -250,7 +282,7 @@ mod tests {
             )
             .unwrap();
         let originals: Methods = module.into();
-        let decorated = decorate(originals.clone(), router(Ok(50), None)).unwrap();
+        let decorated = decorate(originals.clone(), router(Ok(50), None), RpcApi::Eth).unwrap();
         assert_eq!(
             decorated.method_names().collect::<BTreeSet<_>>(),
             originals.method_names().collect()
@@ -305,7 +337,13 @@ mod tests {
                 methods
                     .verify_and_insert("eth_call", native.clone())
                     .unwrap();
-                let decorated = decorate(methods, router(timestamp, result)).unwrap();
+                let result = result.map(|response| {
+                    (
+                        json!({"block":"latest", "block_number":{"blockHash":format!("0x{:064x}", 2)}}),
+                        response,
+                    )
+                });
+                let decorated = decorate(methods, router(timestamp, result), RpcApi::Eth).unwrap();
                 let response = invoke(&decorated).await;
                 assert_eq!(response.as_error_code(), code);
                 let (value, _, extensions) = response.into_parts();
@@ -326,6 +364,143 @@ mod tests {
                     _ => (),
                 }
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn authenticated_calls_use_engine_selectors_and_public_worker_params() {
+        let mut module = RpcModule::new(());
+        module
+            .register_method("eth_call", |params, _, _| params.parse::<Value>())
+            .unwrap();
+        let methods: Methods = module.into();
+        let pinned = json!({"blockHash": format!("0x{:064x}", 1)});
+        let latest = json!({"blockHash": format!("0x{:064x}", 2)});
+        let canonical = json!({"blockHash": format!("0x{:064x}", 1), "requireCanonical": true});
+        for (params, forwarded) in [
+            (json!([{}, "0x1"]), json!([{}, pinned])),
+            (
+                json!({"request": {}, "block_id": "0x1"}),
+                json!({"request": {}, "block_number": pinned}),
+            ),
+            (
+                json!({"request": {}, "blockId": "0x1", "block_number": "latest", "blockNumber": "latest"}),
+                json!({"request": {}, "blockNumber": pinned}),
+            ),
+            (
+                json!({"request": {}, "block_id": canonical, "state_overrides": {}}),
+                json!({"request": {}, "block_number": canonical, "state_overrides": {}}),
+            ),
+            (
+                json!({"request": {}, "block_id": "0x1", "block_number": "latest", "blockNumber": "latest"}),
+                json!({"request": {}, "block_number": pinned}),
+            ),
+            (
+                json!({"request": {}, "block_id": null, "block_number": "0x1", "blockNumber": "0x1"}),
+                json!({"request": {}, "block_number": latest}),
+            ),
+            (
+                json!({"request": {}, "block_number": "0x1", "blockNumber": "0x1"}),
+                json!({"request": {}, "block_number": latest}),
+            ),
+        ] {
+            for timestamp in [50, 110] {
+                let historical = timestamp < 100;
+                let response = historical.then(|| {
+                    (
+                        forwarded.clone(),
+                        Ok(serde_json::value::to_raw_value(&"historical").unwrap()),
+                    )
+                });
+                let decorated = decorate(
+                    methods.clone(),
+                    router(Ok(timestamp), response),
+                    RpcApi::Engine,
+                )
+                .unwrap();
+                let result = tokio::time::timeout(
+                    Duration::from_secs(1),
+                    decorated.call::<_, Value>("eth_call", RpcParams(params.clone())),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                assert_eq!(
+                    result,
+                    if historical {
+                        json!("historical")
+                    } else {
+                        params.clone()
+                    }
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn authenticated_calls_reject_cross_era_overrides_and_keep_pending_native() {
+        let mut module = RpcModule::new(());
+        module
+            .register_method("eth_call", |params, _, _| params.parse::<Value>())
+            .unwrap();
+        let decorated = decorate(module.into(), router(Ok(50), None), RpcApi::Engine).unwrap();
+        for selector in ["0x1", "pending"] {
+            let params = json!({
+                "request": {}, "block_id": selector,
+                "block_number": "latest", "block_overrides": {"time": "0x64"}
+            });
+            let result = tokio::time::timeout(
+                Duration::from_secs(1),
+                decorated.call::<_, Value>("eth_call", RpcParams(params.clone())),
+            )
+            .await
+            .unwrap();
+            if selector == "pending" {
+                assert_eq!(result.unwrap(), params);
+            } else {
+                let jsonrpsee::core::server::MethodsError::JsonRpc(error) = result.unwrap_err()
+                else {
+                    panic!("expected a JSON-RPC error");
+                };
+                assert_eq!(error, unsupported("block override crosses an era boundary"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn authenticated_engine_protocol_callbacks_remain_native() {
+        let mut module = RpcModule::new(());
+        let names = [
+            "engine_newPayloadV4",
+            "engine_forkchoiceUpdatedV3",
+            "engine_exchangeCapabilities",
+            "reth_newPayload",
+            "reth_forkchoiceUpdated",
+        ];
+        for name in names {
+            module
+                .register_method(name, |_, _, _| "native engine")
+                .unwrap();
+        }
+        let original: Methods = module.into();
+        let decorated = decorate(original.clone(), router(Ok(50), None), RpcApi::Engine).unwrap();
+        for name in names {
+            let (Some(MethodCallback::Sync(before)), Some(MethodCallback::Sync(after))) =
+                (original.method(name), decorated.method(name))
+            else {
+                panic!("Engine callbacks must remain native");
+            };
+            assert!(Arc::ptr_eq(before, after));
+            assert_eq!(
+                tokio::time::timeout(
+                    Duration::from_secs(1),
+                    decorated.call::<_, String>(name, RpcParams(json!([]))),
+                )
+                .await
+                .unwrap()
+                .unwrap(),
+                "native engine"
+            );
         }
     }
 
@@ -362,8 +537,12 @@ mod tests {
                     )),
                 )
                 .unwrap();
-            let decorated =
-                decorate(methods, router(Ok(if era == 0 { 50 } else { 110 }), None)).unwrap();
+            let decorated = decorate(
+                methods,
+                router(Ok(if era == 0 { 50 } else { 110 }), None),
+                RpcApi::Eth,
+            )
+            .unwrap();
             let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
             let mut extensions = Extensions::new();
             extensions.insert(42_u32);
