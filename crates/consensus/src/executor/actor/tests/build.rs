@@ -6,7 +6,7 @@ use std::{sync::Arc, time::Duration};
 use alloy_primitives::{B256, Bytes};
 use alloy_rpc_types_engine::{ForkchoiceState, PayloadStatusEnum};
 use commonware_macros::test_traced;
-use commonware_runtime::{Runner as _, deterministic};
+use commonware_runtime::deterministic;
 use eyre::eyre;
 use futures::FutureExt as _;
 use parking_lot::Mutex;
@@ -18,7 +18,7 @@ use super::harness::{
     ElCall, ForkchoiceStateExt as _, GENESIS, Harness, STARTUP_FCU, attributes, built_payload,
     make_block, round,
 };
-use crate::{consensus::Digest, executor::DeferredExtraData};
+use crate::{consensus::Digest, executor::DeferredExtraData, test_utils::TestRunner as _};
 
 #[test_traced]
 fn building_on_an_unfinalized_head_leaves_forkchoice_unchanged() {

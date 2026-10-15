@@ -3,14 +3,14 @@ use commonware_consensus::{
     simplex::types::Context,
     types::{Height, View},
 };
-use commonware_runtime::{Runner as _, deterministic};
+use commonware_runtime::deterministic;
 use commonware_utils::Acknowledgement as _;
 use futures::{StreamExt as _, executor::block_on};
 
 use commonware_consensus::Heightable as _;
 
 use super::{ExecutionTask, ExecutionTaskOutcome, ExecutionTaskType, Verification, WalkOwner};
-use crate::consensus::Digest;
+use crate::{consensus::Digest, test_utils::TestRunner as _};
 
 mod harness;
 

@@ -1,10 +1,10 @@
 use commonware_consensus::types::Epoch;
-use commonware_runtime::{Runner as _, Supervisor as _, deterministic::Runner};
+use commonware_runtime::{Supervisor as _, deterministic::Runner};
 
 use super::*;
 use crate::{
     storage::hybrid::test::utils::fresh_page_cache,
-    test_utils::{dkg_fixture, make_certificate},
+    test_utils::{TestRunner as _, dkg_fixture, make_certificate},
 };
 
 #[test]

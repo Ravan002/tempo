@@ -9,7 +9,7 @@ use commonware_consensus::{
 };
 use commonware_cryptography::certificate::Provider as _;
 use commonware_macros::test_traced;
-use commonware_runtime::{Clock as _, Runner as _, Supervisor as _, deterministic};
+use commonware_runtime::{Clock as _, Supervisor as _, deterministic};
 use commonware_utils::{Acknowledgement as _, acknowledgement::Exact};
 use tempo_chainspec::NetworkIdentity;
 use tempo_node::rpc::consensus::Event;
@@ -22,6 +22,7 @@ use crate::{
         make_certified_block, make_finalization,
     },
     gossip::{CertificateError, CertificateMailbox as _},
+    test_utils::TestRunner as _,
 };
 
 const WAIT_ATTEMPTS: usize = 100;

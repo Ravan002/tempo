@@ -610,7 +610,8 @@ impl Metrics {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use commonware_runtime::{Runner as _, deterministic};
+    use crate::test_utils::TestRunner as _;
+    use commonware_runtime::deterministic;
 
     #[test]
     fn future_header_waits_for_local_clock_before_certification() {

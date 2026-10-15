@@ -6,14 +6,14 @@
 
 use alloy_rpc_types_engine::{ForkchoiceState, PayloadStatusEnum};
 use commonware_macros::test_traced;
-use commonware_runtime::{Runner as _, deterministic};
+use commonware_runtime::deterministic;
 use tempo_primitives::ed25519::PublicKey;
 
 use super::harness::{
     ElCall, FakeMarshal, ForkchoiceStateExt as _, GENESIS, Harness, HarnessOptions, STARTUP_FCU,
     STARTUP_FCU_CALL, built_payload, make_block, make_block_with_proposer, round,
 };
-use crate::consensus::Digest;
+use crate::{consensus::Digest, test_utils::TestRunner as _};
 
 fn finalized_blocks_proposed_by_self(h: &Harness) -> u64 {
     h.metrics()

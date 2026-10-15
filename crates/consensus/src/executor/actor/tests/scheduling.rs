@@ -6,13 +6,14 @@ use std::time::Duration;
 
 use alloy_rpc_types_engine::{ForkchoiceState, PayloadStatusEnum};
 use commonware_macros::test_traced;
-use commonware_runtime::{Runner as _, Spawner as _, Supervisor as _, deterministic};
+use commonware_runtime::{Spawner as _, Supervisor as _, deterministic};
 use futures::future::Either;
 
 use super::harness::{
     ElCall, FakeExecution, ForkchoiceStateExt as _, GENESIS, Harness, HarnessOptions, STARTUP_FCU,
     STARTUP_FCU_CALL, built_payload, make_block, round,
 };
+use crate::test_utils::TestRunner as _;
 
 #[test_traced]
 fn newer_verification_waits_until_the_requester_cancels_the_active_build() {

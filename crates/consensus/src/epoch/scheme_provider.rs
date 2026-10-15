@@ -64,8 +64,11 @@ impl Provider for SchemeProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{config::NAMESPACE, test_utils::dkg_fixture};
-    use commonware_runtime::{Runner as _, deterministic};
+    use crate::{
+        config::NAMESPACE,
+        test_utils::{TestRunner as _, dkg_fixture},
+    };
+    use commonware_runtime::deterministic;
 
     #[test]
     fn registered_identity_allows_scheme_upgrades() {

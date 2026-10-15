@@ -1219,6 +1219,7 @@ impl ReducedBlock {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::TestRunner as _;
     use commonware_codec::Encode as _;
     use commonware_cryptography::{
         bls12381::{dkg::feldman_desmedt as dkg, primitives::sharing::Mode},
@@ -1226,7 +1227,7 @@ mod tests {
         transcript::Summary,
     };
     use commonware_math::algebra::Random as _;
-    use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
+    use commonware_runtime::{Supervisor as _, deterministic};
     use commonware_utils::TryFromIterator as _;
 
     fn make_test_state(rng: &mut impl rand_core::CryptoRng, epoch: u64) -> State {

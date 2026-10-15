@@ -4,7 +4,7 @@ use alloy_consensus::{BlockHeader as _, Sealable as _};
 use commonware_consensus::types::{Epoch, Height, Round};
 use commonware_cryptography::{Signer as _, certificate::Provider as _, transcript::Summary};
 use commonware_math::algebra::Random as _;
-use commonware_runtime::{Runner as _, Supervisor as _, deterministic::Runner};
+use commonware_runtime::{Supervisor as _, deterministic::Runner};
 use rand_core::CryptoRng;
 use tempo_chainspec::NetworkIdentity;
 use tempo_primitives::TempoHeader;
@@ -20,7 +20,7 @@ use crate::{
     consensus::Digest,
     epoch::SchemeProvider,
     gossip::Certificate,
-    test_utils::{DkgFixture, dkg_fixture, make_certificate},
+    test_utils::{DkgFixture, TestRunner as _, dkg_fixture, make_certificate},
 };
 
 fn identity(fixture: &DkgFixture) -> NetworkIdentity {

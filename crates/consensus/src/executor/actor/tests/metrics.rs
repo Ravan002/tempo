@@ -2,9 +2,10 @@
 
 use alloy_rpc_types_engine::{ForkchoiceState, PayloadStatusEnum};
 use commonware_macros::test_traced;
-use commonware_runtime::{Runner as _, deterministic};
+use commonware_runtime::deterministic;
 
 use super::harness::{ForkchoiceStateExt as _, GENESIS, Harness, built_payload, make_block, round};
+use crate::test_utils::TestRunner as _;
 
 fn gauge(h: &Harness, name: &str) -> i64 {
     let name = format!("executor_{name}");

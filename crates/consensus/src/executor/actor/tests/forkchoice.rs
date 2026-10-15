@@ -3,9 +3,10 @@
 use std::time::Duration;
 
 use commonware_macros::test_traced;
-use commonware_runtime::{Runner as _, deterministic};
+use commonware_runtime::deterministic;
 
 use super::harness::{GENESIS, Harness, STARTUP_FCU, make_block, round};
+use crate::test_utils::TestRunner as _;
 
 #[test_traced]
 fn unchanged_forkchoice_is_reaffirmed_every_eight_deliveries() {

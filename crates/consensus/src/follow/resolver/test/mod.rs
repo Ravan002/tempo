@@ -7,7 +7,7 @@ use commonware_codec::Encode as _;
 use commonware_consensus::{marshal::resolver::handler, types::Height};
 use commonware_macros::test_traced;
 use commonware_resolver::opaque::Fetcher as _;
-use commonware_runtime::{Metrics as _, Runner as _, deterministic};
+use commonware_runtime::{Metrics as _, deterministic};
 use futures::executor::block_on;
 use parking_lot::Mutex;
 use prometheus_client::metrics::counter::Counter;
@@ -18,6 +18,7 @@ use super::{
     Fetcher, MAX_RETRY_DELAY, NoopBlockNetwork, RETRY_STATE_TTL, RetryState, resolve_block,
     resolve_finalized,
 };
+use crate::test_utils::TestRunner as _;
 
 mod utils;
 use utils::{StubBlockNetwork, StubBlockProvider, StubUpstream, make_block, make_certified_block};

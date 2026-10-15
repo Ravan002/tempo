@@ -4,7 +4,7 @@
 //! reproduce and easy to get subtly wrong. Both the follower driver and the
 //! `tempo/1` actor need one, so it lives here rather than in either.
 
-use std::iter::repeat_with;
+use std::{future::Future, iter::repeat_with};
 
 use commonware_consensus::{
     simplex::{
@@ -23,7 +23,9 @@ use commonware_cryptography::{
 };
 use commonware_math::algebra::Random as _;
 use commonware_parallel::Sequential;
+use commonware_runtime::deterministic;
 use commonware_utils::{N3f1, TryFromIterator as _, ordered};
+use futures::future::LocalBoxFuture;
 use rand_core::CryptoRng;
 use tempo_dkg_onchain_artifacts::OnchainDkgOutcome;
 
@@ -91,4 +93,62 @@ pub(crate) fn make_certificate(
         &Sequential,
     )
     .expect("all test signers form a quorum")
+}
+
+/// Runs deterministic tests without compiling the runtime loop for each test future.
+pub(crate) trait TestRunner {
+    /// Starts the runtime with a type-erased root task, preserving borrowed test data.
+    fn start<'a, TTask, TFuture>(self, task: TTask) -> TFuture::Output
+    where
+        TTask: FnOnce(deterministic::Context) -> TFuture + 'a,
+        TFuture: Future + 'a;
+}
+
+impl TestRunner for deterministic::Runner {
+    fn start<'a, TTask, TFuture>(self, task: TTask) -> TFuture::Output
+    where
+        TTask: FnOnce(deterministic::Context) -> TFuture + 'a,
+        TFuture: Future + 'a,
+    {
+        // Erase both types: boxing only the future still instantiates the runtime
+        // once per closure passed to Runner::start.
+        let task: Box<
+            dyn FnOnce(deterministic::Context) -> LocalBoxFuture<'a, TFuture::Output> + 'a,
+        > = Box::new(move |context| Box::pin(task(context)));
+        commonware_runtime::Runner::start(self, task)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::{cell::Cell, rc::Rc, time::Duration};
+
+    use commonware_runtime::Clock as _;
+
+    #[test]
+    fn runner_preserves_borrowed_non_send_futures_and_outputs() {
+        let value = String::from("borrowed output");
+        let calls = Rc::new(Cell::new(0));
+        let output = deterministic::Runner::timed(Duration::from_secs(1)).start(|context| {
+            let value = &value;
+            let calls = &calls;
+            async move {
+                context.sleep(Duration::from_millis(1)).await;
+                calls.set(calls.get() + 1);
+                value.as_str()
+            }
+        });
+        assert_eq!(output, value);
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "root test panic")]
+    fn runner_propagates_panics() {
+        deterministic::Runner::default().start(|_| async {
+            panic!("root test panic");
+        });
+    }
 }

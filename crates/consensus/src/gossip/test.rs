@@ -17,7 +17,7 @@ use commonware_consensus::{
     types::{Epoch, Epocher as _, FixedEpocher, Height, Round, View},
 };
 use commonware_macros::test_traced;
-use commonware_runtime::{Clock as _, Runner as _, Supervisor as _, deterministic};
+use commonware_runtime::{Clock as _, Supervisor as _, deterministic};
 use commonware_utils::{Acknowledgement as _, acknowledgement::Exact};
 use parking_lot::Mutex;
 use tempo_node::gossip::{self, Frame, PeerControl, PeerEvent, TransportSender};
@@ -27,7 +27,7 @@ use super::{Certificate, CertificateError, CertificateMailbox, Marshal};
 use crate::{
     consensus::Digest,
     follow::test_utils::{EPOCH_LENGTH, make_block},
-    test_utils::{DkgFixture, dkg_fixture, make_certificate},
+    test_utils::{DkgFixture, TestRunner as _, dkg_fixture, make_certificate},
 };
 
 const WAIT_ATTEMPTS: usize = 200;

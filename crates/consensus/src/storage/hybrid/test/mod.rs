@@ -12,11 +12,14 @@
 pub(in crate::storage) mod utils;
 
 use commonware_macros::test_traced;
-use commonware_runtime::{Runner as _, Spawner, deterministic};
+use commonware_runtime::{Spawner, deterministic};
 use commonware_utils::NZU64;
 
 use super::*;
-use crate::{consensus::block::Error as BlockError, storage::PRUNABLE_ITEMS_PER_SECTION};
+use crate::{
+    consensus::block::Error as BlockError, storage::PRUNABLE_ITEMS_PER_SECTION,
+    test_utils::TestRunner as _,
+};
 use utils::{StubProvider, fresh_prunable_with_section_size, make_block, make_chain};
 
 /// Force every height into its own section so the prunable archive's

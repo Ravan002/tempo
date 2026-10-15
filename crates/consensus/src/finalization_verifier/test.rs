@@ -1,14 +1,17 @@
 use alloy_consensus::{BlockHeader as _, Header};
 use commonware_consensus::types::{Epoch, FixedEpocher};
 use commonware_macros::test_traced;
-use commonware_runtime::{Runner as _, deterministic};
+use commonware_runtime::deterministic;
 use reth_node_core::primitives::SealedBlock;
 use tempo_chainspec::NetworkIdentity;
 use tempo_primitives::{Block as TempoBlock, BlockBody, TempoHeader};
 
 use super::{Error, FinalizationVerifier};
-use crate::follow::test_utils::{
-    EPOCH_LENGTH, dkg_fixture, make_block, make_certified_block, make_finalization,
+use crate::{
+    follow::test_utils::{
+        EPOCH_LENGTH, dkg_fixture, make_block, make_certified_block, make_finalization,
+    },
+    test_utils::TestRunner as _,
 };
 
 #[test_traced]

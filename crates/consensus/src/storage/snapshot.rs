@@ -446,16 +446,19 @@ mod tests {
         types::{Epoch, Round, View},
     };
     use commonware_macros::test_traced;
-    use commonware_runtime::{Runner as _, deterministic};
+    use commonware_runtime::deterministic;
 
     use super::*;
-    use crate::storage::{
-        PRUNABLE_ITEMS_PER_SECTION,
-        hybrid::{
-            Prunable,
-            test::utils::{fresh_page_cache, fresh_prunable_with_section_size, make_chain},
+    use crate::{
+        storage::{
+            PRUNABLE_ITEMS_PER_SECTION,
+            hybrid::{
+                Prunable,
+                test::utils::{fresh_page_cache, fresh_prunable_with_section_size, make_chain},
+            },
+            init_finalizations_archive,
         },
-        init_finalizations_archive,
+        test_utils::TestRunner as _,
     };
 
     async fn fresh_archives(

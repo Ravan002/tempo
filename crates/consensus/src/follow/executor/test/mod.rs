@@ -12,14 +12,17 @@ use commonware_consensus::{
     types::{Epoch, FixedEpocher, Height, Round, View},
 };
 use commonware_macros::test_traced;
-use commonware_runtime::{Handle, Runner as _, Supervisor as _, deterministic};
+use commonware_runtime::{Handle, Supervisor as _, deterministic};
 use commonware_utils::{
     Acknowledgement as _,
     acknowledgement::{Exact, ExactWaiter},
 };
 
 use super::*;
-use crate::consensus::{Digest, block::Block};
+use crate::{
+    consensus::{Digest, block::Block},
+    test_utils::TestRunner as _,
+};
 use utils::{StubExecutionProvider, StubMarshal, make_block, make_block_at_round};
 
 const EPOCH_LENGTH: NonZeroU64 = NonZeroU64::new(10).expect("epoch length is nonzero");

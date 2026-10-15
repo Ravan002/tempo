@@ -13,12 +13,13 @@ use commonware_cryptography::{
     },
     ed25519::PrivateKey,
 };
-use commonware_runtime::{Runner as _, Supervisor as _, deterministic::Runner};
+use commonware_runtime::{Supervisor as _, deterministic::Runner};
 use commonware_utils::{TryFromIterator as _, ordered, ordered::Quorum as _};
 use rand::{SeedableRng as _, rngs::StdRng};
 use tempo_primitives::TempoConsensusContext;
 
 use super::*;
+use crate::test_utils::TestRunner as _;
 use harness::{
     EpochEvent, Harness, StubExecutionProvider, TestNetwork, block, dkg_state, header,
     outcome_header, parent_block, revealed_recovery_fixture, signed_dealer_logs,

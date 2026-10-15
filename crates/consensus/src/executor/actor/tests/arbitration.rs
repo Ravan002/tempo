@@ -6,10 +6,10 @@ use std::time::Duration;
 
 use alloy_rpc_types_engine::PayloadStatusEnum;
 use commonware_macros::test_traced;
-use commonware_runtime::{Runner as _, deterministic};
+use commonware_runtime::deterministic;
 
 use super::harness::{GENESIS, Harness, built_payload, make_block, round};
-use crate::consensus::Digest;
+use crate::{consensus::Digest, test_utils::TestRunner as _};
 
 #[test_traced]
 fn queued_verification_runs_after_a_newer_build() {

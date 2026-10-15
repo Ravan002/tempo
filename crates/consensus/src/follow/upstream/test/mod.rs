@@ -6,11 +6,11 @@ use std::time::Duration;
 
 use alloy_primitives::B256;
 use commonware_macros::test_traced;
-use commonware_runtime::{Clock as _, Runner as _, Spawner as _, Supervisor as _, deterministic};
+use commonware_runtime::{Clock as _, Spawner as _, Supervisor as _, deterministic};
 use tempo_node::rpc::consensus::Event;
 
 use super::actor;
-use crate::consensus::Digest;
+use crate::{consensus::Digest, test_utils::TestRunner as _};
 use utils::{StubClient, StubConnector, StubReporter};
 
 const WAIT_ATTEMPTS: usize = 100;

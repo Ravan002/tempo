@@ -483,7 +483,7 @@ mod tests {
         ed25519::PrivateKey,
     };
     use commonware_p2p::{PeerSetSubscription, TrackedPeers};
-    use commonware_runtime::{Runner as _, deterministic::Runner};
+    use commonware_runtime::deterministic::Runner;
     use commonware_utils::{N3f1, TryFromIterator as _};
     use rand::SeedableRng as _;
     use reth_ethereum::evm::revm::{State, database::StateProviderDatabase};
@@ -499,6 +499,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::test_utils::TestRunner as _;
 
     const VALIDATOR_CONFIG_V2_ADDRESS: AlloyAddress =
         alloy_primitives::address!("0xCCCCCCCC00000000000000000000000000000001");

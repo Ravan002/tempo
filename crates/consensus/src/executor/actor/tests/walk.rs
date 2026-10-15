@@ -4,9 +4,10 @@ use std::{sync::Arc, time::Duration};
 
 use alloy_rpc_types_engine::PayloadStatusEnum;
 use commonware_macros::test_traced;
-use commonware_runtime::{Runner as _, deterministic};
+use commonware_runtime::deterministic;
 
 use super::harness::{FakeExecution, GENESIS, Harness, built_payload, make_block, round};
+use crate::test_utils::TestRunner as _;
 
 #[test_traced]
 fn valid_candidate_leaves_its_parent_for_independent_delivery() {
