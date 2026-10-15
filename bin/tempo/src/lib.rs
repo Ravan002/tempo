@@ -927,9 +927,9 @@ mod tests {
     #[test]
     fn node_sync_mode_defaults_to_safe_no_sync() {
         for (args, expected) in [
-            (&["tempo", "node"][..], SyncMode::SafeNoSync),
+            (&["tempo", "node", "--dev"][..], SyncMode::SafeNoSync),
             (
-                &["tempo", "node", "--db.sync-mode", "durable"][..],
+                &["tempo", "node", "--dev", "--db.sync-mode", "durable"][..],
                 SyncMode::Durable,
             ),
         ] {
