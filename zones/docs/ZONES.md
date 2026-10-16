@@ -194,7 +194,7 @@ You can also run the xtask directly for more control. Set `ZONE_FACTORY_OWNER_KE
 invocation instead of passing a key argument:
 
 ```bash
-ZONE_FACTORY_OWNER_KEY="$SEQUENCER_KEY" cargo run -p tempo-xtask -- create-zone \
+ZONE_FACTORY_OWNER_KEY="$SEQUENCER_KEY" cargo zone-xtask create-zone \
   --output generated/my-zone \
   --initial-token 0x20c0000000000000000000000000000000000001 \
   --admin "$ADMIN_ADDR" \
@@ -212,7 +212,7 @@ command. First, replace `ZONE_FACTORY_OWNER_KEY` with `--safe-address` and `--sa
 
 ```bash
 unset ZONE_FACTORY_OWNER_KEY
-cargo run -p tempo-xtask -- create-zone \
+cargo zone-xtask create-zone \
   --output generated/my-zone \
   --l1-rpc-url https://rpc.tempo.xyz \
   --zone-factory 0x5aF2000000000000000000000000000000000000 \
@@ -237,7 +237,7 @@ transaction executes. After execution, rerun the same command with the execution
 hash in place of the Safe options (the first run prints this command):
 
 ```bash
-cargo run -p tempo-xtask -- create-zone \
+cargo zone-xtask create-zone \
   --output generated/my-zone \
   ...same zone arguments... \
   --creation-tx 0x<execution-tx-hash>
@@ -265,7 +265,7 @@ just set-access-mode true
 just set-gateway-mode true
 ```
 
-If the portal admin is a Safe, have `tempo-xtask` simulate each call from the Safe and
+If the portal admin is a Safe, have `tempo-zone-xtask` simulate each call from the Safe and
 create an unsigned Safe Transaction Builder file instead of setting `ADMIN_KEY`:
 
 ```bash
@@ -274,11 +274,11 @@ export L1_PORTAL_ADDRESS=0x<portal>
 export SAFE_ADDRESS=0x<safe>
 unset ADMIN_KEY
 
-cargo run -p tempo-xtask -- set-allowed-account 0x<account> --allowed \
+cargo zone-xtask set-allowed-account 0x<account> --allowed \
   --safe-address "$SAFE_ADDRESS" \
   --safe-output allow-account.json
 
-cargo run -p tempo-xtask -- set-gateway 0x<gateway> --allowed \
+cargo zone-xtask set-gateway 0x<gateway> --allowed \
   --safe-address "$SAFE_ADDRESS" \
   --safe-output allow-gateway.json
 ```
@@ -373,7 +373,7 @@ Encrypted deposits hide the recipient address and memo on-chain using ECIES encr
 ```bash
 # The sequencer must first register their encryption key (done automatically by deploy-zone)
 # For manual setup:
-PRIVATE_KEY="$SEQUENCER_KEY" cargo run -p tempo-xtask -- set-encryption-key \
+PRIVATE_KEY="$SEQUENCER_KEY" cargo zone-xtask set-encryption-key \
   --portal "$L1_PORTAL_ADDRESS" \
   --l1-rpc-url "$L1_RPC_URL"
 
@@ -383,7 +383,7 @@ just send-deposit 1000000 <recipient-address>   # to a specific address
 ```
 
 For shared-key rotations, pass the currently deployed
-`--deposit-decryption-keys-file` to `tempo-xtask admin encryption-key prepare`
+`--deposit-decryption-keys-file` to `tempo-zone-xtask admin encryption-key prepare`
 with `--existing-decryption-keys-file`. Deploy its merged output before
 registering the replacement encryption key, restart every node that may
 sequence, and confirm the nodes are healthy. Keep every previous key in the
@@ -564,11 +564,11 @@ just enable-token alphausd
 
 If `ZONE_RPC_URL` is set (defaults to `http://localhost:8546`), the command waits for the zone to process the L1 block and confirms the token is available on L2.
 
-To perform only the L1 portal update through `tempo-xtask`, use the same address or alias:
+To perform only the L1 portal update through `tempo-zone-xtask`, use the same address or alias:
 
 ```bash
-cargo run -p tempo-xtask -- enable-token <token-address>
-cargo run -p tempo-xtask -- enable-token alphausd
+cargo zone-xtask enable-token <token-address>
+cargo zone-xtask enable-token alphausd
 ```
 
 The xtask waits for the L1 receipt and verifies `ZonePortal.isTokenEnabled`, but unlike the
@@ -577,7 +577,7 @@ portal admin is a Safe, create an unsigned Transaction Builder proposal instead:
 
 ```bash
 unset ADMIN_KEY
-cargo run -p tempo-xtask -- enable-token <token-address> \
+cargo zone-xtask enable-token <token-address> \
   --safe-address 0x<safe> \
   --safe-output enable-token.json
 ```
@@ -616,7 +616,10 @@ The verifier derives the Zone and Portal from the router, finds the Zone's deplo
 reconstructs the current role and enabled-token sets from Portal events through one pinned L1 block.
 It requires the Earn router to be the only `CallbackGateway` and the boundary-crossing tokens
 (`privateAsset` and `earnShare`) to be the exact enabled-token set with active deposits. The vault
-asset remains on L1 and is not Portal-enabled unless it is also the private asset. The current
+asset remains on L1 and is not Portal-enabled unless it is also the private asset. It also requires
+the router's conversion pool to pair exactly the private asset with the vault asset, a nonzero
+customer ID, and the router's admission as the pool's taker and recipient; the pool's pause state,
+par status, and per-flow liquidity are printed for review rather than failing the check. The current
 `Account` role set is printed in sorted order and must be compared manually with the approved
 deployment record; account membership is not part of the automated pass/fail result. Verification
 performs no transactions and requires no private key.
@@ -670,22 +673,24 @@ just check-authorized 2 0x<address-to-block>
 
 This is useful for verifying that transfer-policy enforcement works end-to-end across L1 and L2, or for demoing the blacklist feature to others.
 
+From `zones/` (recipe arguments are resolved from the repository root):
+
 ```bash
 export PRIVATE_KEY="0x<token-admin-and-depositor-private-key>"
 export L1_PORTAL_ADDRESS=$(jq -r '.portal' generated/my-zone/zone.json)
-# If generated/*/zone.json does not contain the matching adminKey, set ADMIN_KEY
+# If zones/generated/*/zone.json does not contain the matching adminKey, set ADMIN_KEY
 # to the private key for the portal's on-chain admin.
 
 just demo-blacklist              # default deposit amount = 500,000
 just demo-blacklist 1000000      # custom deposit amount
-just demo-blacklist 500000 http://localhost:8546 generated/my-zone  # explicit metadata directory
+just demo-blacklist 500000 http://localhost:8546 zones/generated/my-zone  # explicit metadata directory
 ```
 
 The demo walks through 9 steps, printing every transaction with an explorer link:
 
 1. **Create token** — deploys a fresh TIP-20 "DemoUSD" via `TIP20Factory` (random salt each run)
 2. **Configure token** — sets supply cap, grants `ISSUER_ROLE`, mints tokens, approves portal
-3. **Enable on zone** — portal admin calls `enableToken` on the portal (uses `ADMIN_KEY`, or auto-discovers the matching `generated/<name>/zone.json` and reads `adminKey` with `sequencerKey` as a legacy fallback)
+3. **Enable on zone** — portal admin calls `enableToken` on the portal (uses `ADMIN_KEY`, or auto-discovers the matching `zones/generated/<name>/zone.json` and reads `adminKey` with `sequencerKey` as a legacy fallback)
 4. **Deposit** — plain deposit so the `PRIVATE_KEY` wallet has L2 funds
 5. **Blacklist** — creates a TIP-403 blacklist policy, adds a fresh target wallet, assigns the policy to the token
 6. **Deposit → bounce** — sends a deposit to the blacklisted target; zone rejects it and returns funds to sender
@@ -693,7 +698,7 @@ The demo walks through 9 steps, printing every transaction with an explorer link
 8. **Deposit → success** — the same deposit now goes through
 9. **Withdraw** — target withdraws tokens from zone back to L1
 
-Prerequisites: a running zone with the sequencer producing blocks, the `PRIVATE_KEY` wallet funded with pathUSD on L1, and portal admin authority available via `ADMIN_KEY` or a saved `adminKey` in the matching `generated/<name>/zone.json` (the demo deposits a small amount to the target for L2 gas fees).
+Prerequisites: a running zone with the sequencer producing blocks, the `PRIVATE_KEY` wallet funded with pathUSD on L1, and portal admin authority available via `ADMIN_KEY` or a saved `adminKey` in the matching `zones/generated/<name>/zone.json` (the demo deposits a small amount to the target for L2 gas fees).
 
 ## Architecture
 
@@ -817,6 +822,13 @@ cast code 0x5A4d000000000000000000000000000000000000 --rpc-url "$ETH_RPC_URL"
 | `ZONE_FACTORY` | No | Optional ZoneFactory override; xtasks default to the current Moderato shared deployment |
 
 ## Justfile Commands Reference
+
+Run these commands from `zones/` with `just <recipe>`, or from the repository root
+with `just --justfile zones/Justfile <recipe>`. Recipes use the repository root as
+their working directory and keep generated zone data under `zones/generated/` and
+localnet data under `zones/localnet/`. Explicit path arguments are relative to the
+repository root. The former Bun docs recipes were retired because the docs app
+was not imported; the Markdown guides remain under `zones/docs/`.
 
 | Command | Description |
 |---------|-------------|

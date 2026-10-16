@@ -9,11 +9,6 @@ test-threads = "num-cpus"
 [profile.ci.junit]
 path = "junit.xml"
 
-# Treat timeout as success while debugging snapshot-restart flakiness.
-[[profile.ci.overrides]]
-filter = "test(can_restart_after_joining_from_snapshot)"
-slow-timeout = { period = "3m", terminate-after = 3, on-timeout = "pass" }
-
 # Heavy e2e tests that flake under resource contention — run exclusively.
 # threads-required = "num-test-threads" reserves all slots, so no other test runs concurrently.
 # Scheduled last to avoid blocking the rest of the suite.
@@ -74,4 +69,15 @@ threads-required = 4
 
 [[profile.default.overrides]]
 filter = "package(tempo-node) & binary(it)"
+threads-required = 4
+
+# Integration tests spin up full reth nodes — limit concurrency to avoid
+# resource contention and flaky timeouts on CI runners.
+[[profile.ci.overrides]]
+filter = """
+  package(/^zone-/) & (
+    test(/^(e2e|earn_zone_e2e|l1_e2e|network_chaos_e2e|network_chaos_p2p_e2e|restart_e2e|handoff_e2e)::/) |
+    test(advance_tempo)
+  )
+"""
 threads-required = 4

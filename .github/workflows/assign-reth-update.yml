@@ -1,0 +1,32 @@
+name: Assign reth update PRs
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, reopened]
+
+permissions: {}
+
+jobs:
+  assign:
+    if: >-
+      github.repository == 'tempoxyz/tempo' &&
+      github.event.pull_request.user.login == 'tempo-github-sts[bot]' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.head_ref == 'reth-auto-bump'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      pull-requests: write
+      id-token: write
+    steps:
+      - name: Secure runner
+        uses: tempoxyz/gh-actions/actions/secure-runner@4bc46b3c01e558d32a3f5643f625d39ffb1cb2ef # 2026-10-16T08-51-40Z-4bc46b3c
+      - name: Assign update PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: >-
+          gh api --method POST
+          "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/assignees"
+          -f 'assignees[]=grandizzy' --silent

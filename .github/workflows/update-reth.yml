@@ -13,12 +13,10 @@ concurrency:
 
 jobs:
   update:
-    # Configure the reviewed image/environment before enabling the replacement.
     if: >-
       github.repository == 'tempoxyz/tempo' &&
-      github.ref == 'refs/heads/main' &&
-      vars.UPDATE_RETH_WORKER_IMAGE != ''
-    uses: tempoxyz/gh-actions/.github/workflows/dependency-update.yml@6f27dbf672a2782168ef8aa2f9b87b3cef503cb9 # gh-actions#338
+      github.ref == 'refs/heads/main'
+    uses: tempoxyz/gh-actions/.github/workflows/dependency-update.yml@4bc46b3c01e558d32a3f5643f625d39ffb1cb2ef # 2026-10-16T08-51-40Z-4bc46b3c
     permissions:
       contents: read
       actions: read
@@ -28,15 +26,14 @@ jobs:
       adapter-script: scripts/prepare_reth_update.py
       requested-ref: main
       sts-policy: update-reth
-      environment: dependency-updates
-      worker-image: ${{ vars.UPDATE_RETH_WORKER_IMAGE }}
       runner: depot-ubuntu-latest-32
-      worker-memory: 12g
+      rust-toolchains: |
+        1.99.0
+        nightly-2026-10-02
       local-checks: |
         cargo +nightly-2026-10-02 fmt --all --check
         cargo +nightly-2026-10-02 clippy --all-targets --all-features --locked -- -D warnings
         cargo nextest run --profile ci --locked --no-run
-        zepter run check
       allowed-paths: |
         Cargo.toml
         Cargo.lock
@@ -56,14 +53,14 @@ jobs:
         .github/workflows/publish-check.yml
         .github/workflows/semver-check.yml
       repair-instructions: |
-        Migrate Tempo to the selected reth APIs. Run zepter to fix feature wiring if needed.
+        Migrate Tempo to the selected reth APIs and preserve Cargo feature wiring.
+        Zepter remains enforced by the required lint workflow.
         Non-reth dependency versions may change when necessary.
         Preserve protocol invariants and tests; do not suppress warnings or modify reth Git sources.
       max-local-repairs: 10
       max-ci-repairs: 10
-      repair-budget-minutes: 120
     secrets:
-      AMP_API_KEY: ${{ secrets.AMP_API_KEY }}
+      CODEX_API_KEY: ${{ secrets.CODEX_API_KEY }}
 
   follow-ups:
     needs: update
@@ -76,10 +73,10 @@ jobs:
       id-token: write
     steps:
       - name: Secure runner
-        uses: tempoxyz/gh-actions/actions/secure-runner@e813067e922303348ee5aad965f745803cc24f1f # 2026-10-02T09-56-31Z-e813067e
+        uses: tempoxyz/gh-actions/actions/secure-runner@4bc46b3c01e558d32a3f5643f625d39ffb1cb2ef # 2026-10-16T08-51-40Z-4bc46b3c
       - name: Fetch follow-up token via STS
         id: sts
-        uses: tempoxyz/gh-actions/actions/github-sts@e813067e922303348ee5aad965f745803cc24f1f # 2026-10-02T09-56-31Z-e813067e
+        uses: tempoxyz/gh-actions/actions/github-sts@4bc46b3c01e558d32a3f5643f625d39ffb1cb2ef # 2026-10-16T08-51-40Z-4bc46b3c
         with:
           policy: update-reth-followups
           ttl: 15m
@@ -104,7 +101,7 @@ jobs:
     permissions:
       contents: read
       id-token: write
-    uses: ./.github/workflows/bench-e2e.yml
+    uses: ./.github/workflows/bench-e2e.yml # zizmor: ignore[self-repository] actionlint does not support $/ references yet.
     with:
       pr: ${{ needs.update.outputs.pull-request-number }}
       actor: tempo-github-sts[bot]
@@ -113,7 +110,7 @@ jobs:
       max-concurrent-requests: "500"
       run-pairs: "2"
       run-type: comment
-      no-slack: ${{ 'false' }}
+      no-slack: ${{ 'false' }} # zizmor: ignore[obfuscation] actionlint treats a literal false as boolean; the reusable input is a string.
       feature: ${{ needs.update.outputs.head-sha }}
       pr-head-sha: ${{ needs.update.outputs.head-sha }}
       pr-head-ref: reth-auto-bump
@@ -140,7 +137,7 @@ jobs:
       id-token: write
     steps:
       - name: Secure runner
-        uses: tempoxyz/gh-actions/actions/secure-runner@e813067e922303348ee5aad965f745803cc24f1f # 2026-10-02T09-56-31Z-e813067e
+        uses: tempoxyz/gh-actions/actions/secure-runner@4bc46b3c01e558d32a3f5643f625d39ffb1cb2ef # 2026-10-16T08-51-40Z-4bc46b3c
       - name: Alert reth on-call
         env:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BENCH_BOT_TOKEN }}
