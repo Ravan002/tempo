@@ -596,11 +596,6 @@ where
         let chain_spec = FullNodeComponents::provider(ctx.components).chain_spec();
         let eth_api = ctx
             .eth_api_builder()
-            .modify_gas_oracle_config(|config| {
-                // Include zero-tip transactions regardless of the Reth SDK defaults.
-                config.ignore_price = Some(U256::ZERO);
-                config.default_suggested_fee = Some(U256::ZERO);
-            })
             .map_converter(|_| RpcConverter::new(TempoReceiptConverter::new(chain_spec)).erased())
             .build();
 
