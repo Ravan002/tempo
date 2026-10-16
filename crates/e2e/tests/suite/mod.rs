@@ -9,7 +9,6 @@ use crate::{
 mod backfill;
 mod consensus_context;
 mod dkg;
-mod linkage;
 mod metrics;
 mod restart;
 mod simple;
