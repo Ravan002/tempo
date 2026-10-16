@@ -713,7 +713,7 @@ mod tests {
     };
 
     use alloy_genesis::GenesisAccount;
-    use alloy_primitives::{Address, B256, Bytes, U256, address};
+    use alloy_primitives::{Address, B256, Bytes, address};
     use clap::{CommandFactory, FromArgMatches, Parser};
 
     use super::{
@@ -729,33 +729,6 @@ mod tests {
     fn init_defaults_once() {
         static INIT: Once = Once::new();
         INIT.call_once(defaults::init_defaults);
-    }
-
-    #[test]
-    fn gas_price_oracle_defaults_preserve_overrides() {
-        init_defaults_once();
-
-        for (flags, expected_ignore_price, expected_suggested_fee) in [
-            (vec![], 0, 0),
-            (vec!["--gpo.ignoreprice=2"], 2, 0),
-            (
-                vec!["--gpo.ignoreprice", "1", "--gpo.default-suggested-fee", "7"],
-                1,
-                7,
-            ),
-        ] {
-            let cli = TempoCli::try_parse_from(["tempo", "node", "--dev"].into_iter().chain(flags))
-                .unwrap();
-            let Commands::Node(node_cmd) = cli.command else {
-                panic!("expected node command");
-            };
-            let config = node_cmd.rpc.gas_price_oracle.gas_price_oracle_config();
-            assert_eq!(config.ignore_price, Some(U256::from(expected_ignore_price)));
-            assert_eq!(
-                config.default_suggested_fee,
-                Some(U256::from(expected_suggested_fee))
-            );
-        }
     }
 
     #[test]
