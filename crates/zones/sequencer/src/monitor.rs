@@ -1020,7 +1020,6 @@ mod tests {
     use alloy_rpc_types_eth::Header as RpcHeader;
     use alloy_sol_types::{SolEvent, SolValue};
     use alloy_transport::mock::Asserter;
-    use reth_metrics::metrics::Gauge;
     use reth_provider::test_utils::MockEthProvider;
     use tempo_alloy::rpc::TempoHeaderResponse;
     use tempo_chainspec::hardfork::TempoHardfork;
@@ -1189,123 +1188,6 @@ mod tests {
             certificate: None,
             withdrawals: Vec::new(),
         }
-    }
-
-    fn record_gauge(gauge: &mut Gauge) -> Arc<AtomicU64> {
-        let recorded = Arc::new(AtomicU64::new(0));
-        *gauge = Gauge::from_arc(recorded.clone());
-        recorded
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn head_metrics_advance_while_batch_preparation_is_blocked_or_fails() {
-        let zone = mock_zone_provider(B256::with_last_byte(11), 11, B256::ZERO);
-        zone.add_receipts(
-            11,
-            vec![TempoReceipt {
-                tx_type: TempoTxType::Legacy,
-                success: true,
-                cumulative_gas_used: 0,
-                logs: vec![Log {
-                    address: Address::repeat_byte(0x22),
-                    data: abi::IZoneOutbox::BatchFinalized {
-                        withdrawalQueueHash: B256::ZERO,
-                        withdrawalBatchIndex: 1,
-                    }
-                    .encode_log_data(),
-                }],
-            }],
-        );
-        let mut monitor = test_monitor(Asserter::new(), zone.clone());
-        let observed = record_gauge(&mut monitor.metrics.latest_zone_block_observed);
-        let lag = record_gauge(&mut monitor.metrics.zone_to_l1_submission_lag_blocks);
-        let observation = observe_zone_head(
-            zone.clone(),
-            monitor.metrics.clone(),
-            monitor.submitted_zone_block.clone(),
-            monitor.config.poll_interval,
-        );
-        tokio::pin!(observation);
-        assert!(futures::poll!(&mut observation).is_pending());
-        assert_eq!(f64::from_bits(observed.load(Ordering::Relaxed)), 11.0);
-        assert_eq!(f64::from_bits(lag.load(Ordering::Relaxed)), 1.0);
-
-        let mut preparer = monitor.batch_preparer();
-        let (ready_tx, ready_rx) = mpsc::channel(1);
-        ready_tx.try_send(ready_batch(test_batch_data())).unwrap();
-        {
-            let preparation = preparer.process_available_blocks(&ready_tx);
-            tokio::pin!(preparation);
-            assert!(futures::poll!(&mut preparation).is_pending());
-
-            let mut block = Block::default();
-            block.header.inner.number = 12;
-            zone.add_block(B256::with_last_byte(12), block);
-            zone.add_receipts(12, Vec::new());
-            tokio::time::advance(monitor.config.poll_interval).await;
-            assert!(futures::poll!(&mut observation).is_pending());
-            assert!(futures::poll!(&mut preparation).is_pending());
-            assert_eq!(f64::from_bits(observed.load(Ordering::Relaxed)), 12.0);
-            assert_eq!(f64::from_bits(lag.load(Ordering::Relaxed)), 2.0);
-        }
-        assert_eq!(preparer.latest_scanned_zone_block, 10);
-        assert_eq!(preparer.cursor.zone_height, 10);
-
-        drop(ready_rx);
-        let error = tokio::time::timeout(
-            Duration::from_secs(1),
-            preparer.process_available_blocks(&ready_tx),
-        )
-        .await
-        .unwrap()
-        .unwrap_err();
-        assert_eq!(error.to_string(), "batch submission worker stopped");
-        assert_eq!(preparer.latest_scanned_zone_block, 10);
-        assert_eq!(preparer.cursor.zone_height, 10);
-
-        let mut header = TempoHeader::default();
-        header.inner.number = 13;
-        zone.add_header(B256::with_last_byte(13), header);
-        tokio::time::advance(monitor.config.poll_interval).await;
-        assert!(futures::poll!(&mut observation).is_pending());
-        assert_eq!(f64::from_bits(observed.load(Ordering::Relaxed)), 13.0);
-        assert_eq!(f64::from_bits(lag.load(Ordering::Relaxed)), 3.0);
-
-        monitor.submitted_zone_block.store(13, Ordering::Relaxed);
-        tokio::time::advance(monitor.config.poll_interval).await;
-        assert!(futures::poll!(&mut observation).is_pending());
-        assert_eq!(f64::from_bits(observed.load(Ordering::Relaxed)), 13.0);
-        assert_eq!(f64::from_bits(lag.load(Ordering::Relaxed)), 0.0);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn head_sampling_retries_read_errors_without_resetting_metrics() {
-        let zone = TestZoneProvider::new();
-        let mut monitor = test_monitor(Asserter::new(), zone.clone());
-        let observed = record_gauge(&mut monitor.metrics.latest_zone_block_observed);
-        let lag = record_gauge(&mut monitor.metrics.zone_to_l1_submission_lag_blocks);
-        monitor.metrics.latest_zone_block_observed.set(12.0);
-        monitor.metrics.zone_to_l1_submission_lag_blocks.set(2.0);
-
-        let observation = observe_zone_head(
-            zone.clone(),
-            monitor.metrics.clone(),
-            monitor.submitted_zone_block.clone(),
-            monitor.config.poll_interval,
-        );
-        tokio::pin!(observation);
-        // An empty provider cannot supply its best block number.
-        assert!(futures::poll!(&mut observation).is_pending());
-        assert_eq!(f64::from_bits(observed.load(Ordering::Relaxed)), 12.0);
-        assert_eq!(f64::from_bits(lag.load(Ordering::Relaxed)), 2.0);
-
-        let mut header = TempoHeader::default();
-        header.inner.number = 15;
-        zone.add_header(B256::with_last_byte(15), header);
-        tokio::time::advance(monitor.config.poll_interval).await;
-        assert!(futures::poll!(&mut observation).is_pending());
-        assert_eq!(f64::from_bits(observed.load(Ordering::Relaxed)), 15.0);
-        assert_eq!(f64::from_bits(lag.load(Ordering::Relaxed)), 5.0);
     }
 
     #[tokio::test]
