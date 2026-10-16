@@ -7,6 +7,7 @@
 //! must not secure funds.
 
 pub mod ecdsa;
+pub mod ecdsa_fast;
 pub mod policy;
 pub mod relation;
 
@@ -29,7 +30,7 @@ pub struct Authorizer {
 impl Authorizer {
     /// Builds the profile's constraint system.
     pub fn new(profile: Profile) -> Result<Self, Error> {
-        ecdsa::prepare();
+        ecdsa_fast::prepare();
         let system = CircuitProofSystem::new(
             PrivateAuthorization {
                 profile,

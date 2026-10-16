@@ -6,6 +6,9 @@
 //! are a [`Curve`] parameter for the moduli, `a`, `b`, and generator, and the
 //! removal of the upstream tests. The Freigen soundness proofs cover the
 //! P-256 instantiation only; the secp256k1 instantiation is unverified.
+//!
+//! The relation now uses the optimized verifier in [`crate::ecdsa_fast`], which
+//! reuses this module's lazy-representative primitives and hint arithmetic.
 
 use std::array;
 use std::cmp::Ordering;
@@ -35,51 +38,51 @@ pub const VERIFY_DIGEST_R1CS_ROWS: usize = 7_061;
 /// The widest values are products of 262-bit affine-formula operands.
 pub const P256_Z_LIMBS: usize = 9;
 
-const WIDTH: usize = 256;
-const WORD_LIMBS: usize = 4;
+pub(crate) const WIDTH: usize = 256;
+pub(crate) const WORD_LIMBS: usize = 4;
 
-type P256Z<CS> = <CS as Circuit>::Z<P256_Z_LIMBS>;
-type P256Coefficient<CS> = <CS as Circuit>::Coefficient<P256_Z_LIMBS>;
-type S = num_bigint::BigUint;
+pub(crate) type P256Z<CS> = <CS as Circuit>::Z<P256_Z_LIMBS>;
+pub(crate) type P256Coefficient<CS> = <CS as Circuit>::Coefficient<P256_Z_LIMBS>;
+pub(crate) type S = num_bigint::BigUint;
 
-fn parse_hex(hex: &[u8]) -> S {
+pub(crate) fn parse_hex(hex: &[u8]) -> S {
     S::parse_bytes(hex, 16).unwrap()
 }
-static P256_BASE: LazyLock<S> = LazyLock::new(|| {
+pub(crate) static P256_BASE: LazyLock<S> = LazyLock::new(|| {
     parse_hex(b"ffffffff00000001000000000000000000000000ffffffffffffffffffffffff")
 });
 
-static P256_SCALAR: LazyLock<S> = LazyLock::new(|| {
+pub(crate) static P256_SCALAR: LazyLock<S> = LazyLock::new(|| {
     parse_hex(b"ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551")
 });
 
-static P256_B: LazyLock<S> = LazyLock::new(|| {
+pub(crate) static P256_B: LazyLock<S> = LazyLock::new(|| {
     parse_hex(b"5ac635d8aa3a93e7b3ebbd55769886bc651d06b0cc53b0f63bce3c3e27d2604b")
 });
 
-static P256_GX: LazyLock<S> = LazyLock::new(|| {
+pub(crate) static P256_GX: LazyLock<S> = LazyLock::new(|| {
     parse_hex(b"6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296")
 });
 
-static P256_GY: LazyLock<S> = LazyLock::new(|| {
+pub(crate) static P256_GY: LazyLock<S> = LazyLock::new(|| {
     parse_hex(b"4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5")
 });
 
-static K1_BASE: LazyLock<S> = LazyLock::new(|| {
+pub(crate) static K1_BASE: LazyLock<S> = LazyLock::new(|| {
     parse_hex(b"fffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc2f")
 });
 
-static K1_SCALAR: LazyLock<S> = LazyLock::new(|| {
+pub(crate) static K1_SCALAR: LazyLock<S> = LazyLock::new(|| {
     parse_hex(b"fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141")
 });
 
-static K1_B: LazyLock<S> = LazyLock::new(|| S::from(7_u64));
+pub(crate) static K1_B: LazyLock<S> = LazyLock::new(|| S::from(7_u64));
 
-static K1_GX: LazyLock<S> = LazyLock::new(|| {
+pub(crate) static K1_GX: LazyLock<S> = LazyLock::new(|| {
     parse_hex(b"79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
 });
 
-static K1_GY: LazyLock<S> = LazyLock::new(|| {
+pub(crate) static K1_GY: LazyLock<S> = LazyLock::new(|| {
     parse_hex(b"483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8")
 });
 
@@ -93,14 +96,14 @@ pub enum Curve {
 }
 
 impl Curve {
-    fn base(self) -> Modulus {
+    pub(crate) fn base(self) -> Modulus {
         match self {
             Self::P256 => Modulus::P256Base,
             Self::Secp256k1 => Modulus::K1Base,
         }
     }
 
-    fn scalar(self) -> Modulus {
+    pub(crate) fn scalar(self) -> Modulus {
         match self {
             Self::P256 => Modulus::P256Scalar,
             Self::Secp256k1 => Modulus::K1Scalar,
@@ -108,11 +111,11 @@ impl Curve {
     }
 
     /// Whether `a = -3`; otherwise `a = 0`.
-    fn a_is_minus_three(self) -> bool {
+    pub(crate) fn a_is_minus_three(self) -> bool {
         self == Self::P256
     }
 
-    fn b(self) -> &'static S {
+    pub(crate) fn b(self) -> &'static S {
         match self {
             Self::P256 => &P256_B,
             Self::Secp256k1 => &K1_B,
@@ -134,7 +137,7 @@ impl Curve {
 }
 
 #[derive(Clone, Copy)]
-enum Modulus {
+pub(crate) enum Modulus {
     P256Base,
     P256Scalar,
     K1Base,
@@ -142,7 +145,7 @@ enum Modulus {
 }
 
 impl Modulus {
-    fn value(self) -> &'static S {
+    pub(crate) fn value(self) -> &'static S {
         match self {
             Self::P256Base => &P256_BASE,
             Self::P256Scalar => &P256_SCALAR,
@@ -151,7 +154,7 @@ impl Modulus {
         }
     }
 
-    fn words(self) -> U256 {
+    pub(crate) fn words(self) -> U256 {
         match self {
             Self::P256Base => U256([
                 0xffff_ffff_ffff_ffff,
@@ -181,17 +184,20 @@ impl Modulus {
     }
 }
 
-struct Lc<CS: Circuit> {
-    z: P256Z<CS>,
+pub(crate) struct Lc<CS: Circuit> {
+    pub(crate) z: P256Z<CS>,
 }
 
 #[derive(Clone)]
-struct CapturedValue<ZW> {
-    z: ZW,
+pub(crate) struct CapturedValue<ZW> {
+    pub(crate) z: ZW,
 }
 
 impl<ZW> CapturedValue<ZW> {
-    fn evaluate_words<'a, BW, C>(&'a self, context: &dyn WitnessContext<ZW, BW, C>) -> &'a [u64] {
+    pub(crate) fn evaluate_words<'a, BW, C>(
+        &'a self,
+        context: &dyn WitnessContext<ZW, BW, C>,
+    ) -> &'a [u64] {
         context
             .eval_z_words(&self.z)
             .expect("fixed-width integer hint context required by the P-256 circuit")
@@ -205,32 +211,32 @@ impl<CS: Circuit> Clone for Lc<CS> {
 }
 
 impl<CS: Circuit> Lc<CS> {
-    fn capture(&self) -> CapturedValue<P256Z<CS>> {
+    pub(crate) fn capture(&self) -> CapturedValue<P256Z<CS>> {
         CapturedValue { z: self.z.clone() }
     }
 
-    fn add(self, rhs: Self) -> Self {
+    pub(crate) fn add(self, rhs: Self) -> Self {
         Self { z: self.z + rhs.z }
     }
 
-    fn sub(self, rhs: Self) -> Self {
+    pub(crate) fn sub(self, rhs: Self) -> Self {
         Self { z: self.z - rhs.z }
     }
 
-    fn scale(self, coefficient: &S) -> Self {
+    pub(crate) fn scale(self, coefficient: &S) -> Self {
         self.scale_coefficient(coefficient_for::<CS>(coefficient))
     }
 
-    fn scale_coefficient(self, coefficient: P256Coefficient<CS>) -> Self {
+    pub(crate) fn scale_coefficient(self, coefficient: P256Coefficient<CS>) -> Self {
         Self {
             z: self.z * coefficient,
         }
     }
 }
 
-struct UInt<CS: Circuit, const N: usize, const M: usize> {
-    bits: <CS::Bool as BoolWitness>::Repr<N, M>,
-    value: Lc<CS>,
+pub(crate) struct UInt<CS: Circuit, const N: usize, const M: usize> {
+    pub(crate) bits: <CS::Bool as BoolWitness>::Repr<N, M>,
+    pub(crate) value: Lc<CS>,
 }
 
 impl<CS: Circuit, const N: usize, const M: usize> Clone for UInt<CS, N, M> {
@@ -242,10 +248,10 @@ impl<CS: Circuit, const N: usize, const M: usize> Clone for UInt<CS, N, M> {
     }
 }
 
-type UInt256<CS> = UInt<CS, WIDTH, WORD_LIMBS>;
+pub(crate) type UInt256<CS> = UInt<CS, WIDTH, WORD_LIMBS>;
 
-struct Elem<CS: Circuit> {
-    value: UInt256<CS>,
+pub(crate) struct Elem<CS: Circuit> {
+    pub(crate) value: UInt256<CS>,
 }
 
 impl<CS: Circuit> Clone for Elem<CS> {
@@ -256,9 +262,9 @@ impl<CS: Circuit> Clone for Elem<CS> {
     }
 }
 
-struct Rep<CS: Circuit> {
-    value: Lc<CS>,
-    bound: usize,
+pub(crate) struct Rep<CS: Circuit> {
+    pub(crate) value: Lc<CS>,
+    pub(crate) bound: usize,
 }
 
 impl<CS: Circuit> Clone for Rep<CS> {
@@ -270,10 +276,10 @@ impl<CS: Circuit> Clone for Rep<CS> {
     }
 }
 
-struct Point<CS: Circuit> {
-    x: Rep<CS>,
-    y: Rep<CS>,
-    infinity: Lc<CS>,
+pub(crate) struct Point<CS: Circuit> {
+    pub(crate) x: Rep<CS>,
+    pub(crate) y: Rep<CS>,
+    pub(crate) infinity: Lc<CS>,
 }
 
 impl<CS: Circuit> Clone for Point<CS> {
@@ -286,7 +292,7 @@ impl<CS: Circuit> Clone for Point<CS> {
     }
 }
 
-fn coefficient_for<CS: Circuit>(value: &S) -> P256Coefficient<CS> {
+pub(crate) fn coefficient_for<CS: Circuit>(value: &S) -> P256Coefficient<CS> {
     let mut words = [0; P256_Z_LIMBS];
     for (output, word) in words.iter_mut().zip(value.iter_u64_digits()) {
         *output = word;
@@ -294,36 +300,36 @@ fn coefficient_for<CS: Circuit>(value: &S) -> P256Coefficient<CS> {
     CS::coefficient_from_le_words(&words)
 }
 
-fn lc_constant<CS: Circuit>(value: &S) -> Lc<CS> {
+pub(crate) fn lc_constant<CS: Circuit>(value: &S) -> Lc<CS> {
     Lc {
         z: P256Z::<CS>::from(coefficient_for::<CS>(value)),
     }
 }
 
-fn lc_words<CS: Circuit>(words: &[u64]) -> Lc<CS> {
+pub(crate) fn lc_words<CS: Circuit>(words: &[u64]) -> Lc<CS> {
     Lc {
         z: P256Z::<CS>::from(CS::coefficient_from_le_words(words)),
     }
 }
 
-fn lc_u64<CS: Circuit>(value: u64) -> Lc<CS> {
+pub(crate) fn lc_u64<CS: Circuit>(value: u64) -> Lc<CS> {
     Lc {
         z: P256Z::<CS>::from(P256Coefficient::<CS>::from(value)),
     }
 }
 
-fn assert_zero<CS: Circuit>(circuit: &mut CS, value: Lc<CS>) {
+pub(crate) fn assert_zero<CS: Circuit>(circuit: &mut CS, value: Lc<CS>) {
     circuit.assert_r1c::<P256_Z_LIMBS>(P256Z::<CS>::zero(), P256Z::<CS>::zero(), value.z);
 }
 
-fn repr_bits<BW, const N: usize, const M: usize>(repr: &BW::Repr<N, M>) -> Vec<BW>
+pub(crate) fn repr_bits<BW, const N: usize, const M: usize>(repr: &BW::Repr<N, M>) -> Vec<BW>
 where
     BW: BoolWitness,
 {
     (0..N).map(|index| repr.bit(index)).collect()
 }
 
-fn uint_from_repr<CS: Circuit, const N: usize, const M: usize>(
+pub(crate) fn uint_from_repr<CS: Circuit, const N: usize, const M: usize>(
     circuit: &mut CS,
     bits: <CS::Bool as BoolWitness>::Repr<N, M>,
 ) -> UInt<CS, N, M> {
@@ -334,7 +340,7 @@ fn uint_from_repr<CS: Circuit, const N: usize, const M: usize>(
     }
 }
 
-fn uint_from_repr_with_lifts<CS: Circuit, const N: usize, const M: usize>(
+pub(crate) fn uint_from_repr_with_lifts<CS: Circuit, const N: usize, const M: usize>(
     circuit: &mut CS,
     bits: <CS::Bool as BoolWitness>::Repr<N, M>,
 ) -> (UInt<CS, N, M>, Vec<Lc<CS>>) {
@@ -357,7 +363,7 @@ fn uint_from_repr_with_lifts<CS: Circuit, const N: usize, const M: usize>(
     )
 }
 
-fn hinted_bits<CS: Circuit, const N: usize, const M: usize>(
+pub(crate) fn hinted_bits<CS: Circuit, const N: usize, const M: usize>(
     circuit: &mut CS,
     expression: CapturedValue<P256Z<CS>>,
     description: &'static str,
@@ -367,7 +373,7 @@ fn hinted_bits<CS: Circuit, const N: usize, const M: usize>(
     })
 }
 
-fn uint_from_int<CS: Circuit, const N: usize, const M: usize>(
+pub(crate) fn uint_from_int<CS: Circuit, const N: usize, const M: usize>(
     circuit: &mut CS,
     value: Lc<CS>,
     description: &'static str,
@@ -378,7 +384,7 @@ fn uint_from_int<CS: Circuit, const N: usize, const M: usize>(
     output
 }
 
-fn assert_lt<CS: Circuit>(circuit: &mut CS, modulus: Modulus, value: &UInt256<CS>) {
+pub(crate) fn assert_lt<CS: Circuit>(circuit: &mut CS, modulus: Modulus, value: &UInt256<CS>) {
     let mut bound = modulus.words().0;
     let mut borrow = true;
     for word in &mut bound {
@@ -391,40 +397,44 @@ fn assert_lt<CS: Circuit>(circuit: &mut CS, modulus: Modulus, value: &UInt256<CS
     let _ = uint_from_int::<CS, WIDTH, WORD_LIMBS>(circuit, slack, "range-check slack");
 }
 
-fn of_u<CS: Circuit>(circuit: &mut CS, modulus: Modulus, value: UInt256<CS>) -> Elem<CS> {
+pub(crate) fn of_u<CS: Circuit>(
+    circuit: &mut CS,
+    modulus: Modulus,
+    value: UInt256<CS>,
+) -> Elem<CS> {
     assert_lt(circuit, modulus, &value);
     Elem { value }
 }
 
-fn of_elem<CS: Circuit>(value: &Elem<CS>) -> Rep<CS> {
+pub(crate) fn of_elem<CS: Circuit>(value: &Elem<CS>) -> Rep<CS> {
     Rep {
         value: value.value.value.clone(),
         bound: 2,
     }
 }
 
-fn rep_constant<CS: Circuit>(value: &S) -> Rep<CS> {
+pub(crate) fn rep_constant<CS: Circuit>(value: &S) -> Rep<CS> {
     Rep {
         value: lc_constant(value),
         bound: 2,
     }
 }
 
-fn rep_u64<CS: Circuit>(value: u64) -> Rep<CS> {
+pub(crate) fn rep_u64<CS: Circuit>(value: u64) -> Rep<CS> {
     Rep {
         value: lc_u64(value),
         bound: 2,
     }
 }
 
-fn rep_add<CS: Circuit>(left: Rep<CS>, right: Rep<CS>) -> Rep<CS> {
+pub(crate) fn rep_add<CS: Circuit>(left: Rep<CS>, right: Rep<CS>) -> Rep<CS> {
     Rep {
         value: left.value.add(right.value),
         bound: left.bound + right.bound,
     }
 }
 
-fn rep_sub<CS: Circuit>(modulus: Modulus, left: Rep<CS>, right: Rep<CS>) -> Rep<CS> {
+pub(crate) fn rep_sub<CS: Circuit>(modulus: Modulus, left: Rep<CS>, right: Rep<CS>) -> Rep<CS> {
     let bias = modulus_multiple(modulus, right.bound);
     Rep {
         value: left.value.add(lc_words(&bias.0)).sub(right.value),
@@ -432,7 +442,7 @@ fn rep_sub<CS: Circuit>(modulus: Modulus, left: Rep<CS>, right: Rep<CS>) -> Rep<
     }
 }
 
-fn rep_scale<CS: Circuit>(coefficient: usize, value: Rep<CS>) -> Rep<CS> {
+pub(crate) fn rep_scale<CS: Circuit>(coefficient: usize, value: Rep<CS>) -> Rep<CS> {
     Rep {
         value: value
             .value
@@ -441,7 +451,7 @@ fn rep_scale<CS: Circuit>(coefficient: usize, value: Rep<CS>) -> Rep<CS> {
     }
 }
 
-fn split_521<CS: Circuit>(
+pub(crate) fn split_521<CS: Circuit>(
     circuit: &mut CS,
     bits: <CS::Bool as BoolWitness>::Repr<521, 9>,
 ) -> (UInt256<CS>, UInt<CS, 265, 5>) {
@@ -453,7 +463,12 @@ fn split_521<CS: Circuit>(
     )
 }
 
-fn lazy_mul<CS: Circuit>(circuit: &mut CS, modulus: Modulus, x: Rep<CS>, y: Rep<CS>) -> Rep<CS> {
+pub(crate) fn lazy_mul<CS: Circuit>(
+    circuit: &mut CS,
+    modulus: Modulus,
+    x: Rep<CS>,
+    y: Rep<CS>,
+) -> Rep<CS> {
     let x_eval = x.value.capture();
     let y_eval = y.value.capture();
     let modulus_words = modulus.words();
@@ -479,7 +494,7 @@ fn lazy_mul<CS: Circuit>(circuit: &mut CS, modulus: Modulus, x: Rep<CS>, y: Rep<
     }
 }
 
-fn lazy_mul_sub_to_elem<CS: Circuit>(
+pub(crate) fn lazy_mul_sub_to_elem<CS: Circuit>(
     circuit: &mut CS,
     modulus: Modulus,
     x: Rep<CS>,
@@ -517,7 +532,7 @@ fn lazy_mul_sub_to_elem<CS: Circuit>(
     Elem { value: r }
 }
 
-fn lazy_divide<CS: Circuit>(
+pub(crate) fn lazy_divide<CS: Circuit>(
     circuit: &mut CS,
     modulus: Modulus,
     denominator: Rep<CS>,
@@ -564,7 +579,7 @@ fn lazy_divide<CS: Circuit>(
     }
 }
 
-fn lazy_reduce<CS: Circuit>(circuit: &mut CS, modulus: Modulus, x: Rep<CS>) -> Elem<CS> {
+pub(crate) fn lazy_reduce<CS: Circuit>(circuit: &mut CS, modulus: Modulus, x: Rep<CS>) -> Elem<CS> {
     let x_eval = x.value.capture();
     let modulus_words = modulus.words();
     let bits = circuit.hint::<P256_Z_LIMBS, 521, 9, _>(move |context| {
@@ -581,7 +596,7 @@ fn lazy_reduce<CS: Circuit>(circuit: &mut CS, modulus: Modulus, x: Rep<CS>) -> E
     of_u(circuit, modulus, r)
 }
 
-fn lazy_reduce_scalar<CS: Circuit>(
+pub(crate) fn lazy_reduce_scalar<CS: Circuit>(
     circuit: &mut CS,
     modulus: Modulus,
     x: Rep<CS>,
@@ -609,7 +624,7 @@ fn lazy_reduce_scalar<CS: Circuit>(
     }
 }
 
-fn lazy_assert_mul_eq<CS: Circuit>(
+pub(crate) fn lazy_assert_mul_eq<CS: Circuit>(
     circuit: &mut CS,
     modulus: Modulus,
     x: Rep<CS>,
@@ -645,7 +660,11 @@ fn lazy_assert_mul_eq<CS: Circuit>(
     circuit.assert_r1c::<P256_Z_LIMBS>(x.value.z, y.value.z, rhs.z);
 }
 
-fn relaxed_reduce_small<CS: Circuit>(circuit: &mut CS, modulus: Modulus, x: Lc<CS>) -> Elem<CS> {
+pub(crate) fn relaxed_reduce_small<CS: Circuit>(
+    circuit: &mut CS,
+    modulus: Modulus,
+    x: Lc<CS>,
+) -> Elem<CS> {
     let x_eval = x.capture();
     let modulus_words = modulus.words();
     let bits = circuit.hint::<P256_Z_LIMBS, 258, 5, _>(move |context| {
@@ -663,7 +682,7 @@ fn relaxed_reduce_small<CS: Circuit>(circuit: &mut CS, modulus: Modulus, x: Lc<C
     Elem { value: r }
 }
 
-fn relaxed_mul<CS: Circuit>(
+pub(crate) fn relaxed_mul<CS: Circuit>(
     circuit: &mut CS,
     modulus: Modulus,
     x: Elem<CS>,
@@ -694,7 +713,7 @@ fn relaxed_mul<CS: Circuit>(
     Elem { value: r }
 }
 
-fn packed_evaluated<const N: usize, const M: usize>(
+pub(crate) fn packed_evaluated<const N: usize, const M: usize>(
     words: &[u64],
     description: &str,
 ) -> HintResult<PackedBits<N, M>> {
@@ -706,11 +725,11 @@ fn packed_evaluated<const N: usize, const M: usize>(
     })))
 }
 
-fn evaluated_is_one(words: &[u64]) -> bool {
+pub(crate) fn evaluated_is_one(words: &[u64]) -> bool {
     words.first() == Some(&1) && words[1..].iter().all(|word| *word == 0)
 }
 
-fn evaluated_usize(words: &[u64], description: &str) -> HintResult<usize> {
+pub(crate) fn evaluated_usize(words: &[u64], description: &str) -> HintResult<usize> {
     if words.last().is_some_and(|word| word >> 63 != 0)
         || words
             .get(1..)
@@ -722,7 +741,7 @@ fn evaluated_usize(words: &[u64], description: &str) -> HintResult<usize> {
         .map_err(|_| HintError::new(format!("oversized {description}")))
 }
 
-fn packed_flag_inverse_u256(flag: bool, inverse: U256) -> PackedBits<257, 5> {
+pub(crate) fn packed_flag_inverse_u256(flag: bool, inverse: U256) -> PackedBits<257, 5> {
     let mut carry = u64::from(flag);
     PackedBits::from_words(array::from_fn(|index| {
         let word = inverse.0.get(index).copied().unwrap_or(0);
@@ -734,20 +753,20 @@ fn packed_flag_inverse_u256(flag: bool, inverse: U256) -> PackedBits<257, 5> {
 
 /// An allocation-free integer used by P-256 hint arithmetic.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct U256([u64; 4]);
+pub(crate) struct U256(pub(crate) [u64; 4]);
 
 impl U256 {
-    const ZERO: Self = Self([0; 4]);
+    pub(crate) const ZERO: Self = Self([0; 4]);
 
-    fn is_zero(self) -> bool {
+    pub(crate) fn is_zero(self) -> bool {
         self == Self::ZERO
     }
 
-    fn is_even(self) -> bool {
+    pub(crate) fn is_even(self) -> bool {
         self.0[0] & 1 == 0
     }
 
-    fn cmp_words(self, rhs: Self) -> Ordering {
+    pub(crate) fn cmp_words(self, rhs: Self) -> Ordering {
         for index in (0..4).rev() {
             match self.0[index].cmp(&rhs.0[index]) {
                 Ordering::Equal => {}
@@ -784,10 +803,10 @@ impl From<U256> for S {
 /// A little-endian unsigned integer for P-256 hint arithmetic. Nine limbs
 /// match the circuit's signed Z capacity; eighteen hold a full product.
 #[derive(Clone, Copy)]
-struct Wide<const L: usize>([u64; L]);
+pub(crate) struct Wide<const L: usize>(pub(crate) [u64; L]);
 
 impl<const L: usize> Wide<L> {
-    fn from_evaluated(words: &[u64], description: &str) -> HintResult<Self> {
+    pub(crate) fn from_evaluated(words: &[u64], description: &str) -> HintResult<Self> {
         if words.last().is_some_and(|word| word >> 63 != 0) {
             return Err(HintError::new(format!("negative {description}")));
         }
@@ -800,7 +819,7 @@ impl<const L: usize> Wide<L> {
         Ok(Self(output))
     }
 
-    fn add_assign<const K: usize>(&mut self, rhs: Wide<K>) -> bool {
+    pub(crate) fn add_assign<const K: usize>(&mut self, rhs: Wide<K>) -> bool {
         let mut carry = false;
         for index in 0..L {
             let word = rhs.0.get(index).copied().unwrap_or(0);
@@ -818,7 +837,7 @@ impl<const L: usize> Wide<L> {
 
     /// Subtracts `rhs`, returning false if the unsigned result would be
     /// negative. The wrapped output must be discarded in that case.
-    fn sub_assign<const K: usize>(&mut self, rhs: Wide<K>) -> bool {
+    pub(crate) fn sub_assign<const K: usize>(&mut self, rhs: Wide<K>) -> bool {
         let mut borrow = false;
         for index in 0..L {
             let word = rhs.0.get(index).copied().unwrap_or(0);
@@ -834,7 +853,7 @@ impl<const L: usize> Wide<L> {
                 .is_some_and(|words| words.iter().any(|word| *word != 0))
     }
 
-    fn div_rem(self, modulus: U256) -> (Wide<L>, U256) {
+    pub(crate) fn div_rem(self, modulus: U256) -> (Wide<L>, U256) {
         debug_assert!(modulus.0[3] >> 63 != 0);
         let mut quotient = [0; L];
         let mut dividend = self.0;
@@ -912,7 +931,7 @@ impl<const L: usize> Wide<L> {
     }
 }
 
-fn multiply_wide(left: Wide<9>, right: Wide<9>) -> Wide<18> {
+pub(crate) fn multiply_wide(left: Wide<9>, right: Wide<9>) -> Wide<18> {
     let mut output = [0; 18];
     let left_len = left
         .0
@@ -937,14 +956,14 @@ fn multiply_wide(left: Wide<9>, right: Wide<9>) -> Wide<18> {
     Wide(output)
 }
 
-fn widen_u256<const L: usize>(value: U256) -> Wide<L> {
+pub(crate) fn widen_u256<const L: usize>(value: U256) -> Wide<L> {
     assert!(L >= 4);
     let mut output = [0; L];
     output[..4].copy_from_slice(&value.0);
     Wide(output)
 }
 
-fn modulus_multiple(modulus: Modulus, factor: usize) -> Wide<9> {
+pub(crate) fn modulus_multiple(modulus: Modulus, factor: usize) -> Wide<9> {
     let factor = u64::try_from(factor).expect("P-256 representative bound exceeds u64");
     let mut output = [0; 9];
     let mut carry = 0_u128;
@@ -957,13 +976,15 @@ fn modulus_multiple(modulus: Modulus, factor: usize) -> Wide<9> {
     Wide(output)
 }
 
-fn packed_wide<const N: usize, const M: usize, const L: usize>(value: Wide<L>) -> PackedBits<N, M> {
+pub(crate) fn packed_wide<const N: usize, const M: usize, const L: usize>(
+    value: Wide<L>,
+) -> PackedBits<N, M> {
     PackedBits::from_words(array::from_fn(|index| {
         value.0.get(index).copied().unwrap_or(0)
     }))
 }
 
-fn packed_wide_remainder_quotient<const N: usize, const M: usize, const L: usize>(
+pub(crate) fn packed_wide_remainder_quotient<const N: usize, const M: usize, const L: usize>(
     remainder: U256,
     quotient: Wide<L>,
 ) -> PackedBits<N, M> {
@@ -976,7 +997,7 @@ fn packed_wide_remainder_quotient<const N: usize, const M: usize, const L: usize
     }))
 }
 
-fn modular_inverse_u256(u: U256, v: U256) -> Option<U256> {
+pub(crate) fn modular_inverse_u256(u: U256, v: U256) -> Option<U256> {
     if u.cmp_words(v) != Ordering::Less {
         return None;
     }
@@ -992,7 +1013,7 @@ fn modular_inverse_u256(u: U256, v: U256) -> Option<U256> {
     inverse.map(|inverse| U256(inverse.to_words()))
 }
 
-fn modular_inverse(value: &S, modulus: &S) -> Option<S> {
+pub(crate) fn modular_inverse(value: &S, modulus: &S) -> Option<S> {
     let reduced;
     let value = if value < modulus {
         value
@@ -1003,7 +1024,7 @@ fn modular_inverse(value: &S, modulus: &S) -> Option<S> {
     modular_inverse_u256(U256::try_from(value).ok()?, U256::try_from(modulus).ok()?).map(S::from)
 }
 
-fn point_from_elems<CS: Circuit>(x: &Elem<CS>, y: &Elem<CS>) -> Point<CS> {
+pub(crate) fn point_from_elems<CS: Circuit>(x: &Elem<CS>, y: &Elem<CS>) -> Point<CS> {
     Point {
         x: of_elem(x),
         y: of_elem(y),
@@ -1011,7 +1032,7 @@ fn point_from_elems<CS: Circuit>(x: &Elem<CS>, y: &Elem<CS>) -> Point<CS> {
     }
 }
 
-fn infinity<CS: Circuit>() -> Point<CS> {
+pub(crate) fn infinity<CS: Circuit>() -> Point<CS> {
     Point {
         x: rep_u64(0),
         y: rep_u64(0),
@@ -1019,7 +1040,7 @@ fn infinity<CS: Circuit>() -> Point<CS> {
     }
 }
 
-fn and_bit<CS: Circuit>(circuit: &mut CS, x: Lc<CS>, y: Lc<CS>) -> Lc<CS> {
+pub(crate) fn and_bit<CS: Circuit>(circuit: &mut CS, x: Lc<CS>, y: Lc<CS>) -> Lc<CS> {
     let x_eval = x.capture();
     let y_eval = y.capture();
     let bits = circuit.hint::<P256_Z_LIMBS, 1, 1, _>(move |context| {
@@ -1032,12 +1053,16 @@ fn and_bit<CS: Circuit>(circuit: &mut CS, x: Lc<CS>, y: Lc<CS>) -> Lc<CS> {
     out
 }
 
-fn and3_bit<CS: Circuit>(circuit: &mut CS, x: Lc<CS>, y: Lc<CS>, z: Lc<CS>) -> Lc<CS> {
+pub(crate) fn and3_bit<CS: Circuit>(circuit: &mut CS, x: Lc<CS>, y: Lc<CS>, z: Lc<CS>) -> Lc<CS> {
     let xy = and_bit(circuit, x, y);
     and_bit(circuit, z, xy)
 }
 
-fn lazy_zero_test<CS: Circuit>(circuit: &mut CS, modulus: Modulus, x: Rep<CS>) -> Lc<CS> {
+pub(crate) fn lazy_zero_test<CS: Circuit>(
+    circuit: &mut CS,
+    modulus: Modulus,
+    x: Rep<CS>,
+) -> Lc<CS> {
     let x_eval = x.value.capture();
     let modulus_words = modulus.words();
     let bits = circuit.hint::<P256_Z_LIMBS, 257, 5, _>(move |context| {
@@ -1081,7 +1106,7 @@ fn lazy_zero_test<CS: Circuit>(circuit: &mut CS, modulus: Modulus, x: Rep<CS>) -
     z
 }
 
-fn select_rep<CS: Circuit, const N: usize, const M: usize>(
+pub(crate) fn select_rep<CS: Circuit, const N: usize, const M: usize>(
     circuit: &mut CS,
     choose: Lc<CS>,
     when_one: Rep<CS>,
@@ -1109,7 +1134,7 @@ fn select_rep<CS: Circuit, const N: usize, const M: usize>(
     }
 }
 
-fn select_canonical<CS: Circuit>(
+pub(crate) fn select_canonical<CS: Circuit>(
     circuit: &mut CS,
     choose: Lc<CS>,
     when_one: Rep<CS>,
@@ -1118,7 +1143,7 @@ fn select_canonical<CS: Circuit>(
     select_rep::<CS, 256, 4>(circuit, choose, when_one, when_zero, 2)
 }
 
-fn select_formula<CS: Circuit>(
+pub(crate) fn select_formula<CS: Circuit>(
     circuit: &mut CS,
     choose: Lc<CS>,
     when_one: Rep<CS>,
@@ -1127,7 +1152,11 @@ fn select_formula<CS: Circuit>(
     select_rep::<CS, 262, 5>(circuit, choose, when_one, when_zero, 66)
 }
 
-fn double_complete<CS: Circuit>(circuit: &mut CS, curve: Curve, point: Point<CS>) -> Point<CS> {
+pub(crate) fn double_complete<CS: Circuit>(
+    circuit: &mut CS,
+    curve: Curve,
+    point: Point<CS>,
+) -> Point<CS> {
     let x2 = lazy_mul(circuit, curve.base(), point.x.clone(), point.x.clone());
     // With a = -3 the infinity flag restores a zero numerator at (0, 0);
     // with a = 0 the numerator 3x^2 already vanishes there.
@@ -1175,15 +1204,15 @@ fn double_complete<CS: Circuit>(circuit: &mut CS, curve: Curve, point: Point<CS>
     }
 }
 
-struct AddControl<CS: Circuit> {
-    same_x: Lc<CS>,
-    opposite_y: Lc<CS>,
-    finite: Lc<CS>,
-    double_case: Lc<CS>,
-    active: Lc<CS>,
+pub(crate) struct AddControl<CS: Circuit> {
+    pub(crate) same_x: Lc<CS>,
+    pub(crate) opposite_y: Lc<CS>,
+    pub(crate) finite: Lc<CS>,
+    pub(crate) double_case: Lc<CS>,
+    pub(crate) active: Lc<CS>,
 }
 
-fn add_complete<CS: Circuit>(
+pub(crate) fn add_complete<CS: Circuit>(
     circuit: &mut CS,
     curve: Curve,
     p: Point<CS>,
@@ -1270,7 +1299,7 @@ fn add_complete<CS: Circuit>(
     }
 }
 
-fn materialize_multiples<CS: Circuit>(
+pub(crate) fn materialize_multiples<CS: Circuit>(
     circuit: &mut CS,
     curve: Curve,
     q: Point<CS>,
@@ -1287,7 +1316,7 @@ fn materialize_multiples<CS: Circuit>(
     output
 }
 
-fn indicators_impl<CS: Circuit, const N: usize, const M: usize>(
+pub(crate) fn indicators_impl<CS: Circuit, const N: usize, const M: usize>(
     circuit: &mut CS,
     digit: Lc<CS>,
 ) -> (UInt<CS, N, M>, Vec<Lc<CS>>) {
@@ -1323,7 +1352,7 @@ fn indicators_impl<CS: Circuit, const N: usize, const M: usize>(
     (out, lifted)
 }
 
-fn lookup_rep<CS: Circuit>(
+pub(crate) fn lookup_rep<CS: Circuit>(
     circuit: &mut CS,
     digit: Lc<CS>,
     indicators: &[Lc<CS>],
@@ -1352,7 +1381,7 @@ fn lookup_rep<CS: Circuit>(
     }
 }
 
-fn lookup_flag<CS: Circuit>(
+pub(crate) fn lookup_flag<CS: Circuit>(
     circuit: &mut CS,
     digit: Lc<CS>,
     indicators: &[Lc<CS>],
@@ -1380,7 +1409,11 @@ fn lookup_flag<CS: Circuit>(
     out
 }
 
-fn lookup_point<CS: Circuit>(circuit: &mut CS, digit: Lc<CS>, table: &[Point<CS>]) -> Point<CS> {
+pub(crate) fn lookup_point<CS: Circuit>(
+    circuit: &mut CS,
+    digit: Lc<CS>,
+    table: &[Point<CS>],
+) -> Point<CS> {
     let (_, indicator_bits) = indicators_impl::<CS, 16, 1>(circuit, digit.clone());
     let xs: Vec<_> = table.iter().map(|point| point.x.clone()).collect();
     let ys: Vec<_> = table.iter().map(|point| point.y.clone()).collect();
@@ -1392,7 +1425,7 @@ fn lookup_point<CS: Circuit>(circuit: &mut CS, digit: Lc<CS>, table: &[Point<CS>
     }
 }
 
-fn generator_table(curve: Curve) -> &'static Vec<(S, S)> {
+pub(crate) fn generator_table(curve: Curve) -> &'static Vec<(S, S)> {
     static P256_TABLE: OnceLock<Vec<(S, S)>> = OnceLock::new();
     static K1_TABLE: OnceLock<Vec<(S, S)>> = OnceLock::new();
     let table = match curve {
@@ -1423,7 +1456,7 @@ pub fn prepare() {
     let _ = generator_table(Curve::Secp256k1);
 }
 
-fn affine_add(curve: Curve, left: &(S, S), right: &(S, S), modulus: &S) -> (S, S) {
+pub(crate) fn affine_add(curve: Curve, left: &(S, S), right: &(S, S), modulus: &S) -> (S, S) {
     let numerator = if left == right {
         let a_term = if curve.a_is_minus_three() {
             modulus - S::from(3_u64)
@@ -1445,7 +1478,7 @@ fn affine_add(curve: Curve, left: &(S, S), right: &(S, S), modulus: &S) -> (S, S
     (x, y)
 }
 
-fn generator_coefficients<CS: Circuit>(
+pub(crate) fn generator_coefficients<CS: Circuit>(
     curve: Curve,
 ) -> Vec<(P256Coefficient<CS>, P256Coefficient<CS>)> {
     generator_table(curve)
@@ -1454,7 +1487,7 @@ fn generator_coefficients<CS: Circuit>(
         .collect()
 }
 
-fn lookup_generator_byte<CS: Circuit>(
+pub(crate) fn lookup_generator_byte<CS: Circuit>(
     circuit: &mut CS,
     digit: Lc<CS>,
     table: &[(P256Coefficient<CS>, P256Coefficient<CS>)],
@@ -1481,9 +1514,9 @@ fn lookup_generator_byte<CS: Circuit>(
 
 // A UInt retains the combined integer LC, but Lean's window expressions refer
 // to individual intBits. Keep those lifts explicitly for scalar windows.
-struct ScalarElem<CS: Circuit> {
-    elem: Elem<CS>,
-    int_bits: Vec<Lc<CS>>,
+pub(crate) struct ScalarElem<CS: Circuit> {
+    pub(crate) elem: Elem<CS>,
+    pub(crate) int_bits: Vec<Lc<CS>>,
 }
 
 impl<CS: Circuit> Clone for ScalarElem<CS> {
@@ -1495,7 +1528,7 @@ impl<CS: Circuit> Clone for ScalarElem<CS> {
     }
 }
 
-fn lift_input_word<CS: Circuit>(
+pub(crate) fn lift_input_word<CS: Circuit>(
     circuit: &mut CS,
     bits: <CS::Bool as BoolWitness>::Repr<256, 4>,
 ) -> ScalarElem<CS> {
@@ -1520,7 +1553,11 @@ fn lift_input_word<CS: Circuit>(
     }
 }
 
-fn scalar_window<CS: Circuit>(scalar: &ScalarElem<CS>, start: usize, width: usize) -> Lc<CS> {
+pub(crate) fn scalar_window<CS: Circuit>(
+    scalar: &ScalarElem<CS>,
+    start: usize,
+    width: usize,
+) -> Lc<CS> {
     scalar.int_bits[start..start + width]
         .iter()
         .cloned()
@@ -1530,7 +1567,7 @@ fn scalar_window<CS: Circuit>(scalar: &ScalarElem<CS>, start: usize, width: usiz
         })
 }
 
-fn joint_scalar_mul<CS: Circuit>(
+pub(crate) fn joint_scalar_mul<CS: Circuit>(
     circuit: &mut CS,
     curve: Curve,
     u1: ScalarElem<CS>,
@@ -1560,7 +1597,12 @@ fn joint_scalar_mul<CS: Circuit>(
     accumulator
 }
 
-fn assert_on_curve<CS: Circuit>(circuit: &mut CS, curve: Curve, x: &Elem<CS>, y: &Elem<CS>) {
+pub(crate) fn assert_on_curve<CS: Circuit>(
+    circuit: &mut CS,
+    curve: Curve,
+    x: &Elem<CS>,
+    y: &Elem<CS>,
+) {
     let x = of_elem(x);
     let y = of_elem(y);
     let x2 = lazy_mul(circuit, curve.base(), x.clone(), x.clone());
@@ -1574,7 +1616,7 @@ fn assert_on_curve<CS: Circuit>(circuit: &mut CS, curve: Curve, x: &Elem<CS>, y:
     lazy_assert_mul_eq(circuit, curve.base(), y.clone(), y, rhs);
 }
 
-fn assert_elem_eq<CS: Circuit>(circuit: &mut CS, left: &Elem<CS>, right: &Elem<CS>) {
+pub(crate) fn assert_elem_eq<CS: Circuit>(circuit: &mut CS, left: &Elem<CS>, right: &Elem<CS>) {
     assert_zero(
         circuit,
         left.value.value.clone().sub(right.value.value.clone()),

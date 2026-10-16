@@ -38,7 +38,8 @@ use num_bigint::BigUint;
 use num_traits::Zero;
 
 use crate::{
-    ecdsa::{Curve, verify_digest_circuit},
+    ecdsa::Curve,
+    ecdsa_fast::verify_digest_circuit,
     policy::{
         AUTH_DATA_LEN, CDJ_CHECKED_LEN, CDJ_MAX_BLOCKS, CDJ_MIN_BLOCKS, CDJ_PREFIX, DEPTH,
         EcdsaInputs, LEAF_TAG, MAX_APPROVALS, POLICY_TAG, Profile, SlotKind, Statement, Witness,

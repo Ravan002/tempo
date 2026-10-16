@@ -26,8 +26,8 @@ Slots follow one of two public circuit profiles:
 
 | Profile | Slots | ECDSA verifiers | Constraints |
 | --- | --- | --- | --- |
-| `Mixed` | 4 of any kind | 8 | 69,890 |
-| `Split` | 2 secp256k1 + 2 passkey | 4 | 39,268 |
+| `Mixed` | 4 of any kind | 8 | 80,134 |
+| `Split` | 2 secp256k1 + 2 passkey | 4 | 44,390 |
 
 - **`Mixed`:** each slot runs one secp256k1 verifier and one P-256 verifier. A verifier that does not match the slot's kind, and both verifiers of a disabled slot, check the trivial signature `(Q = G, r = Gx, s = e + r)`, which anyone can produce. Only the matching verifier is tied to the member's committed key.
 - **`Split`:** each slot runs only its kind's verifier. This halves the circuit, but a single proof can then carry at most two approvals of each kind. Ordering is enforced within each group. A member cannot be counted in both groups because its leaf commits to its kind.
@@ -55,6 +55,27 @@ The checks are the same as in the Noir example:
 - **`Tip1136/Arithmetic.lean`** proves the integer gadgets in `src/relation.rs` sound modulo `Q100 = 2^100 - 15`, given the lifted-bit widths: gated 64-bit chunk equality (`gated_chunk_eq`), the Merkle direction selector, `threshold >= 1`, the slack-based threshold comparison, packing, and the ordering gap. The one-hot lookup that computes `base64url(digest)` in-circuit is not yet covered.
 
 The Lean model is written separately from the Rust circuit. It does not verify the Rust code, which was neither extracted from Lean nor checked against it. Closing that gap means expressing this circuit in Freigen and loading Freigen's exported `M`, `A`, `B`, and `C` matrices into BitZ; BitZ `main` cannot load that format yet.
+
+## ECDSA gadget
+
+[`src/ecdsa_fast.rs`](src/ecdsa_fast.rs) ports the optimized ECDSA-P256 verifier from [reilabs/freigen#14](https://github.com/reilabs/freigen/pull/14) at `24fa108`. Freigen proves `verifyDigest_sound`, `verifyDigest_complete`, and `verifyDigest_wf` for that circuit. The proofs build against `24fa108`, but they assume primality of the P-256 base and scalar moduli as axioms (`baseModulus_prime`, `scalarModulus_prime`) and rely on `native_decide`, which trusts Lean's compiler. Compared with the original Freigen circuit, it needs 874,763 lifted bits and 7,954 R1CS rows per verification instead of 1,215,663 and 7,061.
+
+The gadget uses:
+- a mixed-width fixed-base comb for `u1·G`;
+- signed radix-32 recoding for `u2·Q`;
+- collapsed complete-add selectors;
+- checked incomplete additions where exceptional cases are unreachable.
+
+For P-256, the Rust gadget's constraint matrices are **byte-identical** to the ones Freigen exports for its verified `verifyDigestCS` (116,067,650 bytes, covering M, A, B, and C). To reproduce the check:
+
+```sh
+# In a Freigen checkout at PR #14 (24fa108), with lean/freigen-export/ExportEcdsaCS.lean
+# copied to the root and `lean_exe ecdsa_cs_export where root := `ExportEcdsaCS` added to lakefile.lean:
+ulimit -s unlimited && lake exe ecdsa_cs_export verify_digest_cs.bin
+FREIGEN_ECDSA_CS=/path/to/verify_digest_cs.bin cargo test --release --lib byte_identical -- --nocapture
+```
+
+The test is skipped when the export is absent.
 
 ## BitZ revision
 
@@ -87,12 +108,13 @@ Approval by alice (secp256k1), carol (passkey), and eve (secp256k1), on an AMD E
 
 | | `Split`, 1 thread | `Split`, 8 threads | `Mixed`, 1 thread | `Mixed`, 8 threads |
 | --- | --- | --- | --- | --- |
-| Prove | 1.31 s | 0.49 s | 2.42 s | 1.14 s |
-| Verify | 0.33 s | 0.10 s | 0.56 s | 0.25 s |
-| Proof | 300 KB | | 329 KB | |
-| Setup, once per profile | 5.7 s | | 10.8 s | |
+| Committed bits (padded) | 3,900,766 (2^22) | | 7,471,144 (2^23) | |
+| Prove | 1.04 s | 0.42 s | 2.10 s | 0.87 s |
+| Verify | 0.23 s | 0.07 s | 0.43 s | 0.14 s |
+| Proof | 264 KB | | 299 KB | |
+| Setup, once per profile | 6.6 s | | 12.2 s | |
 
-Best of five runs on a shared machine.
+Best of five runs.
 
 Before the BitZ changes, `Mixed` took 64 s to prove and 6.6 s to verify on one thread, produced a 2.26 MB proof, and ran a 10.8 s setup for every proof.
 
@@ -106,5 +128,5 @@ Before the BitZ changes, `Mixed` took 64 s to prove and 6.6 s to verify on one t
 
 1. **Zero knowledge.** The BitZ prover and the Ligerito openings do not hide the witness. TIP-1136 requires the inner proof itself to hide the policy and credentials. Until then, a proof leaks information about the roster, the keys, and which members signed. [`ZK.md`](ZK.md) lists what each stage reveals and the work needed.
 2. **Proof size and verification.** A 300 KB proof with linear-time verification is not usable onchain. A fixed onchain verifier needs either the paper's optimizations or a recursive wrapper. A Groth16 wrapper would reintroduce the BN254/setup assumptions that a hash-based stack avoids.
-3. **secp256k1.** The ECDSA gadget is a curve-parameterized fork of BitZ's Freigen-ported P-256 circuit. Freigen's proofs cover P-256 only.
+3. **secp256k1.** Freigen's ECDSA proofs cover P-256 only, so the secp256k1 instantiation of [`src/ecdsa_fast.rs`](src/ecdsa_fast.rs) is unverified. Its only shape change is a 17-byte final comparator, because `p - n` needs 129 bits on secp256k1.
 4. Origin checks, signature counters, and the OIDC and SMS factors are out of scope, as in the Noir example.
