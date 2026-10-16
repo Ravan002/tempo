@@ -43,17 +43,17 @@ theorem quorum_of_holds_split {approves : Member → Evidence → Digest → Pro
       (enabled_increasing hpb).imp Nat.ne_of_lt, ?_⟩
     intro i hi j hj hij
     subst hij
-    obtain ⟨sa, hsa, rfl⟩ := List.mem_map.mp hi
-    obtain ⟨sb, hsb, hidx⟩ := List.mem_map.mp hj
-    have hsa' := List.mem_filter.mp hsa
-    have hsb' := List.mem_filter.mp hsb
-    have ea : sa.enabled = true := by simpa using hsa'.2
-    have eb : sb.enabled = true := by simpa using hsb'.2
-    have ra := (hmember sa (List.mem_append_left _ hsa'.1) ea).1
-    have rb := (hmember sb (List.mem_append_right _ hsb'.1) eb).1
+    obtain ⟨sa, hmem_a, rfl⟩ := List.mem_map.mp hi
+    obtain ⟨sb, hmem_b, hidx⟩ := List.mem_map.mp hj
+    have hmem_a' := List.mem_filter.mp hmem_a
+    have hmem_b' := List.mem_filter.mp hmem_b
+    have ea : sa.enabled = true := by simpa using hmem_a'.2
+    have eb : sb.enabled = true := by simpa using hmem_b'.2
+    have ra := (hmember sa (List.mem_append_left _ hmem_a'.1) ea).1
+    have rb := (hmember sb (List.mem_append_right _ hmem_b'.1) eb).1
     rw [hidx] at rb
     have hm : sb.member = sa.member := Option.some.inj (rb.symm.trans ra)
-    exact hk ((hka sa hsa'.1 ea).symm.trans (hm ▸ hkb sb hsb'.1 eb))
+    exact hk ((hka sa hmem_a'.1 ea).symm.trans (hm ▸ hkb sb hmem_b'.1 eb))
   · intro i hi
     obtain ⟨s, hs, rfl⟩ := List.mem_map.mp hi
     have hs' := List.mem_filter.mp hs
