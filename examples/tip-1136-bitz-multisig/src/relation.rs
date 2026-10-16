@@ -34,7 +34,7 @@ use crate::{
     ecdsa::{Curve, verify_digest_circuit},
     policy::{
         AUTH_DATA_LEN, CDJ_CHECKED_LEN, CDJ_MAX_BLOCKS, CDJ_MIN_BLOCKS, DEPTH, EcdsaInputs,
-        LEAF_TAG, MAX_APPROVALS, POLICY_TAG, Statement, Witness, cdj_checked_prefix,
+        CDJ_PREFIX, LEAF_TAG, MAX_APPROVALS, POLICY_TAG, Statement, Witness,
     },
 };
 
@@ -64,7 +64,20 @@ pub const SLOT_BITS: usize = 1 // enabled
     + CDJ_COUNT_BITS;
 
 /// Private input bits of the whole witness.
-pub const INPUT_BITS: usize = 256 + 32 + 256 + MAX_APPROVALS * SLOT_BITS;
+/// Public input bits: the policy commitment and the authorization digest.
+pub const PUBLIC_BITS: usize = 2 * 256;
+
+/// Offset of the private threshold bits.
+const THRESHOLD_OFFSET: usize = PUBLIC_BITS + 256;
+
+/// Offset of the first approval slot.
+const SLOTS_OFFSET: usize = THRESHOLD_OFFSET + 32 + 256;
+
+/// Input bits of the whole witness, public bits first.
+pub const INPUT_BITS: usize = SLOTS_OFFSET + MAX_APPROVALS * SLOT_BITS;
+
+/// base64url alphabet.
+const BASE64URL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
 type Z<C> = <C as Circuit>::Z<LIMBS>;
 
@@ -89,11 +102,17 @@ impl CircuitStatement for PrivateAuthorization {
         INPUT_BITS
     }
 
+    fn public_input_bits(&self) -> Vec<bool> {
+        let mut bits = stream_bits(&self.statement.policy_commitment);
+        bits.extend(stream_bits(&self.statement.authorization_digest));
+        bits
+    }
+
     fn synthesize<C: Circuit>(&self, cs: &mut C, inputs: &[C::Bool]) -> Result<(), Error> {
         if inputs.len() != INPUT_BITS {
             return Err(Error::Input("wrong private input length"));
         }
-        authorize(cs, &self.statement, inputs);
+        authorize(cs, inputs);
         Ok(())
     }
 }
@@ -125,11 +144,15 @@ struct SlotSignals<C: Circuit> {
     counted_weight: Z<C>,
 }
 
-fn authorize<C: Circuit>(cs: &mut C, statement: &Statement, inputs: &[C::Bool]) {
+fn authorize<C: Circuit>(cs: &mut C, inputs: &[C::Bool]) {
     let mut cursor = Cursor {
         items: inputs,
         position: 0,
     };
+    // Public: checked against the statement by the PCS, not by constants, so
+    // one constraint system serves every statement.
+    let policy_commitment = cursor.take(256);
+    let digest = cursor.take(256);
     let roster_root = cursor.take(256);
     let threshold = cursor.take(32);
     let salt = cursor.take(256);
@@ -142,7 +165,7 @@ fn authorize<C: Circuit>(cs: &mut C, statement: &Statement, inputs: &[C::Bool]) 
     preimage.extend(roster_root.iter().cloned());
     preimage.extend(salt);
     let commitment = sha256(cs, &preimage);
-    assert_eq_constant(cs, &one, &commitment, &statement.policy_commitment);
+    assert_eq_bits(cs, &one, &commitment, &policy_commitment);
 
     // threshold >= 1: threshold - 1 is a 32-bit natural number.
     let threshold = lift_be(cs, &threshold);
@@ -153,12 +176,12 @@ fn authorize<C: Circuit>(cs: &mut C, statement: &Statement, inputs: &[C::Bool]) 
     let threshold_minus_one = lift(cs, &threshold_minus_one);
     assert_zero(cs, threshold.clone() - one.clone() - threshold_minus_one);
 
-    let digest_le = constant_le_word::<C>(&statement.authorization_digest);
-    let cdj_prefix = cdj_checked_prefix(&statement.authorization_digest);
+    let digest_le = stream_to_le(&digest);
+    let challenge = base64url_chars(cs, &digest);
     let slots: Vec<_> = (0..MAX_APPROVALS)
         .map(|_| {
             let bits = cursor.take(SLOT_BITS);
-            approval_slot(cs, &bits, &roster_root, &digest_le, &cdj_prefix)
+            approval_slot(cs, &bits, &roster_root, &digest_le, &challenge)
         })
         .collect();
 
@@ -204,7 +227,7 @@ fn authorize<C: Circuit>(cs: &mut C, statement: &Statement, inputs: &[C::Bool]) 
     let slack = hint_value(cs, 35, {
         let weights: Vec<_> = (0..MAX_APPROVALS)
             .map(|slot| {
-                let start = 544 + slot * SLOT_BITS;
+                let start = SLOTS_OFFSET + slot * SLOT_BITS;
                 (
                     inputs[start].clone(),
                     inputs[start + 2..start + 34].to_vec(),
@@ -226,7 +249,53 @@ fn authorize<C: Circuit>(cs: &mut C, statement: &Statement, inputs: &[C::Bool]) 
 }
 
 fn threshold_bits_capture<B: Clone>(inputs: &[B]) -> Vec<B> {
-    inputs[256..288].to_vec()
+    inputs[THRESHOLD_OFFSET..THRESHOLD_OFFSET + 32].to_vec()
+}
+
+/// The 43 base64url characters of the digest, as integers.
+///
+/// Each 6-bit group `v` selects a one-hot indicator vector with
+/// `sum ind = 1` and `sum u * ind_u = v`; the character is then the linear
+/// combination `sum ind_u * BASE64URL[u]`.
+fn base64url_chars<C: Circuit>(cs: &mut C, digest: &[C::Bool]) -> Vec<Z<C>> {
+    let one = constant::<C>(1);
+    (0..43)
+        .map(|group| {
+            // Stream bits 6*group.., most significant first; the last group
+            // is padded with two zero bits.
+            let bits: Vec<C::Bool> = (0..6)
+                .map(|offset| {
+                    digest
+                        .get(6 * group + offset)
+                        .cloned()
+                        .unwrap_or_else(|| C::Bool::from(false))
+                })
+                .collect();
+            let value = lift_be(cs, &bits);
+            let indicators = hint_indicators(cs, bits);
+            let mut count = Z::<C>::zero();
+            let mut weighted = Z::<C>::zero();
+            let mut char = Z::<C>::zero();
+            for (u, indicator) in indicators.into_iter().enumerate() {
+                let indicator = cs.bitz::<LIMBS>(indicator);
+                count += indicator.clone();
+                weighted += indicator.clone() * C::Coefficient::<LIMBS>::from(u as u64);
+                char += indicator * C::Coefficient::<LIMBS>::from(u64::from(BASE64URL[u]));
+            }
+            assert_zero(cs, count - one.clone());
+            assert_zero(cs, weighted - value);
+            char
+        })
+        .collect()
+}
+
+/// 64 hinted bits, one-hot at the big-endian value of `bits`.
+fn hint_indicators<C: Circuit>(cs: &mut C, bits: Vec<C::Bool>) -> Vec<C::Bool> {
+    let packed = cs.hint::<LIMBS, 64, 1, _>(move |context| {
+        let eval = |b: &C::Bool| context.eval_bool(b);
+        Ok(PackedBits::from_u64(1 << eval_be(&eval, &bits)))
+    });
+    (0..64).map(|i| packed.bit(i)).collect()
 }
 
 fn approval_slot<C: Circuit>(
@@ -234,7 +303,7 @@ fn approval_slot<C: Circuit>(
     bits: &[C::Bool],
     roster_root: &[C::Bool],
     digest_le: &[C::Bool],
-    cdj_prefix: &[u8; CDJ_CHECKED_LEN],
+    challenge: &[Z<C>],
 ) -> SlotSignals<C> {
     let mut cursor = Cursor {
         items: bits,
@@ -386,12 +455,15 @@ fn approval_slot<C: Circuit>(
 
     // Strict WebAuthn fields: canonical prefix with challenge = base64url(digest),
     // committed RP ID hash, and user presence and verification flags.
-    assert_eq_constant(
-        cs,
-        &passkey_selected,
-        &cdj[..CDJ_CHECKED_LEN * 8],
-        cdj_prefix,
-    );
+    let prefix_bits = CDJ_PREFIX.len() * 8;
+    assert_eq_constant(cs, &passkey_selected, &cdj[..prefix_bits], CDJ_PREFIX);
+    for (k, char) in challenge.iter().enumerate() {
+        let start = prefix_bits + 8 * k;
+        let byte = lift_be(cs, &cdj[start..start + 8]);
+        cs.assert_r1c::<LIMBS>(passkey_selected.clone(), byte - char.clone(), Z::<C>::zero());
+    }
+    let quote = (CDJ_CHECKED_LEN - 1) * 8;
+    assert_eq_constant(cs, &passkey_selected, &cdj[quote..quote + 8], b"\"");
     assert_eq_bits(cs, &passkey_selected, &auth_data[..256], &rp_id_hash);
     for flag_bit in [7, 5] {
         let flag = cs.bitz::<LIMBS>(auth_data[256 + flag_bit].clone());
@@ -461,11 +533,6 @@ fn constant_state<C: Circuit>() -> Vec<C::Bool> {
 
 fn constant_stream<C: Circuit>(bytes: &[u8]) -> Vec<C::Bool> {
     stream_bits(bytes).into_iter().map(C::Bool::from).collect()
-}
-
-/// A 32-byte big-endian integer as little-endian constant bits.
-fn constant_le_word<C: Circuit>(bytes: &[u8; 32]) -> Vec<C::Bool> {
-    stream_to_le(&constant_stream::<C>(bytes))
 }
 
 /// Reverses a 256-bit big-endian stream into little-endian integer bits.
@@ -568,9 +635,12 @@ fn eval_be<B>(eval: Eval<'_, B>, bits: &[B]) -> u64 {
         .fold(0, |sum, bit| sum << 1 | u64::from(eval(bit)))
 }
 
-/// Encodes a witness as private input bits in the layout read by the circuit.
-pub fn witness_bits(witness: &Witness) -> Vec<bool> {
+/// Encodes the statement and witness as input bits in the layout read by the
+/// circuit.
+pub fn witness_bits(statement: &Statement, witness: &Witness) -> Vec<bool> {
     let mut bits = Vec::with_capacity(INPUT_BITS);
+    bits.extend(stream_bits(&statement.policy_commitment));
+    bits.extend(stream_bits(&statement.authorization_digest));
     bits.extend(stream_bits(&witness.roster_root));
     bits.extend(stream_bits(&witness.threshold.to_be_bytes()));
     bits.extend(stream_bits(&witness.salt));

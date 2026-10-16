@@ -6,19 +6,22 @@
 
 mod common;
 
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use common::*;
+use bitz_cli::end_to_end::CircuitStatement;
+use circuit::constraints::ConstraintGenerator;
 use tip_1136_bitz::{
-    CircuitProofSystem, Error,
-    policy::{Approval, Evidence, FLAG_UP, Witness},
+    Error, System,
+    policy::{Approval, Evidence, FLAG_UP, Statement, Witness},
+    prove,
     relation::{PrivateAuthorization, witness_bits},
-    setup,
+    setup, verify,
 };
 
-fn system() -> &'static CircuitProofSystem<PrivateAuthorization> {
-    static SYSTEM: OnceLock<CircuitProofSystem<PrivateAuthorization>> = OnceLock::new();
-    SYSTEM.get_or_init(|| setup(statement()).unwrap())
+fn system() -> &'static Mutex<System> {
+    static SYSTEM: OnceLock<Mutex<System>> = OnceLock::new();
+    SYSTEM.get_or_init(|| Mutex::new(setup().unwrap()))
 }
 
 fn witness(approvals: &[Approval]) -> Witness {
@@ -30,8 +33,13 @@ fn honest(indices: &[usize]) -> Witness {
     witness(&approvals)
 }
 
+fn satisfied_for(statement: &Statement, witness: &Witness) -> Result<(), Error> {
+    let bits = witness_bits(statement, witness);
+    system().lock().unwrap().witness(&bits).map(|_| ())
+}
+
 fn satisfied(witness: &Witness) -> Result<(), Error> {
-    system().witness(&witness_bits(witness)).map(|_| ())
+    satisfied_for(&statement(), witness)
 }
 
 #[track_caller]
@@ -42,9 +50,23 @@ fn assert_rejected(witness: &Witness) {
 #[test]
 fn input_layout_matches_witness_encoding() {
     assert_eq!(
-        witness_bits(&honest(&[ALICE])).len(),
+        witness_bits(&statement(), &honest(&[ALICE])).len(),
         tip_1136_bitz::relation::INPUT_BITS
     );
+}
+
+/// `set_statement` reuses one constraint system, which is sound only if the
+/// constraints do not depend on the statement.
+#[test]
+fn constraints_do_not_depend_on_the_statement() {
+    let matrices = |statement: Statement| {
+        let statement = PrivateAuthorization { statement };
+        let mut cs = ConstraintGenerator::<num_bigint::BigInt>::new(statement.input_bits());
+        let inputs: Vec<_> = (0..statement.input_bits()).map(|i| cs.input(i)).collect();
+        statement.synthesize(&mut cs, &inputs).unwrap();
+        cs.into_matrices()
+    };
+    assert!(matrices(statement()) == matrices(Statement::default()));
 }
 
 #[test]
@@ -141,21 +163,33 @@ fn prover_lowers_threshold() {
 
 #[test]
 fn zero_threshold() {
+    // Even a policy committed with threshold 0 cannot authorize anything.
     let mut low = policy();
     low.threshold = 0;
     let mut witness = honest(&[]);
     witness.threshold = 0;
     witness.roster_root = low.roster_root();
-    // Even a policy committed with threshold 0 cannot authorize anything.
-    let system = setup(tip_1136_bitz::policy::Statement {
+    let statement = Statement {
         policy_commitment: low.commitment(),
         authorization_digest: digest(),
-    })
-    .unwrap();
+    };
     assert!(matches!(
-        system.witness(&witness_bits(&witness)),
+        satisfied_for(&statement, &witness),
         Err(Error::Unsatisfied)
     ));
+}
+
+#[test]
+fn approval_for_other_statement() {
+    // A satisfying witness for another digest does not satisfy this one.
+    let approvals: Vec<_> = [ALICE, CAROL, EVE].map(|i| approve(i, &other_digest())).into();
+    let witness = Witness::new(&policy(), &approvals, &other_digest()).unwrap();
+    let other = Statement {
+        policy_commitment: statement().policy_commitment,
+        authorization_digest: other_digest(),
+    };
+    satisfied_for(&other, &witness).unwrap();
+    assert_rejected(&witness);
 }
 
 #[test]
@@ -237,15 +271,31 @@ fn sha256_rp() -> [u8; 32] {
 
 #[test]
 fn prove_and_verify() {
-    let system = system();
-    let proof = tip_1136_bitz::prove(system, &honest(&[ALICE, CAROL, EVE])).unwrap();
-    system.verify(&proof).unwrap();
+    let mut system = system().lock().unwrap();
+    let proof = prove(&mut system, statement(), &honest(&[ALICE, CAROL, EVE])).unwrap();
+    verify(&mut system, statement(), &proof).unwrap();
 
     // The same proof does not verify for another action or policy.
-    let other = setup(tip_1136_bitz::policy::Statement {
-        policy_commitment: statement().policy_commitment,
+    let other_action = Statement {
         authorization_digest: other_digest(),
-    })
-    .unwrap();
-    assert!(other.verify(&proof).is_err());
+        ..statement()
+    };
+    assert!(verify(&mut system, other_action, &proof).is_err());
+    let mut other_policy = statement();
+    other_policy.policy_commitment[31] ^= 1;
+    assert!(verify(&mut system, other_policy, &proof).is_err());
+
+    // A prover cannot claim a statement other than the one in its inputs.
+    let approvals: Vec<_> = [ALICE, CAROL, EVE].map(|i| approve(i, &other_digest())).into();
+    let witness = Witness::new(&policy(), &approvals, &other_digest()).unwrap();
+    let assignment = system
+        .witness(&witness_bits(&other_action, &witness))
+        .unwrap();
+    let commitment = system.commit(&assignment).unwrap();
+    system.set_statement(PrivateAuthorization {
+        statement: statement(),
+    });
+    if let Ok(proof) = system.prove(assignment, commitment) {
+        assert!(verify(&mut system, statement(), &proof).is_err());
+    }
 }

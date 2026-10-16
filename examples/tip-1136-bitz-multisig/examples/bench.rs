@@ -11,19 +11,26 @@ mod fixtures;
 use std::time::Instant;
 
 use fixtures::*;
-use tip_1136_bitz::{policy::Witness, relation::witness_bits, setup};
+use tip_1136_bitz::{
+    policy::Witness,
+    relation::{PrivateAuthorization, witness_bits},
+    setup,
+};
 
 fn main() -> anyhow::Result<()> {
     let approvals: Vec<_> = [ALICE, CAROL, EVE].map(|i| approve(i, &digest())).into();
     let witness = Witness::new(&policy(), &approvals, &digest())?;
 
     let start = Instant::now();
-    let system = setup(statement())?;
+    let mut system = setup()?;
+    system.set_statement(PrivateAuthorization {
+        statement: statement(),
+    });
     let setup_time = start.elapsed();
     let stats = system.stats();
 
     let start = Instant::now();
-    let bits = witness_bits(&witness);
+    let bits = witness_bits(&statement(), &witness);
     let assignment = system.witness(&bits)?;
     let witness_time = start.elapsed();
 
@@ -47,7 +54,7 @@ fn main() -> anyhow::Result<()> {
         32 + proof.opening.narg_string.len() + proof.opening.hints.len() + 16 * spartan_elements;
 
     println!("threads            {}", rayon::current_num_threads());
-    println!("private input bits {}", bits.len());
+    println!("input bits         {}", bits.len());
     println!("r1cs constraints   {}", stats.constraints);
     println!("assignment bits    {}", stats.assignment_bits);
     println!(
@@ -55,7 +62,7 @@ fn main() -> anyhow::Result<()> {
         stats.committed_bits, stats.padded_committed_bits
     );
     println!("opening path       {:?}", stats.opening_path);
-    println!("setup              {setup_time:?}");
+    println!("setup (once per profile) {setup_time:?}");
     println!("witness            {witness_time:?}");
     println!("commit             {commit_time:?}");
     println!("prove (after commit) {prove_time:?}");
@@ -64,6 +71,11 @@ fn main() -> anyhow::Result<()> {
         witness_time + commit_time + prove_time
     );
     println!("verify             {verify_time:?}");
-    println!("proof bytes        {proof_bytes}");
+    println!(
+        "proof bytes        {proof_bytes} (transcript {}, hints {}, spartan {})",
+        proof.opening.narg_string.len(),
+        proof.opening.hints.len(),
+        16 * spartan_elements
+    );
     Ok(())
 }

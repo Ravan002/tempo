@@ -142,7 +142,7 @@ impl Policy {
 }
 
 /// The public statement reconstructed by the chain.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Statement {
     pub policy_commitment: [u8; 32],
     pub authorization_digest: [u8; 32],

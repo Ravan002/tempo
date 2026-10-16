@@ -41,44 +41,56 @@ The checks are the same as in the Noir example:
 - **`Tip1136/Relation.lean`** abstracts the hashes and signatures:
   - `quorum_of_holds` proves that any satisfying assignment exhibits pairwise-distinct roster positions whose approving members' committed weights reach the threshold. Padding contributes nothing.
   - `holds_of_quorum` proves the converse: any such quorum, listed in increasing order, can be encoded.
-- **`Tip1136/Arithmetic.lean`** proves that each integer gadget in `src/relation.rs` is sound modulo `Q100 = 2^100 - 15`, given the lifted-bit widths. The gadgets covered are gated 64-bit chunk equality (`gated_chunk_eq`), the Merkle direction selector, `threshold >= 1`, the slack-based threshold comparison, packing, and the ordering gap.
+- **`Tip1136/Arithmetic.lean`** proves the integer gadgets in `src/relation.rs` sound modulo `Q100 = 2^100 - 15`, given the lifted-bit widths: gated 64-bit chunk equality (`gated_chunk_eq`), the Merkle direction selector, `threshold >= 1`, the slack-based threshold comparison, packing, and the ordering gap. The one-hot lookup that computes `base64url(digest)` in-circuit is not yet covered.
 
 The Lean model is written separately from the Rust circuit. It does not verify the Rust code, which was neither extracted from Lean nor checked against it. Closing that gap means expressing this circuit in Freigen and loading Freigen's exported `M`, `A`, `B`, and `C` matrices into BitZ; BitZ `main` cannot load that format yet.
+
+## BitZ revision
+
+The crate pins [`decofe/BitZ@73ab1fe`](https://github.com/decofe/BitZ/compare/d7e7257...73ab1fe), which is BitZ `d7e7257` plus two commits:
+
+- **`feat(field): add PCLMULQDQ GF(2^128) kernel for x86_64`.** Upstream uses a hardware carryless multiply only on aarch64. On x86-64, every GF(2^128) multiplication fell back to a 64-step software loop. With this kernel, BitZ's own `sha256-2kb` takes 136 ms to prove instead of 3.45 s, and 39 ms to verify instead of 465 ms (one thread).
+- **`feat(cli): check public inputs with a PCS opening`.** Statement values become leading input bits, checked by one random multilinear opening of the committed witness. Previously they were circuit constants. The constraint system is therefore identical for every statement, so setup runs once per circuit profile instead of once per proof, on both the prover and the verifier.
+
+`.cargo/config.toml` enables `pclmulqdq` on x86-64. Without it, the crate silently builds the slow portable kernel.
 
 ## Run
 
 The toolchain is pinned to Rust 1.97.1 by `rust-toolchain.toml`, matching BitZ.
 
 ```sh
-cargo test --release          # 3 accepting and 15 rejected witnesses, prove/verify, encodings
+cargo test --release          # accepting and rejected witnesses, statement independence, prove/verify
 RAYON_NUM_THREADS=1 cargo run --release --example bench
+cargo run --release --example profile   # per-stage timing tree
 (cd lean && lake build)       # Lean 4 v4.31.0-rc1, no mathlib
 ```
 
 ## Measurements
 
-Approval by alice (secp256k1), carol (passkey), and eve (secp256k1). Measured on an x86-64 sandbox at BitZ `d7e7257`, with a 100-bit PCS round budget:
+Approval by alice (secp256k1), carol (passkey), and eve (secp256k1), on an x86-64 sandbox with a 100-bit PCS round budget:
 
 | | 1 thread | 8 threads |
 | --- | --- | --- |
-| R1CS constraints | 69,648 | |
-| Committed bits | 10,192,772 (padded to 2^24) | |
-| Setup (per statement) | 10.8 s | 10.9 s |
-| Witness + commit + prove | 64.4 s | 28.4 s |
-| Verify | 6.6 s | 1.9 s |
-| Proof | 2.26 MB | |
+| R1CS constraints | 69,890 | |
+| Committed bits | 10,196,036 (padded to 2^24) | |
+| Setup (once per profile, not per proof) | 10.8 s | 11.9 s |
+| Witness + commit + prove | 2.62 s | 1.29 s |
+| Verify | 0.77 s | 0.43 s |
+| Proof | 2.41 MB | |
 
-The 8 ECDSA verifiers account for about 9.7M of the committed bits.
+**Where the time goes** (one thread):
+- **Proving:** Spartan takes 0.9 s, the integer-to-binary bridge (grand-product GKR and inner-product sumcheck) takes 1.3 s, and Ligerito takes about 10 ms.
+- **Verification:** the verifier evaluates the sparse constraint matrices and the bit-to-integer map directly, which is linear in circuit size. Spartan takes 0.27 s and the bridge 0.46 s.
+- **Proof size:** about 2.1 MB of the proof is one column-length vector sent by BitZ's virtual opening (2^17 GF(2^128) elements at the current matrix shape).
 
-These numbers come from BitZ's open-source end-to-end path. For calibration, its own `sha256-2kb` circuit takes 3.45 s to prove and 0.46 s to verify on one thread in the same sandbox, so the paper's figures (for example, ECDSA+SHA-256 in 32 ms) come from a more optimized pipeline. Do not quote either set of numbers as this circuit's production cost.
+**Circuit size:** the 8 ECDSA verifiers (one per curve per slot, half of them trivial) are about 9.7M of the committed bits. A profile with fixed slot kinds, for example two secp256k1 and two passkey slots, would halve the circuit. The trade-off is limiting how many approvals of each kind a quorum can use.
 
 ## Gaps before this can replace the Noir path
 
 1. **Zero knowledge.** The BitZ prover and the Ligerito openings do not hide the witness. TIP-1136 requires the inner proof itself to hide the policy and credentials. Until then, a proof leaks information about the roster, the keys, and which members signed.
-2. **Public inputs.** The commitment and digest enter the circuit as constants, so setup is per statement and the verifier repeats it (10.8 s). Production needs public-input columns, so that setup runs once per circuit profile.
-3. **Proof size and verification.** A 2.26 MB proof with seconds of verification is not usable onchain. A fixed onchain verifier needs either the paper's optimizations or a recursive wrapper. A Groth16 wrapper would reintroduce the BN254/setup assumptions that a hash-based stack avoids.
-4. **secp256k1.** The ECDSA gadget is a curve-parameterized fork of BitZ's Freigen-ported P-256 circuit. Freigen's proofs cover P-256 only.
-5. **WebAuthn padding.** The prover supplies the SHA-256 padding of `clientDataJSON` and selects a hash over 2–4 blocks; the padding itself is not constrained.
-   - **Soundness argument:** the checked 80-byte prefix lies inside the hashed blocks. Reusing a signature made for another challenge therefore requires a different block sequence with the same compression-chain output, which is a SHA-256 collision.
+2. **Proof size and verification.** A 2.4 MB proof with linear-time verification is not usable onchain. A fixed onchain verifier needs either the paper's optimizations or a recursive wrapper. A Groth16 wrapper would reintroduce the BN254/setup assumptions that a hash-based stack avoids.
+3. **secp256k1.** The ECDSA gadget is a curve-parameterized fork of BitZ's Freigen-ported P-256 circuit. Freigen's proofs cover P-256 only.
+4. **WebAuthn padding.** The prover supplies the SHA-256 padding of `clientDataJSON` and selects a hash over 2–4 blocks; the padding itself is not constrained.
+   - **Soundness argument:** the checked 80-byte prefix (canonical prefix, `base64url(digest)` computed in-circuit, closing quote) lies inside the hashed blocks. Reusing a signature made for another challenge therefore requires a different block sequence with the same compression-chain output, which is a SHA-256 collision.
    - **Profile limits:** `clientDataJSON` is at most 247 bytes, and `authenticatorData` must be exactly 37 bytes.
-6. Origin checks, signature counters, and the OIDC and SMS factors are out of scope, as in the Noir example.
+5. Origin checks, signature counters, and the OIDC and SMS factors are out of scope, as in the Noir example.

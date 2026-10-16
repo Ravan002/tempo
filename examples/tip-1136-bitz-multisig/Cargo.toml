@@ -12,19 +12,20 @@ description = "TIP-1136 private weighted multisig proved with BitZ (integer cons
 
 [dependencies]
 anyhow = "1"
-bitz-cli = { git = "https://github.com/worldfnd/BitZ", rev = "d7e7257b8f26125c0dbe6fef4e8e5ed4789773bf" }
-circuit = { git = "https://github.com/worldfnd/BitZ", rev = "d7e7257b8f26125c0dbe6fef4e8e5ed4789773bf" }
+bitz-cli = { git = "https://github.com/decofe/BitZ", rev = "73ab1fe1a1737fd5b6876ba7b1bf8098e435c2c3" }
+circuit = { git = "https://github.com/decofe/BitZ", rev = "73ab1fe1a1737fd5b6876ba7b1bf8098e435c2c3" }
 crypto-bigint = "0.7.5"
 k256 = { version = "0.13", features = ["ecdsa"] }
 num-bigint = "0.4"
 num-traits = "0.2"
 p256 = { version = "0.13", features = ["ecdsa"] }
-pcs = { git = "https://github.com/worldfnd/BitZ", rev = "d7e7257b8f26125c0dbe6fef4e8e5ed4789773bf" }
+pcs = { git = "https://github.com/decofe/BitZ", rev = "73ab1fe1a1737fd5b6876ba7b1bf8098e435c2c3" }
 sha2 = "0.10"
 
 [dev-dependencies]
-rayon = "1.10"
 base64 = "0.22"
+rayon = "1.10"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [profile.release]
 lto = true
@@ -32,3 +33,4 @@ codegen-units = 1
 
 [profile.dev]
 opt-level = 3
+

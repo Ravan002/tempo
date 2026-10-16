@@ -155,7 +155,7 @@ dependencies = [
 [[package]]
 name = "bitz-cli"
 version = "0.1.0"
-source = "git+https://github.com/worldfnd/BitZ?rev=d7e7257b8f26125c0dbe6fef4e8e5ed4789773bf#d7e7257b8f26125c0dbe6fef4e8e5ed4789773bf"
+source = "git+https://github.com/decofe/BitZ?rev=73ab1fe1a1737fd5b6876ba7b1bf8098e435c2c3#73ab1fe1a1737fd5b6876ba7b1bf8098e435c2c3"
 dependencies = [
  "anyhow",
  "argh",
@@ -245,7 +245,7 @@ dependencies = [
 [[package]]
 name = "circuit"
 version = "0.1.0"
-source = "git+https://github.com/worldfnd/BitZ?rev=d7e7257b8f26125c0dbe6fef4e8e5ed4789773bf#d7e7257b8f26125c0dbe6fef4e8e5ed4789773bf"
+source = "git+https://github.com/decofe/BitZ?rev=73ab1fe1a1737fd5b6876ba7b1bf8098e435c2c3#73ab1fe1a1737fd5b6876ba7b1bf8098e435c2c3"
 dependencies = [
  "blake3",
  "common",
@@ -267,7 +267,7 @@ checksum = "0c9ea0ac24bc397ab3c98583a3c9ba74fa56b09a4449bbe172b9b1ddb016027a"
 [[package]]
 name = "common"
 version = "0.1.0"
-source = "git+https://github.com/worldfnd/BitZ?rev=d7e7257b8f26125c0dbe6fef4e8e5ed4789773bf#d7e7257b8f26125c0dbe6fef4e8e5ed4789773bf"
+source = "git+https://github.com/decofe/BitZ?rev=73ab1fe1a1737fd5b6876ba7b1bf8098e435c2c3#73ab1fe1a1737fd5b6876ba7b1bf8098e435c2c3"
 dependencies = [
  "crypto-primitives",
  "field",
@@ -559,7 +559,7 @@ dependencies = [
 [[package]]
 name = "field"
 version = "0.1.0"
-source = "git+https://github.com/worldfnd/BitZ?rev=d7e7257b8f26125c0dbe6fef4e8e5ed4789773bf#d7e7257b8f26125c0dbe6fef4e8e5ed4789773bf"
+source = "git+https://github.com/decofe/BitZ?rev=73ab1fe1a1737fd5b6876ba7b1bf8098e435c2c3#73ab1fe1a1737fd5b6876ba7b1bf8098e435c2c3"
 dependencies = [
  "bytemuck",
  "crypto-primitives",
@@ -624,7 +624,7 @@ dependencies = [
 [[package]]
 name = "gkr"
 version = "0.1.0"
-source = "git+https://github.com/worldfnd/BitZ?rev=d7e7257b8f26125c0dbe6fef4e8e5ed4789773bf#d7e7257b8f26125c0dbe6fef4e8e5ed4789773bf"
+source = "git+https://github.com/decofe/BitZ?rev=73ab1fe1a1737fd5b6876ba7b1bf8098e435c2c3#73ab1fe1a1737fd5b6876ba7b1bf8098e435c2c3"
 dependencies = [
  "common",
  "field",
@@ -1009,7 +1009,7 @@ checksum = "2ee67f1008b1ba2321834326597b8e186293b049a023cdef258527550b9935b4"
 [[package]]
 name = "pcs"
 version = "0.1.0"
-source = "git+https://github.com/worldfnd/BitZ?rev=d7e7257b8f26125c0dbe6fef4e8e5ed4789773bf#d7e7257b8f26125c0dbe6fef4e8e5ed4789773bf"
+source = "git+https://github.com/decofe/BitZ?rev=73ab1fe1a1737fd5b6876ba7b1bf8098e435c2c3#73ab1fe1a1737fd5b6876ba7b1bf8098e435c2c3"
 dependencies = [
  "bincode",
  "blake3",
@@ -1052,7 +1052,7 @@ dependencies = [
 [[package]]
 name = "poly"
 version = "0.1.0"
-source = "git+https://github.com/worldfnd/BitZ?rev=d7e7257b8f26125c0dbe6fef4e8e5ed4789773bf#d7e7257b8f26125c0dbe6fef4e8e5ed4789773bf"
+source = "git+https://github.com/decofe/BitZ?rev=73ab1fe1a1737fd5b6876ba7b1bf8098e435c2c3#73ab1fe1a1737fd5b6876ba7b1bf8098e435c2c3"
 dependencies = [
  "crypto-primitives",
  "field",
@@ -1063,7 +1063,7 @@ dependencies = [
 [[package]]
 name = "post_gkr"
 version = "0.1.0"
-source = "git+https://github.com/worldfnd/BitZ?rev=d7e7257b8f26125c0dbe6fef4e8e5ed4789773bf#d7e7257b8f26125c0dbe6fef4e8e5ed4789773bf"
+source = "git+https://github.com/decofe/BitZ?rev=73ab1fe1a1737fd5b6876ba7b1bf8098e435c2c3#73ab1fe1a1737fd5b6876ba7b1bf8098e435c2c3"
 dependencies = [
  "common",
  "field",
@@ -1104,7 +1104,7 @@ dependencies = [
 [[package]]
 name = "prover"
 version = "0.1.0"
-source = "git+https://github.com/worldfnd/BitZ?rev=d7e7257b8f26125c0dbe6fef4e8e5ed4789773bf#d7e7257b8f26125c0dbe6fef4e8e5ed4789773bf"
+source = "git+https://github.com/decofe/BitZ?rev=73ab1fe1a1737fd5b6876ba7b1bf8098e435c2c3#73ab1fe1a1737fd5b6876ba7b1bf8098e435c2c3"
 dependencies = [
  "common",
  "field",
@@ -1360,7 +1360,7 @@ checksum = "5b3dc8af474f516a851ff4bd12db780f948b9250ad37211e4eec0bccea54e01b"
 [[package]]
 name = "spartan"
 version = "0.1.0"
-source = "git+https://github.com/worldfnd/BitZ?rev=d7e7257b8f26125c0dbe6fef4e8e5ed4789773bf#d7e7257b8f26125c0dbe6fef4e8e5ed4789773bf"
+source = "git+https://github.com/decofe/BitZ?rev=73ab1fe1a1737fd5b6876ba7b1bf8098e435c2c3#73ab1fe1a1737fd5b6876ba7b1bf8098e435c2c3"
 dependencies = [
  "circuit",
  "common",
@@ -1481,6 +1481,7 @@ dependencies = [
  "pcs",
  "rayon",
  "sha2 0.10.9",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -1588,7 +1589,7 @@ dependencies = [
 [[package]]
 name = "transcript"
 version = "0.1.0"
-source = "git+https://github.com/worldfnd/BitZ?rev=d7e7257b8f26125c0dbe6fef4e8e5ed4789773bf#d7e7257b8f26125c0dbe6fef4e8e5ed4789773bf"
+source = "git+https://github.com/decofe/BitZ?rev=73ab1fe1a1737fd5b6876ba7b1bf8098e435c2c3#73ab1fe1a1737fd5b6876ba7b1bf8098e435c2c3"
 dependencies = [
  "blake3",
  "field",
@@ -1616,7 +1617,7 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 [[package]]
 name = "verifier"
 version = "0.1.0"
-source = "git+https://github.com/worldfnd/BitZ?rev=d7e7257b8f26125c0dbe6fef4e8e5ed4789773bf#d7e7257b8f26125c0dbe6fef4e8e5ed4789773bf"
+source = "git+https://github.com/decofe/BitZ?rev=73ab1fe1a1737fd5b6876ba7b1bf8098e435c2c3#73ab1fe1a1737fd5b6876ba7b1bf8098e435c2c3"
 dependencies = [
  "common",
  "field",

@@ -16,21 +16,33 @@ pub use pcs::SecurityLevel;
 use policy::{Statement, Witness};
 use relation::{PrivateAuthorization, witness_bits};
 
-/// Builds the constraint system for one public statement.
+/// The proof system for this circuit profile.
+pub type System = CircuitProofSystem<PrivateAuthorization>;
+
+/// Builds the profile's constraint system.
 ///
-/// Public values enter the constraints as constants, so the verifier runs the
-/// same setup from the reconstructed statement.
-pub fn setup(statement: Statement) -> Result<CircuitProofSystem<PrivateAuthorization>, Error> {
+/// Public values are input bits checked by a PCS opening, so one system serves
+/// every statement: provers and verifiers run this once, not per proof.
+pub fn setup() -> Result<System, Error> {
     ecdsa::prepare();
-    CircuitProofSystem::new(PrivateAuthorization { statement }, SecurityLevel::Bits100)
+    CircuitProofSystem::new(
+        PrivateAuthorization {
+            statement: Statement::default(),
+        },
+        SecurityLevel::Bits100,
+    )
 }
 
-/// Proves that `witness` satisfies the relation for the system's statement.
-pub fn prove(
-    system: &CircuitProofSystem<PrivateAuthorization>,
-    witness: &Witness,
-) -> Result<Proof, Error> {
-    let witness = system.witness(&witness_bits(witness))?;
+/// Proves that `witness` authorizes `statement`.
+pub fn prove(system: &mut System, statement: Statement, witness: &Witness) -> Result<Proof, Error> {
+    system.set_statement(PrivateAuthorization { statement });
+    let witness = system.witness(&witness_bits(&statement, witness))?;
     let commitment = system.commit(&witness)?;
     system.prove(witness, commitment)
+}
+
+/// Verifies a proof for `statement`.
+pub fn verify(system: &mut System, statement: Statement, proof: &Proof) -> Result<(), Error> {
+    system.set_statement(PrivateAuthorization { statement });
+    system.verify(proof)
 }
