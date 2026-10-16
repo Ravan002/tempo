@@ -6,8 +6,9 @@ reached.
 
 ## Running the tests
 
-The `inline` and `deferred` test binaries run the same suite with immediate and
-deferred verification, respectively. Run both with:
+The `inline` and `deferred` test binaries run the suite with immediate and
+deferred verification, respectively. Tests wrapped in `mode_agnostic!` don't
+depend on the verification mode and only run in `inline`. Run both with:
 
 ```sh
 cargo nextest run -p tempo-e2e

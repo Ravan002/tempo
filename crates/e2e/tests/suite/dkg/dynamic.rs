@@ -1,14 +1,16 @@
 use std::time::Duration;
 
 use alloy::transports::http::reqwest::Url;
+use commonware_consensus::types::{Epoch, Epocher as _, FixedEpocher, Height};
 use commonware_macros::test_traced;
 use commonware_runtime::{
     Clock as _, Runner as _,
     deterministic::{Config, Runner},
 };
+use commonware_utils::NZU64;
 use futures::future::join_all;
 
-use crate::{Setup, metrics::MetricsExt, setup_validators, tests::dkg::common::target_epoch};
+use crate::{Setup, metrics::MetricsExt, setup_validators};
 
 #[test_traced]
 fn validator_is_added_to_a_set_of_two() {
@@ -236,5 +238,20 @@ impl AssertValidatorIsRemoved {
                 );
             }
         })
+    }
+}
+
+/// Returns the target epoch to wait for depending on `event_height`.
+///
+/// If `event_height` is less than a boundary height, then the next epoch is
+/// returned. Otherwise, the one *after* the next is returned.
+fn target_epoch(epoch_length: u64, event_height: u64) -> Epoch {
+    let strat = FixedEpocher::new(NZU64!(epoch_length));
+    let event_height = Height::new(event_height);
+    let info = strat.containing(event_height).unwrap();
+    if info.last() == event_height {
+        info.epoch().next().next()
+    } else {
+        info.epoch().next()
     }
 }

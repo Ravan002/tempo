@@ -27,10 +27,12 @@ fn validator_can_fast_sync_after_full_dkg() {
     fast_sync_after_full_dkg(false);
 }
 
-/// A late joiner can also start with the identity produced by the full DKG ceremony.
-#[test_traced]
-fn validator_can_fast_sync_after_full_dkg_with_updated_network_identity() {
-    fast_sync_after_full_dkg(true);
+mode_agnostic! {
+    /// A late joiner can also start with the identity produced by the full DKG ceremony.
+    #[test_traced]
+    fn validator_can_fast_sync_after_full_dkg_with_updated_network_identity() {
+        fast_sync_after_full_dkg(true);
+    }
 }
 
 fn fast_sync_after_full_dkg(update_network_identity: bool) {

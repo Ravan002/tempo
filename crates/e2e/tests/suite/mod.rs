@@ -7,21 +7,24 @@ use crate::{
 };
 
 mod backfill;
-mod blocked_transfers;
 mod consensus_context;
-mod consensus_rpc;
 mod dkg;
-mod fee_recipient;
-mod follow;
 mod linkage;
 mod metrics;
-mod payload_builder;
 mod restart;
 mod simple;
 mod snapshot;
 mod sync;
-mod t12;
-mod testing_node;
+
+mode_agnostic! {
+    mod blocked_transfers;
+    mod consensus_rpc;
+    mod fee_recipient;
+    mod follow;
+    mod payload_builder;
+    mod t12;
+    mod testing_node;
+}
 
 #[test_traced]
 fn spawning_execution_node_works() {
