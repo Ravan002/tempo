@@ -55,6 +55,43 @@ pub const FLAG_UP: u8 = 0x01;
 /// User-verified authenticator flag.
 pub const FLAG_UV: u8 = 0x04;
 
+/// The credential kinds one approval slot accepts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SlotKind {
+    /// Either kind; the slot runs both verifiers.
+    Any,
+    Secp256k1,
+    Passkey,
+}
+
+/// The circuit profile: the kinds of its [`MAX_APPROVALS`] slots.
+///
+/// The profile is public and fixed per registered circuit. It bounds which
+/// quorums one proof can express but reveals nothing about a given approval.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Profile {
+    /// Four slots of any kind: 8 ECDSA verifiers.
+    #[default]
+    Mixed,
+    /// Two secp256k1 slots, then two passkey slots: 4 ECDSA verifiers.
+    Split,
+}
+
+impl Profile {
+    /// Slot kinds in circuit order; same-kind slots are contiguous.
+    pub const fn slot_kinds(self) -> [SlotKind; MAX_APPROVALS] {
+        match self {
+            Self::Mixed => [SlotKind::Any; MAX_APPROVALS],
+            Self::Split => [
+                SlotKind::Secp256k1,
+                SlotKind::Secp256k1,
+                SlotKind::Passkey,
+                SlotKind::Passkey,
+            ],
+        }
+    }
+}
+
 /// Member credential type.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
@@ -228,11 +265,11 @@ pub struct Slot {
 }
 
 impl Slot {
-    /// An inert padding slot for `digest`.
-    pub fn disabled(digest: &[u8; 32]) -> Self {
+    /// An inert padding slot of `kind` for `digest`.
+    pub fn disabled(kind: SlotKind, digest: &[u8; 32]) -> Self {
         let mut slot = Self {
             enabled: false,
-            is_passkey: false,
+            is_passkey: kind == SlotKind::Passkey,
             weight: 0,
             leaf_index: 0,
             path: [[0; 32]; DEPTH],
@@ -275,14 +312,30 @@ pub struct Witness {
 
 impl Witness {
     /// Assembles a witness from a policy and approvals sorted by leaf index.
-    pub fn new(policy: &Policy, approvals: &[Approval], digest: &[u8; 32]) -> anyhow::Result<Self> {
-        anyhow::ensure!(approvals.len() <= MAX_APPROVALS, "too many approvals");
-        let mut slots = std::array::from_fn(|_| Slot::disabled(digest));
-        for (slot, approval) in slots.iter_mut().zip(approvals) {
+    pub fn new(
+        profile: Profile,
+        policy: &Policy,
+        approvals: &[Approval],
+        digest: &[u8; 32],
+    ) -> anyhow::Result<Self> {
+        let kinds = profile.slot_kinds();
+        let mut slots = kinds.map(|kind| Slot::disabled(kind, digest));
+        let mut used = [false; MAX_APPROVALS];
+        for approval in approvals {
             let member = policy
                 .members
                 .get(approval.leaf_index)
                 .ok_or_else(|| anyhow::anyhow!("approval for an empty roster slot"))?;
+            let fits = |kind: SlotKind| match kind {
+                SlotKind::Any => true,
+                SlotKind::Secp256k1 => member.kind == Kind::Secp256k1,
+                SlotKind::Passkey => member.kind == Kind::Passkey,
+            };
+            let position = (0..MAX_APPROVALS)
+                .find(|&i| !used[i] && fits(kinds[i]))
+                .ok_or_else(|| anyhow::anyhow!("profile has no free slot for this member kind"))?;
+            used[position] = true;
+            let slot = &mut slots[position];
             slot.enabled = true;
             slot.is_passkey = member.kind == Kind::Passkey;
             slot.weight = member.weight;

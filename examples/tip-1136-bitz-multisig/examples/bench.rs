@@ -2,7 +2,7 @@
 //! the alice (secp256k1) + carol (passkey) + eve (secp256k1) approval.
 //!
 //! ```sh
-//! RAYON_NUM_THREADS=1 cargo run --release --example bench
+//! RAYON_NUM_THREADS=1 cargo run --release --example bench -- [mixed|split]
 //! ```
 
 #[path = "../tests/common/mod.rs"]
@@ -12,21 +12,25 @@ use std::time::Instant;
 
 use fixtures::*;
 use tip_1136_bitz::{
-    policy::Witness,
-    relation::{PrivateAuthorization, witness_bits},
-    setup,
+    Authorizer,
+    policy::{Profile, Witness},
+    relation::witness_bits,
 };
 
 fn main() -> anyhow::Result<()> {
+    let profile = match std::env::args().nth(1).as_deref() {
+        None | Some("mixed") => Profile::Mixed,
+        Some("split") => Profile::Split,
+        Some(other) => anyhow::bail!("unknown profile {other}"),
+    };
     let approvals: Vec<_> = [ALICE, CAROL, EVE].map(|i| approve(i, &digest())).into();
-    let witness = Witness::new(&policy(), &approvals, &digest())?;
+    let witness = Witness::new(profile, &policy(), &approvals, &digest())?;
 
     let start = Instant::now();
-    let mut system = setup()?;
-    system.set_statement(PrivateAuthorization {
-        statement: statement(),
-    });
+    let mut authorizer = Authorizer::new(profile)?;
     let setup_time = start.elapsed();
+    authorizer.bind(statement());
+    let system = authorizer.system();
     let stats = system.stats();
 
     let start = Instant::now();
@@ -53,6 +57,7 @@ fn main() -> anyhow::Result<()> {
     let proof_bytes =
         32 + proof.opening.narg_string.len() + proof.opening.hints.len() + 16 * spartan_elements;
 
+    println!("profile            {profile:?}");
     println!("threads            {}", rayon::current_num_threads());
     println!("input bits         {}", bits.len());
     println!("r1cs constraints   {}", stats.constraints);
@@ -61,7 +66,6 @@ fn main() -> anyhow::Result<()> {
         "committed bits     {} (padded {})",
         stats.committed_bits, stats.padded_committed_bits
     );
-    println!("opening path       {:?}", stats.opening_path);
     println!("setup (once per profile) {setup_time:?}");
     println!("witness            {witness_time:?}");
     println!("commit             {commit_time:?}");

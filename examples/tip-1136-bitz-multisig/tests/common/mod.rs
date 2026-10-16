@@ -5,9 +5,26 @@
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use k256::ecdsa::{SigningKey as K1Key, signature::hazmat::PrehashSigner};
 use p256::ecdsa::SigningKey as R1Key;
-use tip_1136_bitz::policy::{
-    AUTH_DATA_LEN, Approval, Evidence, FLAG_UP, FLAG_UV, Kind, Member, Policy, Statement, sha256,
+use std::sync::{Mutex, OnceLock};
+
+use tip_1136_bitz::{
+    Authorizer,
+    policy::{
+        AUTH_DATA_LEN, Approval, Evidence, FLAG_UP, FLAG_UV, Kind, Member, Policy, Profile,
+        Statement, sha256,
+    },
 };
+
+/// One shared proof system per profile; setup takes seconds.
+pub fn authorizer(profile: Profile) -> &'static Mutex<Authorizer> {
+    static MIXED: OnceLock<Mutex<Authorizer>> = OnceLock::new();
+    static SPLIT: OnceLock<Mutex<Authorizer>> = OnceLock::new();
+    let cell = match profile {
+        Profile::Mixed => &MIXED,
+        Profile::Split => &SPLIT,
+    };
+    cell.get_or_init(|| Mutex::new(Authorizer::new(profile).unwrap()))
+}
 
 pub const RP_ID: &str = "wallet.tempo.xyz";
 

@@ -1,4 +1,5 @@
-//! Accepting and adversarial witnesses for the private weighted multisig.
+//! Accepting and adversarial witnesses for the private weighted multisig,
+//! four slots of any kind ([`Profile::Mixed`]).
 //!
 //! Rejections are checked against the constraint system itself: the witness
 //! generator runs the honest hints, and `Error::Unsatisfied` means some rank-1
@@ -6,26 +7,19 @@
 
 mod common;
 
-use std::sync::{Mutex, OnceLock};
-
-use common::*;
 use bitz_cli::end_to_end::CircuitStatement;
 use circuit::constraints::ConstraintGenerator;
+use common::*;
 use tip_1136_bitz::{
-    Error, System,
-    policy::{Approval, Evidence, FLAG_UP, Statement, Witness},
-    prove,
+    Error,
+    policy::{Approval, Evidence, FLAG_UP, Profile, Statement, Witness},
     relation::{PrivateAuthorization, witness_bits},
-    setup, verify,
 };
 
-fn system() -> &'static Mutex<System> {
-    static SYSTEM: OnceLock<Mutex<System>> = OnceLock::new();
-    SYSTEM.get_or_init(|| Mutex::new(setup().unwrap()))
-}
+const PROFILE: Profile = Profile::Mixed;
 
 fn witness(approvals: &[Approval]) -> Witness {
-    Witness::new(&policy(), approvals, &digest()).unwrap()
+    Witness::new(PROFILE, &policy(), approvals, &digest()).unwrap()
 }
 
 fn honest(indices: &[usize]) -> Witness {
@@ -34,8 +28,10 @@ fn honest(indices: &[usize]) -> Witness {
 }
 
 fn satisfied_for(statement: &Statement, witness: &Witness) -> Result<(), Error> {
-    let bits = witness_bits(statement, witness);
-    system().lock().unwrap().witness(&bits).map(|_| ())
+    authorizer(PROFILE)
+        .lock()
+        .unwrap()
+        .check(statement, witness)
 }
 
 fn satisfied(witness: &Witness) -> Result<(), Error> {
@@ -60,7 +56,10 @@ fn input_layout_matches_witness_encoding() {
 #[test]
 fn constraints_do_not_depend_on_the_statement() {
     let matrices = |statement: Statement| {
-        let statement = PrivateAuthorization { statement };
+        let statement = PrivateAuthorization {
+            profile: PROFILE,
+            statement,
+        };
         let mut cs = ConstraintGenerator::<num_bigint::BigInt>::new(statement.input_bits());
         let inputs: Vec<_> = (0..statement.input_bits()).map(|i| cs.input(i)).collect();
         statement.synthesize(&mut cs, &inputs).unwrap();
@@ -182,8 +181,10 @@ fn zero_threshold() {
 #[test]
 fn approval_for_other_statement() {
     // A satisfying witness for another digest does not satisfy this one.
-    let approvals: Vec<_> = [ALICE, CAROL, EVE].map(|i| approve(i, &other_digest())).into();
-    let witness = Witness::new(&policy(), &approvals, &other_digest()).unwrap();
+    let approvals: Vec<_> = [ALICE, CAROL, EVE]
+        .map(|i| approve(i, &other_digest()))
+        .into();
+    let witness = Witness::new(PROFILE, &policy(), &approvals, &other_digest()).unwrap();
     let other = Statement {
         policy_commitment: statement().policy_commitment,
         authorization_digest: other_digest(),
@@ -271,31 +272,34 @@ fn sha256_rp() -> [u8; 32] {
 
 #[test]
 fn prove_and_verify() {
-    let mut system = system().lock().unwrap();
-    let proof = prove(&mut system, statement(), &honest(&[ALICE, CAROL, EVE])).unwrap();
-    verify(&mut system, statement(), &proof).unwrap();
+    let mut authorizer = authorizer(PROFILE).lock().unwrap();
+    let proof = authorizer
+        .prove(statement(), &honest(&[ALICE, CAROL, EVE]))
+        .unwrap();
+    authorizer.verify(statement(), &proof).unwrap();
 
     // The same proof does not verify for another action or policy.
     let other_action = Statement {
         authorization_digest: other_digest(),
         ..statement()
     };
-    assert!(verify(&mut system, other_action, &proof).is_err());
+    assert!(authorizer.verify(other_action, &proof).is_err());
     let mut other_policy = statement();
     other_policy.policy_commitment[31] ^= 1;
-    assert!(verify(&mut system, other_policy, &proof).is_err());
+    assert!(authorizer.verify(other_policy, &proof).is_err());
 
     // A prover cannot claim a statement other than the one in its inputs.
-    let approvals: Vec<_> = [ALICE, CAROL, EVE].map(|i| approve(i, &other_digest())).into();
-    let witness = Witness::new(&policy(), &approvals, &other_digest()).unwrap();
+    let approvals: Vec<_> = [ALICE, CAROL, EVE]
+        .map(|i| approve(i, &other_digest()))
+        .into();
+    let witness = Witness::new(PROFILE, &policy(), &approvals, &other_digest()).unwrap();
+    authorizer.bind(statement());
+    let system = authorizer.system();
     let assignment = system
         .witness(&witness_bits(&other_action, &witness))
         .unwrap();
     let commitment = system.commit(&assignment).unwrap();
-    system.set_statement(PrivateAuthorization {
-        statement: statement(),
-    });
     if let Ok(proof) = system.prove(assignment, commitment) {
-        assert!(verify(&mut system, statement(), &proof).is_err());
+        assert!(authorizer.verify(statement(), &proof).is_err());
     }
 }

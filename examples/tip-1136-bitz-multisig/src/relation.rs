@@ -15,10 +15,17 @@
 //!    whose challenge is the digest.
 //! 5. The enabled weights sum to at least the threshold.
 //!
-//! Each slot always runs one secp256k1 and one P-256 verifier. The verifier
-//! that does not match the slot (and both verifiers of a disabled slot) checks a
-//! signature under the generator, which anyone can produce; only the matching
-//! verifier is tied to the member's committed key.
+//! Slots follow a [`Profile`]:
+//!
+//! - [`Profile::Mixed`] has four slots of any kind. Each runs one secp256k1
+//!   and one P-256 verifier. The verifier that does not match the slot (and
+//!   both verifiers of a disabled slot) checks a signature under the generator,
+//!   which anyone can produce; only the matching verifier is tied to the
+//!   member's committed key.
+//! - [`Profile::Split`] has two secp256k1 slots and two passkey slots, each
+//!   with one verifier: half the circuit, at the cost of at most two approvals
+//!   of each kind. Ordering is enforced within each group; a member cannot
+//!   appear in both groups because its leaf commits to its kind.
 
 use std::array;
 
@@ -33,8 +40,8 @@ use num_traits::Zero;
 use crate::{
     ecdsa::{Curve, verify_digest_circuit},
     policy::{
-        AUTH_DATA_LEN, CDJ_CHECKED_LEN, CDJ_MAX_BLOCKS, CDJ_MIN_BLOCKS, DEPTH, EcdsaInputs,
-        CDJ_PREFIX, LEAF_TAG, MAX_APPROVALS, POLICY_TAG, Statement, Witness,
+        AUTH_DATA_LEN, CDJ_CHECKED_LEN, CDJ_MAX_BLOCKS, CDJ_MIN_BLOCKS, CDJ_PREFIX, DEPTH,
+        EcdsaInputs, LEAF_TAG, MAX_APPROVALS, POLICY_TAG, Profile, SlotKind, Statement, Witness,
     },
 };
 
@@ -63,7 +70,6 @@ pub const SLOT_BITS: usize = 1 // enabled
     + CDJ_MAX_BLOCKS * 512
     + CDJ_COUNT_BITS;
 
-/// Private input bits of the whole witness.
 /// Public input bits: the policy commitment and the authorization digest.
 pub const PUBLIC_BITS: usize = 2 * 256;
 
@@ -81,15 +87,19 @@ const BASE64URL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvw
 
 type Z<C> = <C as Circuit>::Z<LIMBS>;
 
-/// The public statement of one approval proof.
+/// The public statement of one approval proof under a circuit profile.
 #[derive(Clone, Copy, Debug)]
 pub struct PrivateAuthorization {
+    pub profile: Profile,
     pub statement: Statement,
 }
 
 impl CircuitStatement for PrivateAuthorization {
     fn domain(&self) -> &'static [u8] {
-        b"tempo/tip-1136/private-weighted-multisig/bitz/v1"
+        match self.profile {
+            Profile::Mixed => b"tempo/tip-1136/private-weighted-multisig/bitz/mixed4/v1",
+            Profile::Split => b"tempo/tip-1136/private-weighted-multisig/bitz/split2x2/v1",
+        }
     }
 
     fn public_bytes(&self) -> Vec<u8> {
@@ -112,7 +122,7 @@ impl CircuitStatement for PrivateAuthorization {
         if inputs.len() != INPUT_BITS {
             return Err(Error::Input("wrong private input length"));
         }
-        authorize(cs, inputs);
+        authorize(cs, inputs, self.profile);
         Ok(())
     }
 }
@@ -144,7 +154,7 @@ struct SlotSignals<C: Circuit> {
     counted_weight: Z<C>,
 }
 
-fn authorize<C: Circuit>(cs: &mut C, inputs: &[C::Bool]) {
+fn authorize<C: Circuit>(cs: &mut C, inputs: &[C::Bool], profile: Profile) {
     let mut cursor = Cursor {
         items: inputs,
         position: 0,
@@ -178,16 +188,22 @@ fn authorize<C: Circuit>(cs: &mut C, inputs: &[C::Bool]) {
 
     let digest_le = stream_to_le(&digest);
     let challenge = base64url_chars(cs, &digest);
-    let slots: Vec<_> = (0..MAX_APPROVALS)
-        .map(|_| {
+    let kinds = profile.slot_kinds();
+    let slots: Vec<_> = kinds
+        .iter()
+        .map(|&kind| {
             let bits = cursor.take(SLOT_BITS);
-            approval_slot(cs, &bits, &roster_root, &digest_le, &challenge)
+            approval_slot(cs, &bits, kind, &roster_root, &digest_le, &challenge)
         })
         .collect();
 
-    // (3) Packed, strictly increasing roster positions: no member counts twice
-    // and padding cannot hide approvals.
-    for pair in slots.windows(2) {
+    // (3) Within each group of same-kind slots: packed, strictly increasing
+    // roster positions, so no member counts twice and padding cannot hide
+    // approvals. Different groups hold members of different committed kinds.
+    for (pair, kind_pair) in slots.windows(2).zip(kinds.windows(2)) {
+        if kind_pair[0] != kind_pair[1] {
+            continue;
+        }
         let [current, next] = pair else {
             unreachable!()
         };
@@ -301,6 +317,7 @@ fn hint_indicators<C: Circuit>(cs: &mut C, bits: Vec<C::Bool>) -> Vec<C::Bool> {
 fn approval_slot<C: Circuit>(
     cs: &mut C,
     bits: &[C::Bool],
+    kind: SlotKind,
     roster_root: &[C::Bool],
     digest_le: &[C::Bool],
     challenge: &[Z<C>],
@@ -326,13 +343,26 @@ fn approval_slot<C: Circuit>(
     let one = constant::<C>(1);
     let enabled = cs.bitz::<LIMBS>(enabled_bit.clone());
     let passkey = cs.bitz::<LIMBS>(passkey_bit.clone());
-    let passkey_selected = hint_value(cs, 1, {
-        let (enabled, passkey) = (enabled_bit.clone(), passkey_bit.clone());
-        move |eval| u64::from(eval(&enabled) && eval(&passkey))
-    });
-    let passkey_selected = cs.bitz::<LIMBS>(passkey_selected[0].clone());
-    cs.assert_r1c::<LIMBS>(enabled.clone(), passkey, passkey_selected.clone());
-    let secp256k1_selected = enabled.clone() - passkey_selected.clone();
+    let (secp256k1_selected, passkey_selected) = match kind {
+        SlotKind::Any => {
+            let selected = hint_value(cs, 1, {
+                let (enabled, passkey) = (enabled_bit.clone(), passkey_bit.clone());
+                move |eval| u64::from(eval(&enabled) && eval(&passkey))
+            });
+            let selected = cs.bitz::<LIMBS>(selected[0].clone());
+            cs.assert_r1c::<LIMBS>(enabled.clone(), passkey, selected.clone());
+            (enabled.clone() - selected.clone(), selected)
+        }
+        // A typed slot fixes the kind bit hashed into the leaf.
+        SlotKind::Secp256k1 => {
+            assert_zero(cs, passkey);
+            (enabled.clone(), Z::<C>::zero())
+        }
+        SlotKind::Passkey => {
+            assert_zero(cs, one.clone() - passkey);
+            (Z::<C>::zero(), enabled.clone())
+        }
+    };
 
     // (2) The leaf commits to kind, weight, key, and RP ID hash.
     let kind_low = cs.xor(passkey_bit.clone(), C::Bool::from(true));
@@ -383,91 +413,24 @@ fn approval_slot<C: Circuit>(
     }
     assert_eq_bits(cs, &enabled, &current, roster_root);
 
-    // (2) secp256k1 approval of the raw digest under the member's key.
-    let k1_inputs: [C::Bool; 7 * 256] = array::from_fn(|i| {
-        if i < 256 {
-            digest_le[i].clone()
-        } else {
-            k1_words[i - 256].clone()
-        }
-    });
-    verify_digest_circuit(cs, Curve::Secp256k1, &k1_inputs);
-    assert_eq_bits(
-        cs,
-        &secp256k1_selected,
-        &k1_words[..256],
-        &stream_to_le(&pk_x),
-    );
-    assert_eq_bits(
-        cs,
-        &secp256k1_selected,
-        &k1_words[256..512],
-        &stream_to_le(&pk_y),
-    );
-
-    // (2) WebAuthn: H(cdj) over the selected number of prover-padded blocks.
-    let mut state = constant_state::<C>();
-    let mut states = Vec::with_capacity(CDJ_MAX_BLOCKS);
-    for block in cdj.chunks(512) {
-        state = compress_stream(cs, &state, block);
-        states.push(state.clone());
+    if kind != SlotKind::Passkey {
+        secp256k1_approval(cs, digest_le, &k1_words, &pk_x, &pk_y, &secp256k1_selected);
     }
-    let candidates = &states[CDJ_MIN_BLOCKS - 1..];
-    let client_hash = hint_bits(cs, 256, {
-        let (count, candidates) = (cdj_count.clone(), candidates.to_vec());
-        move |eval, i| {
-            let selected = count.iter().position(eval).unwrap_or(0);
-            eval(&candidates[selected][i])
-        }
-    });
-    let mut count_sum = Z::<C>::zero();
-    for (selector, candidate) in cdj_count.iter().zip(candidates) {
-        let selector = cs.bitz::<LIMBS>(selector.clone());
-        count_sum += selector.clone();
-        assert_eq_bits(cs, &selector, &client_hash, candidate);
-    }
-    assert_zero(cs, count_sum - one.clone());
-
-    let mut signed = auth_data.clone();
-    signed.extend(client_hash);
-    let message = sha256(cs, &signed);
-    let message_le = stream_to_le(&message);
-    let r1_inputs: [C::Bool; 7 * 256] = array::from_fn(|i| {
-        if i < 256 {
-            message_le[i].clone()
-        } else {
-            r1_words[i - 256].clone()
-        }
-    });
-    verify_digest_circuit(cs, Curve::P256, &r1_inputs);
-    assert_eq_bits(
-        cs,
-        &passkey_selected,
-        &r1_words[..256],
-        &stream_to_le(&pk_x),
-    );
-    assert_eq_bits(
-        cs,
-        &passkey_selected,
-        &r1_words[256..512],
-        &stream_to_le(&pk_y),
-    );
-
-    // Strict WebAuthn fields: canonical prefix with challenge = base64url(digest),
-    // committed RP ID hash, and user presence and verification flags.
-    let prefix_bits = CDJ_PREFIX.len() * 8;
-    assert_eq_constant(cs, &passkey_selected, &cdj[..prefix_bits], CDJ_PREFIX);
-    for (k, char) in challenge.iter().enumerate() {
-        let start = prefix_bits + 8 * k;
-        let byte = lift_be(cs, &cdj[start..start + 8]);
-        cs.assert_r1c::<LIMBS>(passkey_selected.clone(), byte - char.clone(), Z::<C>::zero());
-    }
-    let quote = (CDJ_CHECKED_LEN - 1) * 8;
-    assert_eq_constant(cs, &passkey_selected, &cdj[quote..quote + 8], b"\"");
-    assert_eq_bits(cs, &passkey_selected, &auth_data[..256], &rp_id_hash);
-    for flag_bit in [7, 5] {
-        let flag = cs.bitz::<LIMBS>(auth_data[256 + flag_bit].clone());
-        cs.assert_r1c::<LIMBS>(passkey_selected.clone(), one.clone() - flag, Z::<C>::zero());
+    if kind != SlotKind::Secp256k1 {
+        passkey_approval(
+            cs,
+            &PasskeyEvidence {
+                r1_words: &r1_words,
+                auth_data: &auth_data,
+                cdj: &cdj,
+                cdj_count: &cdj_count,
+            },
+            &pk_x,
+            &pk_y,
+            &rp_id_hash,
+            challenge,
+            &passkey_selected,
+        );
     }
 
     // (5) Weight counted only for enabled slots: counted = enabled * weight.
@@ -492,6 +455,118 @@ fn approval_slot<C: Circuit>(
         index,
         index_bits,
         counted_weight,
+    }
+}
+
+/// (2) secp256k1 approval of the raw digest under the member's key.
+fn secp256k1_approval<C: Circuit>(
+    cs: &mut C,
+    digest_le: &[C::Bool],
+    k1_words: &[C::Bool],
+    pk_x: &[C::Bool],
+    pk_y: &[C::Bool],
+    selected: &Z<C>,
+) {
+    let k1_inputs: [C::Bool; 7 * 256] = array::from_fn(|i| {
+        if i < 256 {
+            digest_le[i].clone()
+        } else {
+            k1_words[i - 256].clone()
+        }
+    });
+    verify_digest_circuit(cs, Curve::Secp256k1, &k1_inputs);
+    assert_eq_bits(cs, selected, &k1_words[..256], &stream_to_le(pk_x));
+    assert_eq_bits(cs, selected, &k1_words[256..512], &stream_to_le(pk_y));
+}
+
+/// A passkey slot's WebAuthn inputs.
+struct PasskeyEvidence<'a, B> {
+    r1_words: &'a [B],
+    auth_data: &'a [B],
+    cdj: &'a [B],
+    cdj_count: &'a [B],
+}
+
+/// (2) A strict WebAuthn P-256 assertion over the digest under the member's
+/// key: H(cdj) over the selected number of prover-padded blocks, then P-256
+/// over `SHA256(authData || H(cdj))`.
+fn passkey_approval<C: Circuit>(
+    cs: &mut C,
+    evidence: &PasskeyEvidence<'_, C::Bool>,
+    pk_x: &[C::Bool],
+    pk_y: &[C::Bool],
+    rp_id_hash: &[C::Bool],
+    challenge: &[Z<C>],
+    passkey_selected: &Z<C>,
+) {
+    let PasskeyEvidence {
+        r1_words,
+        auth_data,
+        cdj,
+        cdj_count,
+    } = *evidence;
+    let one = constant::<C>(1);
+    let mut state = constant_state::<C>();
+    let mut states = Vec::with_capacity(CDJ_MAX_BLOCKS);
+    for block in cdj.chunks(512) {
+        state = compress_stream(cs, &state, block);
+        states.push(state.clone());
+    }
+    let candidates = &states[CDJ_MIN_BLOCKS - 1..];
+    let client_hash = hint_bits(cs, 256, {
+        let (count, candidates) = (cdj_count.to_vec(), candidates.to_vec());
+        move |eval, i| {
+            let selected = count.iter().position(eval).unwrap_or(0);
+            eval(&candidates[selected][i])
+        }
+    });
+    let mut count_sum = Z::<C>::zero();
+    for (selector, candidate) in cdj_count.iter().zip(candidates) {
+        let selector = cs.bitz::<LIMBS>(selector.clone());
+        count_sum += selector.clone();
+        assert_eq_bits(cs, &selector, &client_hash, candidate);
+    }
+    assert_zero(cs, count_sum - one.clone());
+
+    let mut signed = auth_data.to_vec();
+    signed.extend(client_hash);
+    let message = sha256(cs, &signed);
+    let message_le = stream_to_le(&message);
+    let r1_inputs: [C::Bool; 7 * 256] = array::from_fn(|i| {
+        if i < 256 {
+            message_le[i].clone()
+        } else {
+            r1_words[i - 256].clone()
+        }
+    });
+    verify_digest_circuit(cs, Curve::P256, &r1_inputs);
+    assert_eq_bits(cs, passkey_selected, &r1_words[..256], &stream_to_le(pk_x));
+    assert_eq_bits(
+        cs,
+        passkey_selected,
+        &r1_words[256..512],
+        &stream_to_le(pk_y),
+    );
+
+    // Strict WebAuthn fields: canonical prefix with challenge = base64url(digest),
+    // committed RP ID hash, and user presence and verification flags.
+    let prefix_bits = CDJ_PREFIX.len() * 8;
+    assert_eq_constant(cs, passkey_selected, &cdj[..prefix_bits], CDJ_PREFIX);
+    for (k, char) in challenge.iter().enumerate() {
+        let start = prefix_bits + 8 * k;
+        let byte = lift_be(cs, &cdj[start..start + 8]);
+        cs.assert_r1c::<LIMBS>(
+            passkey_selected.clone(),
+            byte - char.clone(),
+            Z::<C>::zero(),
+        );
+    }
+    let quote = (CDJ_CHECKED_LEN - 1) * 8;
+    assert_eq_constant(cs, passkey_selected, &cdj[quote..quote + 8], b"\"");
+    assert_eq_bits(cs, passkey_selected, &auth_data[..256], rp_id_hash);
+    for flag_bit in [7, 5] {
+        let flag = cs.bitz::<LIMBS>(auth_data[256 + flag_bit].clone());
+        cs.assert_r1c::<LIMBS>(passkey_selected.clone(), one.clone() - flag, Z::<C>::zero());
     }
 }
 
