@@ -13,7 +13,7 @@ storage-layout compatibility check. The latter is now part of the contracts
 success gate. Root `.gitmodules` owns the imported Solidity dependencies. Tempo's
 `specs.yml` still tests `tips/verify` with its own Foundry/Tempo revisions.
 
-## Remaining migration prerequisites
+## Workspace and CI
 
 The root Cargo workspace now owns the imported Zones crates, prover binaries,
 and lockfile. `cargo zone-xtask` runs Zones tooling; `cargo xtask` continues to run
@@ -23,15 +23,11 @@ Root lint and test jobs cover the unified workspace. The build matrix includes
 Zones and prover binaries, and root nextest configuration preserves Zones’
 integration-test concurrency limits. Imported lint/test/build workflows are retired.
 
-The remaining workflow and publication prerequisites are:
-
-- Zones reproducible builds have a separate concurrency group so they cannot
-  cancel Tempo builds, and are gated to `tempoxyz/zones` because the shared recipe
-  would run Tempo's `scripts/reproducible-build.sh`. Their recipe/script and Cargo
-  layout still need migration.
-
-The root Dependabot configuration also needs the final workspace layout before
-retiring the imported dependency configuration.
+Root Dependabot covers the shared Cargo workspace and GitHub Actions workflows,
+plus Docker recipes at `/` and `/zones/docker`, each with its own one-PR limit.
+The imported dependency configuration and redundant lint/Cross configs are retired.
+`zones/Justfile` remains the documented local recipe collection; prover E2E rollout
+documentation lives in [docs/PROVER_E2E.md](docs/PROVER_E2E.md).
 
 The root Test workflow builds Earn before Zones and distributes
 `crates/zones/contracts/out` to each Rust test shard. The merged
@@ -60,3 +56,23 @@ variable (each is disabled unless set to `true`):
 
 The gates deliberately separate repository changes from external cutover. These
 PRs do not deploy sensors, alter AWS/Depot trust, or enable publishing variables.
+
+The Zones reproducible workflow invokes `zones/scripts/reproducible-build.sh`
+with the root workspace as context. Its `zones-reproducible` profile preserves
+Zones' unwind behavior while Tempo's `reproducible` profile keeps abort behavior.
+The workflows retain separate concurrency groups. Independent Linux rebuilds are
+still required to establish byte-for-byte reproducibility after the import.
+
+Automatic reproducible builds on `main` require `ZONES_REPRODUCIBLE_ENABLED=true`.
+Manual dispatch remains available for validating the root-context build before
+turning on automatic builds. The separate profile enables SPF's `catch_unwind`
+recovery for invalid MPT proofs.
+
+The final reproducible publication pipeline from
+[tempoxyz/zones#1264](https://github.com/tempoxyz/zones/pull/1264) builds and compares
+complete production node image IDs before promotion, delays companion tags until
+verification succeeds, and verifies archived Linux x86_64 release binaries against
+an independent clean rebuild. Production and verification share the canonical
+prover compiler and timestamp-normalizing EIF packager. The Docker pipeline keeps
+`ZONES_PUBLISH_ENABLED` and `ZONES_EVENTS_ENABLED` as external cutover gates.
+See [reproduction instructions](docs/REPRODUCIBLE_BUILDS.md).

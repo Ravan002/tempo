@@ -110,6 +110,20 @@ impl TempoBlockExecutor<'_> {
                 StorageAction::Sload(address, key, value) => {
                     let _ = self.replay_state.sload_exact(db, address, key, value)?;
                 }
+                StorageAction::FeeTokenBalanceCheck(
+                    address,
+                    key,
+                    sload_value,
+                    required,
+                    sufficient,
+                ) => {
+                    let balance =
+                        self.replay_state
+                            .sload_current_or(db, address, key, sload_value)?;
+                    if (balance >= required) != sufficient {
+                        return Err(StorageActionReplayError::ActionConflict.into());
+                    }
+                }
                 StorageAction::Sstore(address, key, sload_value, value) => {
                     self.replay_state
                         .sstore_exact(db, address, key, sload_value, value)?;
@@ -569,9 +583,13 @@ impl ExpiringNonceReplayState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{TempoBlockEnv, TempoEvm, TempoEvmExt, build_tempo_evm};
+    use crate::{
+        TempoBlockEnv, TempoEvm, TempoEvmExt, build_tempo_evm,
+        test_utils::{TestExecutorBuilder, test_chainspec},
+    };
     use evm2::evm::{AccountInfo, InMemoryDB, precompile::NoPrecompiles};
-    use tempo_chainspec::hardfork::TempoHardfork;
+    use std::sync::Arc;
+    use tempo_chainspec::{TempoChainSpec, hardfork::TempoHardfork};
 
     fn empty_evm(database: InMemoryDB) -> TempoEvm<'static> {
         build_tempo_evm(
@@ -591,6 +609,97 @@ mod tests {
         evm.overlay_db_mut()
             .insert_account_storage(&address, &slot, &value);
         evm
+    }
+
+    fn executor_with_storage(
+        chainspec: &Arc<TempoChainSpec>,
+        address: Address,
+        slot: U256,
+        value: U256,
+    ) -> TempoBlockExecutor<'_> {
+        let mut executor = TestExecutorBuilder::default().build(InMemoryDB::default(), chainspec);
+        let db = executor.evm_mut().overlay_db_mut();
+        db.insert_account_info(&address, AccountInfo::default());
+        db.insert_account_storage(&address, &slot, &value);
+        executor
+    }
+
+    #[test]
+    fn fee_token_balance_check_replays_only_when_affordability_is_unchanged() {
+        let token = Address::repeat_byte(0x42);
+        let slot = U256::from(7);
+        let chainspec = test_chainspec();
+        for (observed, current, sufficient, succeeds) in [
+            (100, 80, true, true),
+            (100, 120, true, true),
+            (100, 50, true, true),
+            (100, 49, true, false),
+            (20, 49, false, true),
+            (20, 0, false, true),
+            (20, 50, false, false),
+        ] {
+            let mut executor = executor_with_storage(&chainspec, token, slot, U256::from(current));
+            let mut actions = vec![StorageAction::FeeTokenBalanceCheck(
+                token,
+                slot,
+                U256::from(observed),
+                U256::from(50),
+                sufficient,
+            )];
+            if sufficient {
+                actions.push(StorageAction::Sdec(
+                    token,
+                    slot,
+                    U256::from(observed),
+                    U256::from(10),
+                ));
+            }
+            let result = executor.replay_actions(actions, None);
+            if succeeds {
+                let state = result.unwrap();
+                let value = state
+                    .account_changes()
+                    .find(|changes| changes.address == token)
+                    .and_then(|changes| changes.storage.slots.get(&slot).map(|slot| slot.value));
+                if sufficient {
+                    let value = value.unwrap();
+                    assert_eq!(value.original, U256::from(current));
+                    assert_eq!(value.current, U256::from(current - 10));
+                } else {
+                    assert!(value.is_none());
+                }
+            } else {
+                assert_eq!(
+                    StorageActionReplayError::from_block_execution_error(&result.unwrap_err()),
+                    Some(StorageActionReplayError::ActionConflict)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fee_token_balance_check_does_not_relax_later_exact_reads() {
+        let token = Address::repeat_byte(0x42);
+        let slot = U256::from(7);
+        let chainspec = test_chainspec();
+        let mut executor = executor_with_storage(&chainspec, token, slot, U256::from(80));
+        let result = executor.replay_actions(
+            [
+                StorageAction::FeeTokenBalanceCheck(
+                    token,
+                    slot,
+                    U256::from(100),
+                    U256::from(50),
+                    true,
+                ),
+                StorageAction::Sload(token, slot, U256::from(100)),
+            ],
+            None,
+        );
+        assert_eq!(
+            StorageActionReplayError::from_block_execution_error(&result.unwrap_err()),
+            Some(StorageActionReplayError::ActionConflict)
+        );
     }
 
     #[test]

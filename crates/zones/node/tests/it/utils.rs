@@ -10,6 +10,7 @@ use alloy_sol_types::{SolCall, SolEvent, SolValue};
 use commonware_codec::Encode as _;
 use commonware_cryptography::{Signer as _, ed25519::PrivateKey as Ed25519PrivateKey};
 use eyre::WrapErr;
+use futures::future::try_join_all;
 use k256::SecretKey;
 use p256::ecdsa::SigningKey as P256SigningKey;
 use reth_node_api::FullNodeComponents;
@@ -66,7 +67,7 @@ use tempo_precompiles::{
     },
     zone_factory::portal,
 };
-use tempo_primitives::{TempoHeader, transaction::tt_signature::TempoSignature};
+use tempo_primitives::TempoHeader;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio_util::sync::CancellationToken;
 use zone_chainspec::{ZoneChainSpec, test_utils::set_tempo_fork};
@@ -4104,14 +4105,13 @@ async fn start_real_p2p_cluster_inner(
     }
     let _ = std::fs::remove_dir_all(&config_dir);
 
-    let mut nodes = Vec::with_capacity(active_nodes);
-    for (index, config) in configs.into_iter().take(active_nodes).enumerate() {
-        let additional_decryption_keys = if index == 0 {
-            Vec::new()
-        } else {
-            vec![SecretKey::from(attestation_signers[0].credential())]
-        };
-        nodes.push(
+    let nodes = try_join_all(configs.into_iter().take(active_nodes).enumerate().map(
+        |(index, config)| {
+            let additional_decryption_keys = if index == 0 {
+                Vec::new()
+            } else {
+                vec![SecretKey::from(attestation_signers[0].credential())]
+            };
             ZoneTestNode::launch_with_genesis_and_withdrawal_batch_interval_and_decryption_keys(
                 l1_rpc_urls[index].clone(),
                 portal_address,
@@ -4124,9 +4124,9 @@ async fn start_real_p2p_cluster_inner(
                 additional_decryption_keys,
                 prover_config.clone(),
             )
-            .await?,
-        );
-    }
+        },
+    ))
+    .await?;
 
     Ok(RealP2pClusterParts {
         cluster: RealP2pCluster {
@@ -4346,28 +4346,14 @@ fn build_auth_token(
     alloy_primitives::hex::encode([sig.as_rsy().as_slice(), &fields].concat())
 }
 
-fn build_auth_token_with_signature(
-    signature: TempoSignature,
-    zone_id: u32,
-    chain_id: u64,
-) -> String {
-    use zone_node::rpc::auth::build_token_fields;
-
-    let now = now_secs();
-    let expires_at = now + 600;
-
-    let (fields, _) = build_token_fields(zone_id, chain_id, now, expires_at);
-    auth_tokens::build_token_with_signature(signature, &fields)
-}
-
 fn build_p256_auth_token(signing_key: &P256SigningKey, zone_id: u32, chain_id: u64) -> String {
     let now = now_secs();
     let expires_at = now + 600;
-    let (_, digest) = zone_node::rpc::auth::build_token_fields(zone_id, chain_id, now, expires_at);
-    build_auth_token_with_signature(
+    let (fields, digest) =
+        zone_node::rpc::auth::build_token_fields(zone_id, chain_id, now, expires_at);
+    auth_tokens::build_token_with_signature(
         sign_p256_signature(digest, signing_key).expect("p256 signing failed"),
-        zone_id,
-        chain_id,
+        &fields,
     )
 }
 
@@ -4379,12 +4365,12 @@ fn build_webauthn_auth_token(
 ) -> String {
     let now = now_secs();
     let expires_at = now + 600;
-    let (_, digest) = zone_node::rpc::auth::build_token_fields(zone_id, chain_id, now, expires_at);
-    build_auth_token_with_signature(
+    let (fields, digest) =
+        zone_node::rpc::auth::build_token_fields(zone_id, chain_id, now, expires_at);
+    auth_tokens::build_token_with_signature(
         sign_webauthn_signature(signing_key, challenge_digest.unwrap_or(digest))
             .expect("webauthn signing failed"),
-        zone_id,
-        chain_id,
+        &fields,
     )
 }
 
@@ -4397,12 +4383,13 @@ fn build_keychain_auth_token(
 ) -> (String, Address) {
     let now = now_secs();
     let expires_at = now + 600;
-    let (_, digest) = zone_node::rpc::auth::build_token_fields(zone_id, chain_id, now, expires_at);
+    let (fields, digest) =
+        zone_node::rpc::auth::build_token_fields(zone_id, chain_id, now, expires_at);
     let (signature, key_id) = sign_keychain_signature(digest, signing_key, root_account, version)
         .expect("keychain signing failed");
 
     (
-        build_auth_token_with_signature(signature, zone_id, chain_id),
+        auth_tokens::build_token_with_signature(signature, &fields),
         key_id,
     )
 }

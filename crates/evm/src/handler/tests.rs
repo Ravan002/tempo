@@ -181,6 +181,7 @@ impl ProtocolFeeManager for ValidatorTokenLookupFailsFeeManager {
         _host: &mut Evm<'_, TempoEvmTypes>,
         tx: &TempoTxEnv,
         _fee_payer: Address,
+        _max_fee: U256,
         _spec: TempoHardfork,
     ) -> tempo_precompiles::error::Result<Address> {
         Ok(tx.evm_tx().fee_token().unwrap_or(DEFAULT_FEE_TOKEN))
