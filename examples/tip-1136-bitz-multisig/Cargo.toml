@@ -1,0 +1,34 @@
+[package]
+name = "tip-1136-bitz"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "TIP-1136 private weighted multisig proved with BitZ (integer constraints committed over binary fields)"
+
+# Standalone research workspace; not a member of the Tempo node workspace.
+[workspace]
+
+[dependencies]
+anyhow = "1"
+bitz-cli = { git = "https://github.com/worldfnd/BitZ", rev = "d7e7257b8f26125c0dbe6fef4e8e5ed4789773bf" }
+circuit = { git = "https://github.com/worldfnd/BitZ", rev = "d7e7257b8f26125c0dbe6fef4e8e5ed4789773bf" }
+crypto-bigint = "0.7.5"
+k256 = { version = "0.13", features = ["ecdsa"] }
+num-bigint = "0.4"
+num-traits = "0.2"
+p256 = { version = "0.13", features = ["ecdsa"] }
+pcs = { git = "https://github.com/worldfnd/BitZ", rev = "d7e7257b8f26125c0dbe6fef4e8e5ed4789773bf" }
+sha2 = "0.10"
+
+[dev-dependencies]
+rayon = "1.10"
+base64 = "0.22"
+
+[profile.release]
+lto = true
+codegen-units = 1
+
+[profile.dev]
+opt-level = 3

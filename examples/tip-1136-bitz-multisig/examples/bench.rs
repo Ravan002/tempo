@@ -1,0 +1,69 @@
+//! Times setup, witness generation, commitment, proving, and verification for
+//! the alice (secp256k1) + carol (passkey) + eve (secp256k1) approval.
+//!
+//! ```sh
+//! RAYON_NUM_THREADS=1 cargo run --release --example bench
+//! ```
+
+#[path = "../tests/common/mod.rs"]
+mod fixtures;
+
+use std::time::Instant;
+
+use fixtures::*;
+use tip_1136_bitz::{policy::Witness, relation::witness_bits, setup};
+
+fn main() -> anyhow::Result<()> {
+    let approvals: Vec<_> = [ALICE, CAROL, EVE].map(|i| approve(i, &digest())).into();
+    let witness = Witness::new(&policy(), &approvals, &digest())?;
+
+    let start = Instant::now();
+    let system = setup(statement())?;
+    let setup_time = start.elapsed();
+    let stats = system.stats();
+
+    let start = Instant::now();
+    let bits = witness_bits(&witness);
+    let assignment = system.witness(&bits)?;
+    let witness_time = start.elapsed();
+
+    let start = Instant::now();
+    let commitment = system.commit(&assignment)?;
+    let commit_time = start.elapsed();
+
+    let start = Instant::now();
+    let proof = system.prove(assignment, commitment)?;
+    let prove_time = start.elapsed();
+
+    let start = Instant::now();
+    system.verify(&proof)?;
+    let verify_time = start.elapsed();
+
+    // Q100 elements are encoded in 16 bytes.
+    let spartan_elements = proof.spartan.outer.sumcheck.round_polynomials.len() * 4
+        + 3
+        + proof.spartan.inner.round_polynomials.len() * 3;
+    let proof_bytes =
+        32 + proof.opening.narg_string.len() + proof.opening.hints.len() + 16 * spartan_elements;
+
+    println!("threads            {}", rayon::current_num_threads());
+    println!("private input bits {}", bits.len());
+    println!("r1cs constraints   {}", stats.constraints);
+    println!("assignment bits    {}", stats.assignment_bits);
+    println!(
+        "committed bits     {} (padded {})",
+        stats.committed_bits, stats.padded_committed_bits
+    );
+    println!("opening path       {:?}", stats.opening_path);
+    println!("setup              {setup_time:?}");
+    println!("witness            {witness_time:?}");
+    println!("commit             {commit_time:?}");
+    println!("prove (after commit) {prove_time:?}");
+    println!(
+        "prover total       {:?}",
+        witness_time + commit_time + prove_time
+    );
+    println!("verify             {verify_time:?}");
+    println!("proof bytes        {proof_bytes}");
+    Ok(())
+}
