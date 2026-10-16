@@ -528,6 +528,8 @@ fn passkey_approval<C: Circuit>(
     }
     assert_zero(cs, count_sum - one.clone());
 
+    assert_sha256_padding(cs, cdj, cdj_count);
+
     let mut signed = auth_data.to_vec();
     signed.extend(client_hash);
     let message = sha256(cs, &signed);
@@ -567,6 +569,121 @@ fn passkey_approval<C: Circuit>(
     for flag_bit in [7, 5] {
         let flag = cs.bitz::<LIMBS>(auth_data[256 + flag_bit].clone());
         cs.assert_r1c::<LIMBS>(passkey_selected.clone(), one.clone() - flag, Z::<C>::zero());
+    }
+}
+
+/// The prover-supplied `clientDataJSON` blocks are exactly SHA-256's padding
+/// of a message of some length `L >= CDJ_CHECKED_LEN`, and the selected block
+/// count is the padded length. Then the selected compression-chain output is
+/// `SHA256(cdj[..L])`, and the checked prefix lies inside the message.
+///
+/// A one-hot marker `e` sits at byte `L`:
+/// - `sum e = 1`, `L = sum i * e_i`, and no marker in the checked prefix;
+/// - `e_i * (byte_i - 0x80) = 0`;
+/// - `64 * blocks - (L + 9)` lies in `[0, 64)`;
+/// - the selected block's last 8 bytes equal `8 * L`;
+/// - bytes strictly after `L` and before the length field are zero.
+fn assert_sha256_padding<C: Circuit>(cs: &mut C, cdj: &[C::Bool], cdj_count: &[C::Bool]) {
+    const BYTES: usize = CDJ_MAX_BLOCKS * 64;
+    let bytes: Vec<Z<C>> = (0..BYTES)
+        .map(|i| lift_be(cs, &cdj[8 * i..8 * i + 8]))
+        .collect();
+    let counts: Vec<Z<C>> = cdj_count
+        .iter()
+        .map(|bit| cs.bitz::<LIMBS>(bit.clone()))
+        .collect();
+    let blocks = counts
+        .iter()
+        .enumerate()
+        .fold(Z::<C>::zero(), |sum, (k, selector)| {
+            sum + selector.clone() * C::Coefficient::<LIMBS>::from((CDJ_MIN_BLOCKS + k) as u64)
+        });
+
+    // The marker at L, read off the selected block's length field.
+    let markers = hint_bits(cs, BYTES, {
+        let (cdj, count) = (cdj.to_vec(), cdj_count.to_vec());
+        move |eval, i| {
+            let blocks = CDJ_MIN_BLOCKS + count.iter().position(eval).unwrap_or(0);
+            let field = &cdj[(64 * blocks - 8) * 8..64 * blocks * 8];
+            (eval_be(eval, field) / 8) as usize == i
+        }
+    });
+    let markers: Vec<Z<C>> = markers
+        .iter()
+        .map(|bit| cs.bitz::<LIMBS>(bit.clone()))
+        .collect();
+    let one = constant::<C>(1);
+    let count = markers
+        .iter()
+        .cloned()
+        .fold(Z::<C>::zero(), |sum, e| sum + e);
+    assert_zero(cs, count - one.clone());
+    let length = markers
+        .iter()
+        .enumerate()
+        .fold(Z::<C>::zero(), |sum, (i, e)| {
+            sum + e.clone() * C::Coefficient::<LIMBS>::from(i as u64)
+        });
+    let in_prefix = markers[..CDJ_CHECKED_LEN]
+        .iter()
+        .cloned()
+        .fold(Z::<C>::zero(), |sum, e| sum + e);
+    assert_zero(cs, in_prefix);
+    for (marker, byte) in markers.iter().zip(&bytes) {
+        cs.assert_r1c::<LIMBS>(
+            marker.clone(),
+            byte.clone() - constant::<C>(0x80),
+            Z::<C>::zero(),
+        );
+    }
+
+    // The block count is the padded length of L bytes.
+    let slack = hint_value(cs, 6, {
+        let (markers_bits, count) = (cdj.to_vec(), cdj_count.to_vec());
+        move |eval| {
+            let blocks = (CDJ_MIN_BLOCKS + count.iter().position(eval).unwrap_or(0)) as u64;
+            let field = &markers_bits[((64 * blocks - 8) * 8) as usize..(64 * blocks * 8) as usize];
+            (64 * blocks).wrapping_sub(eval_be(eval, field) / 8 + 9)
+        }
+    });
+    let slack = lift(cs, &slack);
+    assert_zero(
+        cs,
+        blocks * C::Coefficient::<LIMBS>::from(64) - length.clone() - constant::<C>(9) - slack,
+    );
+
+    // The selected block ends with the 64-bit big-endian bit length.
+    for (k, selector) in counts.iter().enumerate() {
+        let end = 64 * (CDJ_MIN_BLOCKS + k);
+        let field = lift_be(cs, &cdj[(end - 8) * 8..end * 8]);
+        cs.assert_r1c::<LIMBS>(
+            selector.clone(),
+            field - length.clone() * C::Coefficient::<LIMBS>::from(8),
+            Z::<C>::zero(),
+        );
+    }
+
+    // Zero fill: byte i is zero when L < i and i precedes the length field.
+    let fill = hint_bits(cs, BYTES, {
+        let (cdj, count) = (cdj.to_vec(), cdj_count.to_vec());
+        move |eval, i| {
+            let blocks = CDJ_MIN_BLOCKS + count.iter().position(eval).unwrap_or(0);
+            let field = &cdj[(64 * blocks - 8) * 8..64 * blocks * 8];
+            let length = (eval_be(eval, field) / 8) as usize;
+            length < i && i < 64 * blocks - 8
+        }
+    });
+    let mut after = Z::<C>::zero();
+    for (i, (marker, byte)) in markers.iter().zip(&bytes).enumerate() {
+        let before_field = counts
+            .iter()
+            .enumerate()
+            .filter(|(k, _)| i + 8 < 64 * (CDJ_MIN_BLOCKS + k))
+            .fold(Z::<C>::zero(), |sum, (_, selector)| sum + selector.clone());
+        let fill = cs.bitz::<LIMBS>(fill[i].clone());
+        cs.assert_r1c::<LIMBS>(after.clone(), before_field, fill.clone());
+        cs.assert_r1c::<LIMBS>(fill, byte.clone(), Z::<C>::zero());
+        after += marker.clone();
     }
 }
 
@@ -677,7 +794,7 @@ where
     C: Circuit,
     H: Fn(Eval<'_, C::Bool>, usize) -> bool + Send + Sync + 'static,
 {
-    assert_eq!(count, 256);
+    assert_eq!(count, 256, "hint_bits allocates 256-bit words");
     let packed = cs.hint::<LIMBS, 256, 4, _>(move |context| {
         let eval = |b: &C::Bool| context.eval_bool(b);
         Ok(PackedBits::from_fn(|i| bit(&eval, i)))

@@ -41,7 +41,7 @@ The checks are the same as in the Noir example:
 - **Ordering.** Enabled slots are packed first with strictly increasing roster positions.
 - **Signatures.**
   - secp256k1 members sign the digest directly.
-  - Passkey members use strict WebAuthn: the `clientDataJSON` must start with the canonical prefix, with `challenge` equal to `base64url(digest)`. The committed RP ID hash and the UP and UV flags are required, and the signature is P-256 over `sha256(authData || sha256(clientDataJSON))`.
+  - Passkey members use strict WebAuthn: the `clientDataJSON` must start with the canonical prefix, with `challenge` equal to `base64url(digest)`. The committed RP ID hash and the UP and UV flags are required, and the signature is P-256 over `sha256(authData || sha256(clientDataJSON))`. The SHA-256 padding of `clientDataJSON` is constrained in-circuit, so the hashed blocks are exactly `SHA256(clientDataJSON)` for a message that contains the checked prefix.
 - **Threshold.** The enabled weights sum to at least the threshold.
 
 ## Lean
@@ -101,10 +101,7 @@ Before the BitZ changes, `Mixed` took 64 s to prove and 6.6 s to verify on one t
 
 ## Gaps before this can replace the Noir path
 
-1. **Zero knowledge.** The BitZ prover and the Ligerito openings do not hide the witness. TIP-1136 requires the inner proof itself to hide the policy and credentials. Until then, a proof leaks information about the roster, the keys, and which members signed.
+1. **Zero knowledge.** The BitZ prover and the Ligerito openings do not hide the witness. TIP-1136 requires the inner proof itself to hide the policy and credentials. Until then, a proof leaks information about the roster, the keys, and which members signed. [`ZK.md`](ZK.md) lists what each stage reveals and the work needed.
 2. **Proof size and verification.** A 300 KB proof with linear-time verification is not usable onchain. A fixed onchain verifier needs either the paper's optimizations or a recursive wrapper. A Groth16 wrapper would reintroduce the BN254/setup assumptions that a hash-based stack avoids.
 3. **secp256k1.** The ECDSA gadget is a curve-parameterized fork of BitZ's Freigen-ported P-256 circuit. Freigen's proofs cover P-256 only.
-4. **WebAuthn padding.** The prover supplies the SHA-256 padding of `clientDataJSON` and selects a hash over 2–4 blocks; the padding itself is not constrained.
-   - **Soundness argument:** the checked 80-byte prefix (canonical prefix, `base64url(digest)` computed in-circuit, closing quote) lies inside the hashed blocks. Reusing a signature made for another challenge therefore requires a different block sequence with the same compression-chain output, which is a SHA-256 collision.
-   - **Profile limits:** `clientDataJSON` is at most 247 bytes, and `authenticatorData` must be exactly 37 bytes.
-5. Origin checks, signature counters, and the OIDC and SMS factors are out of scope, as in the Noir example.
+4. Origin checks, signature counters, and the OIDC and SMS factors are out of scope, as in the Noir example.

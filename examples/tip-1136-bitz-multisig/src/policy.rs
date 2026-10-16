@@ -282,6 +282,11 @@ impl Slot {
             cdj_blocks: [0; 64 * CDJ_MAX_BLOCKS],
             cdj_block_count: CDJ_MIN_BLOCKS,
         };
+        // The circuit checks SHA-256 padding in every slot that has a P-256
+        // verifier, so padding slots carry a well-formed dummy message.
+        let dummy = sha256_pad(&[0; CDJ_CHECKED_LEN]);
+        slot.cdj_blocks[..dummy.len()].copy_from_slice(&dummy);
+        slot.cdj_block_count = dummy.len() / 64;
         slot.refresh_p256_trivial();
         slot
     }

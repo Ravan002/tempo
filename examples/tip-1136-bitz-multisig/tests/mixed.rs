@@ -303,3 +303,42 @@ fn prove_and_verify() {
         assert!(authorizer.verify(statement(), &proof).is_err());
     }
 }
+
+#[test]
+fn unpadded_client_data_blocks() {
+    // A passkey signature over a compression chain of blocks that are not
+    // SHA-256 padding of any message must not count, even with a valid
+    // signature over exactly that chain.
+    use k256::ecdsa::signature::hazmat::PrehashSigner;
+    use tip_1136_bitz::policy::CDJ_CHECKED_LEN;
+
+    let mut witness = honest(&[ALICE, CAROL, EVE]);
+    let slot = &mut witness.slots[1];
+    assert!(slot.is_passkey);
+    slot.cdj_blocks[CDJ_CHECKED_LEN..128].fill(b'x');
+    slot.cdj_block_count = 2;
+    let signature: p256::ecdsa::Signature = r1_key("carol")
+        .sign_prehash(&slot.webauthn_message())
+        .unwrap();
+    let bytes = signature.to_bytes();
+    slot.p256.r = num_bigint::BigUint::from_bytes_be(&bytes[..32]);
+    slot.p256.s = num_bigint::BigUint::from_bytes_be(&bytes[32..]);
+    assert_rejected(&witness);
+}
+
+#[test]
+fn wrong_padding_length_field() {
+    use k256::ecdsa::signature::hazmat::PrehashSigner;
+
+    let mut witness = honest(&[ALICE, CAROL, EVE]);
+    let slot = &mut witness.slots[1];
+    let end = 64 * slot.cdj_block_count;
+    slot.cdj_blocks[end - 1] ^= 0x08;
+    let signature: p256::ecdsa::Signature = r1_key("carol")
+        .sign_prehash(&slot.webauthn_message())
+        .unwrap();
+    let bytes = signature.to_bytes();
+    slot.p256.r = num_bigint::BigUint::from_bytes_be(&bytes[..32]);
+    slot.p256.s = num_bigint::BigUint::from_bytes_be(&bytes[32..]);
+    assert_rejected(&witness);
+}
