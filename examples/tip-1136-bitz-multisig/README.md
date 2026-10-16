@@ -58,7 +58,7 @@ The Lean model is written separately from the Rust circuit. It does not verify t
 
 ## BitZ revision
 
-The crate pins [`decofe/BitZ@c7f4f95`](https://github.com/decofe/BitZ/compare/d7e7257...c7f4f95), which is BitZ `d7e7257` plus four commits:
+The crate pins [`decofe/BitZ@bf2a79e`](https://github.com/decofe/BitZ/compare/d7e7257...bf2a79e), which is BitZ `d7e7257` plus five commits:
 
 | Commit | Effect |
 | --- | --- |
@@ -66,6 +66,7 @@ The crate pins [`decofe/BitZ@c7f4f95`](https://github.com/decofe/BitZ/compare/d7
 | `feat(cli): check public inputs with a PCS opening` | Statement values become leading input bits, checked by one random multilinear opening, instead of circuit constants. Setup runs once per profile instead of once per proof. |
 | `feat(circuit): cache the virtual map digest` | The bit-to-integer map is fixed per circuit, but its digest was rehashed on every proof and verification. |
 | `feat(cli): use the reference row/column split for the claim shape` | The fold round sends one element per column. With 128-bit rows that was 2^17 elements (2.1 MB). `Shape::for_log_bits` sends 2^9 instead. |
+| `feat(prover): parallelize grand-product setup and transpose factored claims` | The grand-product leaves, layers, and bit-table transpose were sequential. The opening claim's tensor weights were also flattened into a 128 MB table before the bit-to-integer map was applied; they are now applied factored. |
 
 `.cargo/config.toml` enables `pclmulqdq` on x86-64. Without it, the crate silently builds the slow portable kernel.
 
@@ -86,10 +87,12 @@ Approval by alice (secp256k1), carol (passkey), and eve (secp256k1), on an AMD E
 
 | | `Split`, 1 thread | `Split`, 8 threads | `Mixed`, 1 thread | `Mixed`, 8 threads |
 | --- | --- | --- | --- | --- |
-| Prove | 1.32 s | 0.65 s | 2.54 s | 1.31 s |
-| Verify | 0.35 s | 0.17 s | 0.67 s | 0.35 s |
-| Proof | 300 KB | | 330 KB | |
+| Prove | 1.31 s | 0.49 s | 2.42 s | 1.14 s |
+| Verify | 0.33 s | 0.10 s | 0.56 s | 0.25 s |
+| Proof | 300 KB | | 329 KB | |
 | Setup, once per profile | 5.7 s | | 10.8 s | |
+
+Best of five runs on a shared machine.
 
 Before the BitZ changes, `Mixed` took 64 s to prove and 6.6 s to verify on one thread, produced a 2.26 MB proof, and ran a 10.8 s setup for every proof.
 

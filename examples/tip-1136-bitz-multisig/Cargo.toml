@@ -12,14 +12,14 @@ description = "TIP-1136 private weighted multisig proved with BitZ (integer cons
 
 [dependencies]
 anyhow = "1"
-bitz-cli = { git = "https://github.com/decofe/BitZ", rev = "c7f4f95ca15373493ebd62c1fc87d0e9727d1d4e" }
-circuit = { git = "https://github.com/decofe/BitZ", rev = "c7f4f95ca15373493ebd62c1fc87d0e9727d1d4e" }
+bitz-cli = { git = "https://github.com/decofe/BitZ", rev = "bf2a79e2230e2e9887add0e50a1000ef36f6ac67" }
+circuit = { git = "https://github.com/decofe/BitZ", rev = "bf2a79e2230e2e9887add0e50a1000ef36f6ac67" }
 crypto-bigint = "0.7.5"
 k256 = { version = "0.13", features = ["ecdsa"] }
 num-bigint = "0.4"
 num-traits = "0.2"
 p256 = { version = "0.13", features = ["ecdsa"] }
-pcs = { git = "https://github.com/decofe/BitZ", rev = "c7f4f95ca15373493ebd62c1fc87d0e9727d1d4e" }
+pcs = { git = "https://github.com/decofe/BitZ", rev = "bf2a79e2230e2e9887add0e50a1000ef36f6ac67" }
 sha2 = "0.10"
 
 [dev-dependencies]
@@ -33,5 +33,6 @@ codegen-units = 1
 
 [profile.dev]
 opt-level = 3
+
 
 
