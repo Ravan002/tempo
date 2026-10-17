@@ -152,8 +152,8 @@ where
 {
     /// Wraps an existing [`BestTransactions`] iterator.
     ///
-    /// `fallback_fee_tokens` lists the tokens execution may fall back to when a transaction
-    /// does not select its fee token explicitly.
+    /// `fallback_fee_tokens` lists the tokens execution may fall back to when no transaction
+    /// field or fee-manager rule selects the fee token.
     pub fn new(inner: I, fallback_fee_tokens: &'static [Address]) -> Self {
         Self {
             inner,
@@ -190,8 +190,7 @@ where
         (token, slot): (Address, U256),
         fee: U256,
     ) -> bool {
-        tx.transaction.inner().fee_token().is_none()
-            && self.fallback_fee_tokens.contains(&token)
+        tx.transaction.is_fallback_fee_token()
             && self.fallback_fee_tokens.iter().any(|&candidate| {
                 // TIP-20 balance slots share a layout.
                 candidate != token
@@ -285,6 +284,7 @@ mod tests {
     };
     use std::sync::Arc;
     use tempo_chainspec::{hardfork::TempoHardfork, spec::TEMPO_T1_BASE_FEE};
+    use tempo_revm::ResolvedFeeToken;
 
     type TestTx = Arc<ValidPoolTransaction<TempoPooledTransaction>>;
 
@@ -630,22 +630,20 @@ mod tests {
         let &[path_usd, ousd] = t13 else {
             panic!("T13 falls back to pathUSD, then OUSD");
         };
-        let implicit = || protocol_tx(0, 0);
-        let explicit = || {
-            Arc::new(wrap_valid_tx(
-                TxBuilder::aa(Address::random())
-                    .fee_token(path_usd)
-                    .max_fee(u128::from(TEMPO_T1_BASE_FEE))
-                    .build(),
-                TransactionOrigin::External,
-            ))
+        let tx = |resolved| {
+            let tx = protocol_tx(0, 0);
+            tx.transaction.set_resolved_fee_token(resolved);
+            tx
         };
+        let fallback = || tx(ResolvedFeeToken::Fallback(path_usd));
+        // An explicit token, stored preference, or TIP-20 inference never falls back.
+        let selected = || tx(ResolvedFeeToken::Selected(path_usd));
 
-        assert!(state_aware_yields(implicit(), t13, &[path_usd]));
-        assert!(!state_aware_yields(implicit(), t13, &[path_usd, ousd]));
-        assert!(!state_aware_yields(explicit(), t13, &[path_usd]));
+        assert!(state_aware_yields(fallback(), t13, &[path_usd]));
+        assert!(!state_aware_yields(fallback(), t13, &[path_usd, ousd]));
+        assert!(!state_aware_yields(selected(), t13, &[path_usd]));
         assert!(!state_aware_yields(
-            implicit(),
+            fallback(),
             TempoHardfork::T12.fallback_fee_tokens(),
             &[path_usd]
         ));

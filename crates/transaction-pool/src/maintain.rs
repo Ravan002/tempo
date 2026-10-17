@@ -557,16 +557,12 @@ where
             all_txs
                 .iter()
                 .filter(|tx| !removed_this_iteration.contains(tx.hash()))
-                .filter(|tx| spec.is_t13() && tx.transaction.inner().fee_token().is_none())
+                // Fallback balances cannot change a token chosen before the fallback.
+                .filter(|tx| spec.is_t13() && tx.transaction.is_fallback_fee_token())
                 .filter(|tx| {
                     tx.transaction
                         .fee_balance_slot()
                         .is_some_and(|(selected_token, slot)| {
-                            // Stored preferences and TIP-20 inference run before the fallback,
-                            // so fallback balances cannot change a token chosen by them.
-                            if !fallback_tokens.contains(&selected_token) {
-                                return false;
-                            }
                             // TIP-20 balance slots share a layout. Include credits and protocol
                             // fee writes, which may change the choice without Transfer logs.
                             let fee = tx.transaction.fee_token_cost();
