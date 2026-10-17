@@ -311,7 +311,18 @@ impl TempoHandlerHooks {
         })?;
 
         let fee_manager = host.ext().fee_manager.clone();
-        let fee_token = fee_manager.get_fee_token(host, envelope, fee_payer, spec)?;
+        let fee_token = fee_manager
+            .get_fee_token(host, envelope, fee_payer, max_fee, spec)
+            .map_err(|error| match error {
+                TempoPrecompileError::TIP20(TIP20Error::InsufficientBalance(error)) => {
+                    TempoInvalidTransaction::from(FeePaymentError::InsufficientFeeTokenBalance {
+                        fee: error.required,
+                        balance: error.available,
+                    })
+                    .into()
+                }
+                error => HandlerError::from(error),
+            })?;
         host.ext_mut().resolved_fee_token = Some(fee_token);
         if !fee_token.is_tip20() {
             return Err(TempoInvalidTransaction::FeeTokenNotTip20 { address: fee_token }.into());

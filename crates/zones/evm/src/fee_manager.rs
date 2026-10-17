@@ -50,6 +50,7 @@ impl ProtocolFeeManager for ZoneProtocolFeeManager {
         host: &mut Evm<'_, TempoEvmTypes>,
         tx: &TempoTxEnv,
         _fee_payer: Address,
+        _max_fee: U256,
         spec: TempoHardfork,
     ) -> Result<Address> {
         // Tempo's transaction handler calls this hook. The trait default reads the L1
