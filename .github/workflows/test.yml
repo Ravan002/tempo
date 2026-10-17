@@ -194,7 +194,7 @@ jobs:
         with:
           components: ${{ needs.check-precompiles.outputs.coverage == 'true' && 'llvm-tools-preview' || '' }}
       # sccache reuses compiled crates, but Cargo still needs their sources first.
-      # One test shard populates the source cache shared by all test shards.
+      # One main-branch shard populates the source cache shared by all test shards.
       - name: Cache Cargo sources
         uses: tempoxyz/gh-actions/vendor/Swatinem/rust-cache@947d9a3ccb2425a9c94d563fd721cc0e33c89e26 # 2026-10-15T00-15-06Z-947d9a3c
         with:
@@ -203,7 +203,7 @@ jobs:
           add-rust-environment-hash-key: false
           cache-targets: false
           cache-bin: false
-          save-if: ${{ matrix.partition == 1 }}
+          save-if: ${{ github.event_name == 'push' && matrix.partition == 1 }}
       - uses: tempoxyz/gh-actions/actions/setup-mold@947d9a3ccb2425a9c94d563fd721cc0e33c89e26 # 2026-10-15T00-15-06Z-947d9a3c
       - uses: tempoxyz/gh-actions/vendor/mozilla-actions/sccache-action@947d9a3ccb2425a9c94d563fd721cc0e33c89e26 # 2026-10-15T00-15-06Z-947d9a3c
         with:
