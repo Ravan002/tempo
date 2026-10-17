@@ -141,6 +141,8 @@ pub struct StateAwareBestTransactions<I> {
     /// Updated after each executed transaction. Used to check if a candidate
     /// transaction's fee payer can still cover its fee cost.
     decreased_balances: HashMap<(Address, U256), U256>,
+    /// Ordered fallback fee tokens active for the block being built.
+    fallback_fee_tokens: &'static [Address],
 }
 
 impl<I> StateAwareBestTransactions<I>
@@ -149,10 +151,14 @@ where
     I::Item: StateAwarePoolTransaction,
 {
     /// Wraps an existing [`BestTransactions`] iterator.
-    pub fn new(inner: I) -> Self {
+    ///
+    /// `fallback_fee_tokens` lists the tokens execution may fall back to when a transaction
+    /// does not select its fee token explicitly.
+    pub fn new(inner: I, fallback_fee_tokens: &'static [Address]) -> Self {
         Self {
             inner,
             decreased_balances: HashMap::default(),
+            fallback_fee_tokens,
         }
     }
 
@@ -174,6 +180,27 @@ where
             }
         }
     }
+
+    /// Returns whether execution may pay the fee with another fallback token.
+    ///
+    /// Untracked balances may have grown during the block, so they count as sufficient.
+    fn may_use_other_fallback_token(
+        &self,
+        tx: &BestTransaction,
+        (token, slot): (Address, U256),
+        fee: U256,
+    ) -> bool {
+        tx.transaction.inner().fee_token().is_none()
+            && self.fallback_fee_tokens.contains(&token)
+            && self.fallback_fee_tokens.iter().any(|&candidate| {
+                // TIP-20 balance slots share a layout.
+                candidate != token
+                    && self
+                        .decreased_balances
+                        .get(&(candidate, slot))
+                        .is_none_or(|&balance| balance >= fee)
+            })
+    }
 }
 
 impl<I> Iterator for StateAwareBestTransactions<I>
@@ -193,15 +220,15 @@ where
                 continue;
             };
 
+            let fee = best_tx.transaction.fee_token_cost();
             if let Some(&balance) = self.decreased_balances.get(&key)
-                && balance < best_tx.transaction.fee_token_cost()
+                && balance < fee
+                && !self.may_use_other_fallback_token(best_tx, key, fee)
             {
                 self.inner.mark_invalid(
                     &tx,
                     InvalidPoolTransactionError::Consensus(
-                        InvalidTransactionError::InsufficientFunds(
-                            (balance, best_tx.transaction.fee_token_cost()).into(),
-                        ),
+                        InvalidTransactionError::InsufficientFunds((balance, fee).into()),
                     ),
                 );
                 continue;
@@ -575,5 +602,52 @@ mod tests {
 
         assert_eq!(merged.next().map(|tx| *tx.hash()), Some(*right_tx.hash()));
         assert!(merged.next().is_none());
+    }
+
+    /// Returns whether a transaction survives when `drained` balances drop just below its fee.
+    fn state_aware_yields(
+        tx: TestTx,
+        fallback_fee_tokens: &'static [Address],
+        drained: &[Address],
+    ) -> bool {
+        let (_, slot) = tx.transaction.fee_balance_slot().unwrap();
+        let fee = tx.transaction.fee_token_cost();
+        assert!(!fee.is_zero());
+        let mut best = StateAwareBestTransactions::new(
+            protocol_best_transactions(vec![tx]),
+            fallback_fee_tokens,
+        );
+        for &token in drained {
+            best.decreased_balances
+                .insert((token, slot), fee - U256::ONE);
+        }
+        best.next().is_some()
+    }
+
+    #[test]
+    fn test_state_aware_skips_only_when_no_fallback_token_can_pay() {
+        let t13 = TempoHardfork::T13.fallback_fee_tokens();
+        let &[path_usd, ousd] = t13 else {
+            panic!("T13 falls back to pathUSD, then OUSD");
+        };
+        let implicit = || protocol_tx(0, 0);
+        let explicit = || {
+            Arc::new(wrap_valid_tx(
+                TxBuilder::aa(Address::random())
+                    .fee_token(path_usd)
+                    .max_fee(u128::from(TEMPO_T1_BASE_FEE))
+                    .build(),
+                TransactionOrigin::External,
+            ))
+        };
+
+        assert!(state_aware_yields(implicit(), t13, &[path_usd]));
+        assert!(!state_aware_yields(implicit(), t13, &[path_usd, ousd]));
+        assert!(!state_aware_yields(explicit(), t13, &[path_usd]));
+        assert!(!state_aware_yields(
+            implicit(),
+            TempoHardfork::T12.fallback_fee_tokens(),
+            &[path_usd]
+        ));
     }
 }
