@@ -29,7 +29,7 @@ jobs:
     timeout-minutes: 60
     env:
       # Limit peak memory while linting the combined Tempo and Zones workspace.
-      CARGO_BUILD_JOBS: 2
+      CARGO_BUILD_JOBS: 16
     permissions:
       id-token: write
       contents: read
