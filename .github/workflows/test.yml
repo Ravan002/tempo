@@ -173,6 +173,9 @@ jobs:
 
   test:
     name: test (${{ matrix.partition }}/2)
+    env:
+      # nextest already runs tests concurrently; avoid a full CPU-sized pool per test.
+      TOKIO_WORKER_THREADS: "4"
     needs: [check-precompiles, zones-artifacts]
     runs-on: depot-ubuntu-latest-32
     timeout-minutes: 30
@@ -260,6 +263,8 @@ jobs:
       matrix:
         partition: [1, 2, 3, 4]
     env:
+      # Execution runtimes otherwise create one Tokio worker per CPU in every test.
+      TOKIO_WORKER_THREADS: "4"
       # Set to 8 MiB because some tests run into stack overflows with jemalloc
       RUST_MIN_STACK: 8388608
     steps:
