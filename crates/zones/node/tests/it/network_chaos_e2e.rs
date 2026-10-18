@@ -20,7 +20,7 @@ use crate::utils::{
 const NETWORK_TIMEOUT: Duration = Duration::from_secs(60);
 const SUBMISSION_TIMEOUT: Duration = Duration::from_secs(15);
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
-const L1_BLOCK_TIME: Duration = Duration::from_millis(250);
+const L1_BLOCK_TIME: Duration = Duration::from_millis(100);
 const OUTAGE_BLOCK_GAP: u64 = 8;
 const INITIAL_DEPOSIT: u128 = 10_000_000;
 const OUTAGE_DEPOSIT: u128 = 1_000_000;

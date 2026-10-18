@@ -21,7 +21,7 @@ use crate::utils::{
 
 const NETWORK_TIMEOUT: Duration = Duration::from_secs(60);
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
-const L1_BLOCK_TIME: Duration = Duration::from_millis(250);
+const L1_BLOCK_TIME: Duration = Duration::from_millis(100);
 const P2P_LATENCY: Duration = Duration::from_millis(400);
 const L1_LATENCY: Duration = Duration::from_millis(500);
 const RECOVERY_GAP: u64 = 6;
