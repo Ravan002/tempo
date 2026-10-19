@@ -6,6 +6,9 @@ Subcommands currently supported:
 
 - `admin`: read-only checks and guarded operational commands for deployed Zones.
   See the [admin command documentation](admin/README.md).
+- `bench-preconfirmations`: compares `eth_sendRawTransactionSync` with sequencer preconfirmations
+  for TIP-20 transfers on a running Zone. `zones/contrib/bench/preconfirmations.sh` runs it
+  against a local Tempo L1 and three-sequencer Zone.
 - `create-zone`: creates a new Zone through Tempo's native TIP-1091 ZoneFactory, either
   signed by `ZONE_FACTORY_OWNER_KEY` or, for a Safe-owned factory, as a Safe Transaction
   Builder proposal (`--safe-address`) finished with `--creation-tx` after execution.

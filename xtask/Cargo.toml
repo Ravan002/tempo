@@ -49,6 +49,7 @@ itertools.workspace = true
 rand_08.workspace = true
 rand.workspace = true
 rayon.workspace = true
+reqwest.workspace = true
 reth-evm.workspace = true
 reth-db.workspace = true
 reth-db-api.workspace = true
@@ -66,6 +67,7 @@ tempo-alloy.workspace = true
 zone-primitives.workspace = true
 zone-precompiles = { workspace = true, features = ["std"] }
 zone-p2p.workspace = true
+zone-payload.workspace = true
 zone-rpc.workspace = true
 zone-sequencer.workspace = true
 alloy-rlp.workspace = true
