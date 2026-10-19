@@ -63,14 +63,6 @@ impl CallRules for TIP20Rules {
                 ITIP20::ITIP20Calls::nonces(call) => {
                     check_caller(caller, &[call.owner])
                 }
-                // Transfers are disabled during the initial permissioned Zone phase.
-                // Private asset movement is limited to the protocol-managed inbox and outbox paths.
-                ITIP20::ITIP20Calls::transferFrom(_)
-                | ITIP20::ITIP20Calls::transfer(_)
-                | ITIP20::ITIP20Calls::transferWithMemo(_)
-                | ITIP20::ITIP20Calls::transferFromWithMemo(_) => {
-                    CallCheck::Revert(Unauthorized {}.abi_encode().into())
-                }
                 // Inbox/outbox call TIP20 internally; public mint/burn entry points stay disabled.
                 ITIP20::ITIP20Calls::mint(_)
                 | ITIP20::ITIP20Calls::mintWithMemo(_)
@@ -119,6 +111,10 @@ impl CallRules for TIP20Rules {
                 | ITIP20::ITIP20Calls::ISSUER_ROLE(_)
                 | ITIP20::ITIP20Calls::BURN_BLOCKED_ROLE(_)
                 | ITIP20::ITIP20Calls::BURN_AT_ROLE(_)
+                | ITIP20::ITIP20Calls::transfer(_)
+                | ITIP20::ITIP20Calls::transferFrom(_)
+                | ITIP20::ITIP20Calls::transferWithMemo(_)
+                | ITIP20::ITIP20Calls::transferFromWithMemo(_)
                 | ITIP20::ITIP20Calls::approve(_)
                 | ITIP20::ITIP20Calls::permit(_)
                 | ITIP20::ITIP20Calls::DOMAIN_SEPARATOR(_) => CallCheck::Continue,
@@ -358,45 +354,63 @@ mod tests {
     }
 
     #[test]
-    fn all_transfer_calls_are_disallowed() {
-        let rules = rules();
-        let caller = Address::repeat_byte(0x11);
-        let recipient = Address::repeat_byte(0x22);
-        let amount = U256::ONE;
+    fn transfers_move_balances() -> eyre::Result<()> {
+        let mut harness = PrecompileHarness::new()?;
         let memo = B256::repeat_byte(0x33);
         let calls = [
-            ITIP20::transferCall {
-                to: recipient,
-                amount,
-            }
-            .abi_encode(),
-            ITIP20::transferFromCall {
-                from: caller,
-                to: recipient,
-                amount,
-            }
-            .abi_encode(),
-            ITIP20::transferWithMemoCall {
-                to: recipient,
-                amount,
-                memo,
-            }
-            .abi_encode(),
-            ITIP20::transferFromWithMemoCall {
-                from: caller,
-                to: recipient,
-                amount,
-                memo,
-            }
-            .abi_encode(),
+            (
+                harness.alice,
+                ITIP20::transferCall {
+                    to: harness.bob,
+                    amount: U256::from(1u64),
+                }
+                .abi_encode(),
+            ),
+            (
+                harness.alice,
+                ITIP20::transferWithMemoCall {
+                    to: harness.bob,
+                    amount: U256::from(20u64),
+                    memo,
+                }
+                .abi_encode(),
+            ),
+            (
+                harness.spender,
+                ITIP20::transferFromCall {
+                    from: harness.alice,
+                    to: harness.bob,
+                    amount: U256::from(300u64),
+                }
+                .abi_encode(),
+            ),
+            (
+                harness.spender,
+                ITIP20::transferFromWithMemoCall {
+                    from: harness.alice,
+                    to: harness.bob,
+                    amount: U256::from(4_000u64),
+                    memo,
+                }
+                .abi_encode(),
+            ),
         ];
 
-        for call in calls {
-            assert!(matches!(
-                admit_at(&rules, &call, caller, TempoHardfork::T8),
-                CallCheck::Revert(data) if data == Unauthorized {}.abi_encode()
-            ));
+        for (caller, calldata) in calls {
+            let result = harness.call(caller, calldata.into(), TIP20_FIXED_TRANSFER_GAS, false)?;
+            assert!(result.is_success());
         }
+
+        assert_eq!(harness.balance_of(harness.bob)?, U256::from(4_321u64));
+        assert_eq!(
+            harness.balance_of(harness.alice)?,
+            U256::from(1_000_000u64 - 4_321)
+        );
+        assert_eq!(
+            harness.allowance(harness.alice, harness.spender)?,
+            U256::from(300_000u64 - 4_300)
+        );
+        Ok(())
     }
 
     #[test]
@@ -715,7 +729,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "TODO: re-enable once zones allow user transfers"]
     fn transfer_from_insufficient_balance_does_not_reveal_the_source_balance() -> eyre::Result<()> {
         let mut harness = PrecompileHarness::new()?;
         // Craft a successful allowance return whose first four bytes collide with the upstream
