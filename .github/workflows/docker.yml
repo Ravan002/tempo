@@ -44,18 +44,20 @@ env:
   REGISTRY: ghcr.io/tempoxyz
 
 jobs:
-  build-and-push:
-    name: Build and Push Docker Images
-    outputs:
-      tempo_image_tag: ${{ steps.meta-tempo.outputs.version }}
+  resolve-build-source:
+    name: Resolve immutable build source
     if: ${{ (github.event_name != 'schedule' || github.repository == 'tempoxyz/tempo') && !(github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository != 'tempoxyz/tempo') }}
-    runs-on: depot-ubuntu-latest-16
+    runs-on: ubuntu-latest
     permissions:
-      actions: read
       contents: read
       pull-requests: read
-      packages: write
       id-token: write
+    outputs:
+      sha: ${{ steps.source.outputs.sha }}
+      short_sha: ${{ steps.source.outputs.short_sha }}
+      branch: ${{ steps.source.outputs.branch }}
+      revision_label: ${{ steps.source.outputs.revision_label }}
+      epoch: ${{ steps.epoch.outputs.value }}
     steps:
       - name: Secure runner
         uses: tempoxyz/gh-actions/actions/secure-runner@947d9a3ccb2425a9c94d563fd721cc0e33c89e26 # 2026-10-15T00-15-06Z-947d9a3c
@@ -115,9 +117,286 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           ref: ${{ steps.source.outputs.sha }}
+          fetch-depth: 0
           persist-credentials: false
 
-      - uses: tempoxyz/gh-actions/vendor/depot/setup-action@947d9a3ccb2425a9c94d563fd721cc0e33c89e26 # 2026-10-15T00-15-06Z-947d9a3c
+      - name: Record commit timestamp
+        id: epoch
+        run: echo "value=$(git show -s --format=%ct HEAD)" >> "$GITHUB_OUTPUT"
+
+  build-candidates:
+    name: ${{ matrix.mode }} Docker binaries (${{ matrix.arch }})
+    needs: resolve-build-source
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 360
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {mode: candidate, arch: amd64, runner: depot-ubuntu-latest-16}
+          - {mode: candidate, arch: arm64, runner: depot-ubuntu-latest-arm-16}
+          - {mode: clean, arch: amd64, runner: ubuntu-latest}
+          - {mode: clean, arch: arm64, runner: ubuntu-24.04-arm}
+    env:
+      SOURCE_DATE_EPOCH: ${{ needs.resolve-build-source.outputs.epoch }}
+    steps:
+      - name: Secure runner
+        uses: tempoxyz/gh-actions/actions/secure-runner@947d9a3ccb2425a9c94d563fd721cc0e33c89e26 # 2026-10-15T00-15-06Z-947d9a3c
+
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ needs.resolve-build-source.outputs.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up isolated Docker builder
+        uses: tempoxyz/gh-actions/vendor/docker/setup-buildx-action@947d9a3ccb2425a9c94d563fd721cc0e33c89e26 # 2026-10-15T00-15-06Z-947d9a3c
+        with:
+          driver-opts: image=moby/buildkit:v0.29.0@sha256:0039c1d47e8748b5afea56f4e85f14febaf34452bd99d9552d2daa82262b5cc5
+
+      - name: Set up Depot
+        if: matrix.mode == 'candidate'
+        uses: tempoxyz/gh-actions/vendor/depot/setup-action@947d9a3ccb2425a9c94d563fd721cc0e33c89e26 # 2026-10-15T00-15-06Z-947d9a3c
+
+      - name: Determine Docker labels
+        id: docker-labels
+        shell: bash
+        run: |
+          if [[ "${{ github.repository }}" != "tempoxyz/tempo" ]]; then
+            cat <<'LABELS' >> "$GITHUB_OUTPUT"
+          value<<EOF
+          org.opencontainers.image.created=
+          org.opencontainers.image.description=
+          org.opencontainers.image.licenses=
+          org.opencontainers.image.revision=
+          org.opencontainers.image.source=
+          org.opencontainers.image.title=
+          org.opencontainers.image.url=
+          org.opencontainers.image.version=
+          EOF
+          LABELS
+          fi
+
+      - name: Docker metadata for tempo
+        id: meta-tempo
+        uses: tempoxyz/gh-actions/vendor/docker/metadata-action@947d9a3ccb2425a9c94d563fd721cc0e33c89e26 # 2026-10-15T00-15-06Z-947d9a3c
+        with:
+          images: |
+            ${{ env.REGISTRY }}/tempo
+            docker.io/tempoxyz/tempo
+          bake-target: tempo
+          labels: |
+            ${{ steps.docker-labels.outputs.value }}
+            ${{ needs.resolve-build-source.outputs.revision_label }}
+          tags: |
+            type=schedule,pattern=nightly,enable=${{ inputs.pr_number == '' }}
+            type=raw,value=nightly,enable=${{ github.event.inputs.nightly == 'true' }}
+            type=semver,pattern={{version}},enable=${{ inputs.pr_number == '' }}
+            type=semver,pattern={{major}}.{{minor}},enable=${{ inputs.pr_number == '' }}
+            type=semver,pattern={{major}},enable=${{ inputs.pr_number == '' }}
+            type=raw,value=stable,enable=${{ inputs.pr_number == '' && github.ref_type == 'tag' }}
+            type=raw,value=latest,enable=${{ inputs.pr_number == '' && '{{is_default_branch}}' || 'false' }}
+            type=edge,branch=main,enable=${{ inputs.pr_number == '' }}
+            type=raw,value=sha-${{ needs.resolve-build-source.outputs.short_sha }},priority=100
+            type=raw,value=pr-${{ inputs.pr_number }},enable=${{ inputs.pr_number != '' }}
+
+      - name: Docker metadata for tempo-devnet
+        id: meta-tempo-devnet
+        uses: tempoxyz/gh-actions/vendor/docker/metadata-action@947d9a3ccb2425a9c94d563fd721cc0e33c89e26 # 2026-10-15T00-15-06Z-947d9a3c
+        with:
+          images: |
+            ${{ env.REGISTRY }}/tempo-devnet
+            docker.io/tempoxyz/tempo-devnet
+          bake-target: tempo-devnet
+          labels: |
+            ${{ steps.docker-labels.outputs.value }}
+            ${{ needs.resolve-build-source.outputs.revision_label }}
+          tags: |
+            type=schedule,pattern=nightly,enable=${{ inputs.pr_number == '' }}
+            type=raw,value=nightly,enable=${{ github.event.inputs.nightly == 'true' }}
+            type=semver,pattern={{version}},enable=${{ inputs.pr_number == '' }}
+            type=semver,pattern={{major}}.{{minor}},enable=${{ inputs.pr_number == '' }}
+            type=semver,pattern={{major}},enable=${{ inputs.pr_number == '' }}
+            type=raw,value=stable,enable=${{ inputs.pr_number == '' && github.ref_type == 'tag' }}
+            type=raw,value=latest,enable=${{ inputs.pr_number == '' && '{{is_default_branch}}' || 'false' }}
+            type=edge,branch=main,enable=${{ inputs.pr_number == '' }}
+            type=raw,value=sha-${{ needs.resolve-build-source.outputs.short_sha }},priority=100
+            type=raw,value=pr-${{ inputs.pr_number }},enable=${{ inputs.pr_number != '' }}
+
+      - name: Docker metadata for tempo-localnet
+        id: meta-tempo-localnet
+        uses: tempoxyz/gh-actions/vendor/docker/metadata-action@947d9a3ccb2425a9c94d563fd721cc0e33c89e26 # 2026-10-15T00-15-06Z-947d9a3c
+        with:
+          images: |
+            ${{ env.REGISTRY }}/tempo-localnet
+            docker.io/tempoxyz/tempo-localnet
+          bake-target: tempo-localnet
+          labels: |
+            ${{ steps.docker-labels.outputs.value }}
+            ${{ needs.resolve-build-source.outputs.revision_label }}
+          tags: |
+            type=schedule,pattern=nightly,enable=${{ inputs.pr_number == '' }}
+            type=raw,value=nightly,enable=${{ github.event.inputs.nightly == 'true' }}
+            type=semver,pattern={{version}},enable=${{ inputs.pr_number == '' }}
+            type=semver,pattern={{major}}.{{minor}},enable=${{ inputs.pr_number == '' }}
+            type=semver,pattern={{major}},enable=${{ inputs.pr_number == '' }}
+            type=raw,value=stable,enable=${{ inputs.pr_number == '' && github.ref_type == 'tag' }}
+            type=raw,value=latest,enable=${{ inputs.pr_number == '' && '{{is_default_branch}}' || 'false' }}
+            type=edge,branch=main,enable=${{ inputs.pr_number == '' }}
+            type=raw,value=sha-${{ needs.resolve-build-source.outputs.short_sha }},priority=100
+            type=raw,value=pr-${{ inputs.pr_number }},enable=${{ inputs.pr_number != '' }}
+
+      - name: Docker metadata for tempo-sidecar
+        id: meta-tempo-sidecar
+        uses: tempoxyz/gh-actions/vendor/docker/metadata-action@947d9a3ccb2425a9c94d563fd721cc0e33c89e26 # 2026-10-15T00-15-06Z-947d9a3c
+        with:
+          images: |
+            ${{ env.REGISTRY }}/tempo-sidecar
+            docker.io/tempoxyz/tempo-sidecar
+          bake-target: tempo-sidecar
+          labels: |
+            ${{ steps.docker-labels.outputs.value }}
+            ${{ needs.resolve-build-source.outputs.revision_label }}
+          tags: |
+            type=schedule,pattern=nightly,enable=${{ inputs.pr_number == '' }}
+            type=raw,value=nightly,enable=${{ github.event.inputs.nightly == 'true' }}
+            type=semver,pattern={{version}},enable=${{ inputs.pr_number == '' }}
+            type=semver,pattern={{major}}.{{minor}},enable=${{ inputs.pr_number == '' }}
+            type=semver,pattern={{major}},enable=${{ inputs.pr_number == '' }}
+            type=raw,value=stable,enable=${{ inputs.pr_number == '' && github.ref_type == 'tag' }}
+            type=raw,value=latest,enable=${{ inputs.pr_number == '' && '{{is_default_branch}}' || 'false' }}
+            type=edge,branch=main,enable=${{ inputs.pr_number == '' }}
+            type=raw,value=sha-${{ needs.resolve-build-source.outputs.short_sha }},priority=100
+            type=raw,value=pr-${{ inputs.pr_number }},enable=${{ inputs.pr_number != '' }}
+
+      - name: Docker metadata for tempo-xtask
+        id: meta-tempo-xtask
+        uses: tempoxyz/gh-actions/vendor/docker/metadata-action@947d9a3ccb2425a9c94d563fd721cc0e33c89e26 # 2026-10-15T00-15-06Z-947d9a3c
+        with:
+          images: |
+            ${{ env.REGISTRY }}/tempo-xtask
+            docker.io/tempoxyz/tempo-xtask
+          bake-target: tempo-xtask
+          labels: |
+            ${{ steps.docker-labels.outputs.value }}
+            ${{ needs.resolve-build-source.outputs.revision_label }}
+          tags: |
+            type=schedule,pattern=nightly,enable=${{ inputs.pr_number == '' }}
+            type=raw,value=nightly,enable=${{ github.event.inputs.nightly == 'true' }}
+            type=semver,pattern={{version}},enable=${{ inputs.pr_number == '' }}
+            type=semver,pattern={{major}}.{{minor}},enable=${{ inputs.pr_number == '' }}
+            type=semver,pattern={{major}},enable=${{ inputs.pr_number == '' }}
+            type=raw,value=stable,enable=${{ inputs.pr_number == '' && github.ref_type == 'tag' }}
+            type=raw,value=latest,enable=${{ inputs.pr_number == '' && '{{is_default_branch}}' || 'false' }}
+            type=edge,branch=main,enable=${{ inputs.pr_number == '' }}
+            type=raw,value=sha-${{ needs.resolve-build-source.outputs.short_sha }},priority=100
+            type=raw,value=pr-${{ inputs.pr_number }},enable=${{ inputs.pr_number != '' }}
+
+      - name: Prepare candidate exports
+        run: mkdir -p "$RUNNER_TEMP/candidate-images"
+
+      - name: Build candidate images without publishing
+        if: matrix.mode == 'candidate'
+        uses: tempoxyz/gh-actions/vendor/depot/bake-action@947d9a3ccb2425a9c94d563fd721cc0e33c89e26 # 2026-10-15T00-15-06Z-947d9a3c
+        with:
+          files: |
+            docker-bake.hcl
+            ${{ steps.meta-tempo.outputs.bake-file }}
+            ${{ steps.meta-tempo-devnet.outputs.bake-file }}
+            ${{ steps.meta-tempo-localnet.outputs.bake-file }}
+            ${{ steps.meta-tempo-sidecar.outputs.bake-file }}
+            ${{ steps.meta-tempo-xtask.outputs.bake-file }}
+          targets: default
+          project: 0c6tg19qsp
+          push: false
+          provenance: false
+          pull: true
+          set: |
+            *.platform=linux/${{ matrix.arch }}
+            tempo.tags=tempo:candidate-${{ matrix.arch }}
+            tempo.output=type=docker,dest=${{ runner.temp }}/candidate-images/tempo.tar
+            tempo-devnet.tags=tempo-devnet:candidate-${{ matrix.arch }}
+            tempo-devnet.output=type=docker,dest=${{ runner.temp }}/candidate-images/tempo-devnet.tar
+            tempo-localnet.tags=tempo-localnet:candidate-${{ matrix.arch }}
+            tempo-localnet.output=type=docker,dest=${{ runner.temp }}/candidate-images/tempo-localnet.tar
+            tempo-sidecar.tags=tempo-sidecar:candidate-${{ matrix.arch }}
+            tempo-sidecar.output=type=docker,dest=${{ runner.temp }}/candidate-images/tempo-sidecar.tar
+            tempo-xtask.tags=tempo-xtask:candidate-${{ matrix.arch }}
+            tempo-xtask.output=type=docker,dest=${{ runner.temp }}/candidate-images/tempo-xtask.tar
+
+      - name: Free space for independent rebuild
+        if: matrix.mode == 'clean'
+        run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc
+
+      - name: Rebuild all shipped binaries without Depot or shared cache
+        if: matrix.mode == 'clean'
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          docker buildx build --platform "linux/$ARCH" --no-cache --pull \
+            --build-arg "SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH" \
+            -f Dockerfile.reproducible --target docker-artifacts \
+            --output "type=local,dest=$RUNNER_TEMP/clean-binaries" .
+          cd "$RUNNER_TEMP/clean-binaries"
+          sha256sum tempo tempo-devnet tempo-localnet tempo-sidecar tempo-xtask > "$RUNNER_TEMP/candidate-images/clean.sha256"
+
+      - name: Upload candidates or independent checksums
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: docker-${{ matrix.mode }}-${{ matrix.arch }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/candidate-images/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 2
+
+  build-and-push:
+    name: Verify and publish Docker images
+    needs: [resolve-build-source, build-candidates]
+    outputs:
+      tempo_image_tag: ${{ steps.meta-tempo.outputs.version }}
+    if: ${{ (github.event_name != 'schedule' || github.repository == 'tempoxyz/tempo') && !(github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository != 'tempoxyz/tempo') }}
+    runs-on: depot-ubuntu-latest-16
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: read
+      packages: write
+      id-token: write
+    steps:
+      - name: Secure runner
+        uses: tempoxyz/gh-actions/actions/secure-runner@947d9a3ccb2425a9c94d563fd721cc0e33c89e26 # 2026-10-15T00-15-06Z-947d9a3c
+
+      - name: Use resolved build source
+        id: source
+        env:
+          SHA: ${{ needs.resolve-build-source.outputs.sha }}
+          SHORT_SHA: ${{ needs.resolve-build-source.outputs.short_sha }}
+          BRANCH: ${{ needs.resolve-build-source.outputs.branch }}
+          REVISION_LABEL: ${{ needs.resolve-build-source.outputs.revision_label }}
+        run: |
+          {
+            echo "sha=$SHA"
+            echo "short_sha=$SHORT_SHA"
+            echo "branch=$BRANCH"
+            echo "revision_label=$REVISION_LABEL"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ needs.resolve-build-source.outputs.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up isolated Docker builder
+        uses: tempoxyz/gh-actions/vendor/docker/setup-buildx-action@947d9a3ccb2425a9c94d563fd721cc0e33c89e26 # 2026-10-15T00-15-06Z-947d9a3c
+        with:
+          driver-opts: image=moby/buildkit:v0.29.0@sha256:0039c1d47e8748b5afea56f4e85f14febaf34452bd99d9552d2daa82262b5cc5
 
       - name: Determine Docker labels
         id: docker-labels
@@ -266,25 +545,27 @@ jobs:
           username: ${{ vars.DOCKER_HUB_USER }}
           password: ${{ secrets.DOCKER_HUB_TOKEN }}
 
-      - name: Build and push Docker images
-        id: build-and-push
-        uses: tempoxyz/gh-actions/vendor/depot/bake-action@947d9a3ccb2425a9c94d563fd721cc0e33c89e26 # 2026-10-15T00-15-06Z-947d9a3c
+      - name: Download candidate images and independent checksums
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          files: |
-            docker-bake.hcl
-            ${{ steps.meta-tempo.outputs.bake-file }}
-            ${{ steps.meta-tempo-devnet.outputs.bake-file }}
-            ${{ steps.meta-tempo-localnet.outputs.bake-file }}
-            ${{ steps.meta-tempo-sidecar.outputs.bake-file }}
-            ${{ steps.meta-tempo-xtask.outputs.bake-file }}
-          targets: ${{ ((inputs.pr_number == '' && github.event_name == 'schedule') || github.event.inputs.nightly == 'true') && 'nightly' || 'default' }}
-          project: 0c6tg19qsp
-          push: true
-          no-cache: ${{ inputs.pr_number == '' && startsWith(github.ref, 'refs/tags/v') }}
-          pull: ${{ github.event_name != 'merge_group' }}
+          pattern: docker-*-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/verified-images
+
+      - name: Compare every shipped executable before any publication
         env:
-          VERGEN_GIT_SHA: ${{ steps.source.outputs.sha }}
-          VERGEN_GIT_SHA_SHORT: ${{ steps.source.outputs.short_sha }}
+          IMAGE_DIR: ${{ runner.temp }}/verified-images
+        run: scripts/verify-docker-rebuild.sh
+
+      - name: Publish the verified images without rebuilding
+        id: build-and-push
+        env:
+          IMAGE_DIR: ${{ runner.temp }}/verified-images
+          TEMPO_TAGS: ${{ steps.meta-tempo.outputs.tags }}
+          TEMPO_DEVNET_TAGS: ${{ steps.meta-tempo-devnet.outputs.tags }}
+          TEMPO_LOCALNET_TAGS: ${{ steps.meta-tempo-localnet.outputs.tags }}
+          TEMPO_SIDECAR_TAGS: ${{ steps.meta-tempo-sidecar.outputs.tags }}
+          TEMPO_XTASK_TAGS: ${{ steps.meta-tempo-xtask.outputs.tags }}
+        run: scripts/publish-verified-images.sh
 
       - name: Record published PR images
         id: image-report
