@@ -17,6 +17,10 @@ on:
         description: "Source command comment ID for updating its receipt (optional)"
         type: string
         default: ""
+      verify_only:
+        description: "Build and compare candidates without publishing images or events"
+        type: boolean
+        default: false
       nightly:
         description: "Tag nightly"
         type: boolean
@@ -358,7 +362,7 @@ jobs:
     name: Verify and publish Docker images
     needs: [resolve-build-source, build-candidates]
     outputs:
-      tempo_image_tag: ${{ steps.meta-tempo.outputs.version }}
+      tempo_image_tag: ${{ inputs.verify_only != true && steps.meta-tempo.outputs.version || '' }}
     if: ${{ (github.event_name != 'schedule' || github.repository == 'tempoxyz/tempo') && !(github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository != 'tempoxyz/tempo') }}
     runs-on: depot-ubuntu-latest-16
     permissions:
@@ -533,6 +537,7 @@ jobs:
             type=raw,value=pr-${{ inputs.pr_number }},enable=${{ inputs.pr_number != '' }}
 
       - name: Log in to Container Registry
+        if: inputs.verify_only != true
         uses: tempoxyz/gh-actions/vendor/docker/login-action@947d9a3ccb2425a9c94d563fd721cc0e33c89e26 # 2026-10-15T00-15-06Z-947d9a3c
         with:
           registry: ${{ env.REGISTRY }}
@@ -540,6 +545,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Log in to Docker Hub
+        if: inputs.verify_only != true
         uses: tempoxyz/gh-actions/vendor/docker/login-action@947d9a3ccb2425a9c94d563fd721cc0e33c89e26 # 2026-10-15T00-15-06Z-947d9a3c
         with:
           username: ${{ vars.DOCKER_HUB_USER }}
@@ -552,11 +558,13 @@ jobs:
           path: ${{ runner.temp }}/verified-images
 
       - name: Compare every shipped executable before any publication
+        id: verify
         env:
           IMAGE_DIR: ${{ runner.temp }}/verified-images
         run: scripts/verify-docker-rebuild.sh
 
       - name: Publish the verified images without rebuilding
+        if: inputs.verify_only != true
         id: build-and-push
         env:
           IMAGE_DIR: ${{ runner.temp }}/verified-images
@@ -569,7 +577,7 @@ jobs:
 
       - name: Record published PR images
         id: image-report
-        if: inputs.pr_number != ''
+        if: inputs.pr_number != '' && inputs.verify_only != true
         continue-on-error: true
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
@@ -604,9 +612,11 @@ jobs:
           retention-days: 7
 
       - name: Install cosign
+        if: inputs.verify_only != true
         uses: tempoxyz/gh-actions/vendor/sigstore/cosign-installer@947d9a3ccb2425a9c94d563fd721cc0e33c89e26 # 2026-10-15T00-15-06Z-947d9a3c
 
       - name: Sign Docker images
+        if: inputs.verify_only != true
         id: sign-images
         shell: bash
         env:
@@ -661,7 +671,7 @@ jobs:
 
       - name: Publish event (sha tag)
         id: publish-sha-event
-        if: ${{ github.repository == 'tempoxyz/tempo' && github.event_name != 'merge_group' && github.event_name != 'pull_request' }}
+        if: ${{ inputs.verify_only != true && github.repository == 'tempoxyz/tempo' && github.event_name != 'merge_group' && github.event_name != 'pull_request' }}
         shell: bash
         env:
           EVENTS_KEY: ${{ secrets.EVENTS_KEY }}
@@ -694,7 +704,7 @@ jobs:
 
       - name: Publish event (nightly tag)
         id: publish-nightly-event
-        if: ${{ github.repository == 'tempoxyz/tempo' && ((inputs.pr_number == '' && github.event_name == 'schedule') || github.event.inputs.nightly == 'true') }}
+        if: ${{ inputs.verify_only != true && github.repository == 'tempoxyz/tempo' && ((inputs.pr_number == '' && github.event_name == 'schedule') || github.event.inputs.nightly == 'true') }}
         shell: bash
         env:
           EVENTS_KEY: ${{ secrets.EVENTS_KEY }}
@@ -744,6 +754,8 @@ jobs:
           SHORT_SHA: ${{ steps.source.outputs.short_sha }}
           COMMIT_SHA: ${{ steps.source.outputs.sha }}
           BRANCH_NAME: ${{ steps.source.outputs.branch }}
+          VERIFY_ONLY: ${{ inputs.verify_only }}
+          VERIFY_OUTCOME: ${{ steps.verify.outcome }}
           BUILD_OUTCOME: ${{ steps.build-and-push.outcome }}
           SIGN_OUTCOME: ${{ steps.sign-images.outcome }}
           SHA_EVENT_OUTCOME: ${{ steps.publish-sha-event.outcome }}
@@ -758,7 +770,7 @@ jobs:
             resolved_job_url="$(gh api \
               "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/jobs" \
               --paginate \
-              --jq '.jobs[] | select(.name == "Build and Push Docker Images") | .html_url' \
+              --jq '.jobs[] | select(.name == "Verify and publish Docker images") | .html_url' \
               | head -n 1 || true)"
             if [ -n "$resolved_job_url" ]; then
               job_url="$resolved_job_url"
@@ -774,9 +786,10 @@ jobs:
             echo "| Ref | \`${BRANCH_NAME}\` |"
             echo "| Workflow run | [run #${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) |"
             echo "| Workflow run ID | [\`${{ github.run_id }}\`](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) |"
-            echo "| Job summary | [Build and Push Docker Images](${job_url}) |"
+            echo "| Job summary | [Verify and publish Docker images](${job_url}) |"
             echo "| Short SHA tag | \`sha-${SHORT_SHA}\` |"
-            echo "| Build | \`${BUILD_OUTCOME:-unknown}\` |"
+            echo "| Verify | \`${VERIFY_OUTCOME:-unknown}\` |"
+            echo "| Publish | \`${BUILD_OUTCOME:-unknown}\` |"
             echo "| Sign | \`${SIGN_OUTCOME:-unknown}\` |"
             echo
             echo "## Images"
@@ -784,6 +797,11 @@ jobs:
             echo "| Image | Package | Tags | Digest |"
             echo "| --- | --- | --- | --- |"
           } >> "$GITHUB_STEP_SUMMARY"
+
+          if [[ "$VERIFY_ONLY" == true ]]; then
+            echo "Verification-only run: no images or deployment events were published." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
 
           summarize_image() {
             local image="$1"

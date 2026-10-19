@@ -100,7 +100,8 @@ COPY --from=builder /out/ /
 
 # Docker builds compile the same production feature set as the existing images.
 FROM build-base AS docker-builder
-RUN case "$TARGETARCH" in \
+RUN mkdir -p /out && \
+    case "$TARGETARCH" in \
       amd64) target=x86_64-unknown-linux-gnu; multiarch=x86_64-linux-gnu ;; \
       arm64) target=aarch64-unknown-linux-gnu; multiarch=aarch64-linux-gnu ;; \
     esac && \
