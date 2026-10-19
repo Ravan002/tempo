@@ -99,8 +99,8 @@ use zone_p2p::{
     P2pNetworkId, P2pPeerId, ZoneManifest, spawn_p2p,
 };
 use zone_payload::{
-    DEFAULT_WITHDRAWAL_BATCH_INTERVAL_BLOCKS, WithdrawalRevealEncryptor, ZonePayloadAttributes,
-    ZonePayloadFactory, ZonePayloadTypes,
+    DEFAULT_WITHDRAWAL_BATCH_INTERVAL_BLOCKS, Preconfirmations, WithdrawalRevealEncryptor,
+    ZonePayloadAttributes, ZonePayloadFactory, ZonePayloadTypes,
 };
 use zone_primitives::constants::{decode_l1_chain_id, zone_chain_id};
 use zone_rpc::ZoneDebugApiRpcServer;
@@ -286,6 +286,8 @@ pub struct ZoneNode {
     p2p_config: Option<P2pConfig>,
     /// Whether a consumer outside this builder drains the deposit queue.
     external_deposit_consumer: bool,
+    /// Transfers this node promised to include, when it issues preconfirmations.
+    preconfirmations: Option<Preconfirmations>,
 }
 
 impl ZoneNode {
@@ -333,6 +335,7 @@ impl ZoneNode {
             prover_config: None,
             p2p_config: None,
             external_deposit_consumer: false,
+            preconfirmations: None,
         }
     }
 
@@ -356,8 +359,17 @@ impl ZoneNode {
             encryption_key.clone(),
             config.zone_id,
         )));
-        self = self.with_deposit_decryption_keys([encryption_key]);
+        self = self
+            .with_deposit_decryption_keys([encryption_key])
+            .with_preconfirmations(config.sequencer_signer.clone());
         self.sequencer_config = Some(config);
+        self
+    }
+
+    /// Issue preconfirmations for TIP-20 transfers signed by `sequencer_signer`, and include
+    /// preconfirmed transactions first in every block this node builds.
+    pub fn with_preconfirmations(mut self, sequencer_signer: PrivateKeySigner) -> Self {
+        self.preconfirmations = Some(Preconfirmations::new(sequencer_signer));
         self
     }
 
@@ -453,6 +465,11 @@ impl ZoneNode {
     pub fn deposit_decryption_keys(&self) -> Option<EncryptionKeyRing> {
         self.encryption_keys.clone()
     }
+
+    /// Returns the preconfirmation queue, when this node issues preconfirmations.
+    pub fn preconfirmations(&self) -> Option<Preconfirmations> {
+        self.preconfirmations.clone()
+    }
 }
 
 impl NodeTypes for ZoneNode {
@@ -500,6 +517,8 @@ where
     p2p_config: Option<P2pConfig>,
     /// Whether a consumer outside this builder drains the deposit queue.
     external_deposit_consumer: bool,
+    /// Preconfirmation queue served by the redacted RPC.
+    preconfirmations: Option<Preconfirmations>,
 }
 
 impl<N> std::fmt::Debug for ZoneAddOns<N>
@@ -530,6 +549,7 @@ where
         prover_config: Option<ZoneProverConfig>,
         p2p_config: Option<P2pConfig>,
         external_deposit_consumer: bool,
+        preconfirmations: Option<Preconfirmations>,
     ) -> Self {
         Self {
             inner: RpcAddOns::new(
@@ -552,6 +572,7 @@ where
             prover_config,
             p2p_config,
             external_deposit_consumer,
+            preconfirmations,
         }
     }
 }
@@ -905,6 +926,7 @@ where
             self.enabled_tokens.clone(),
             chain_id,
             max_response_size,
+            self.preconfirmations.clone(),
         )
         .await?;
 
@@ -1579,6 +1601,7 @@ where
         enabled_tokens: EnabledTokenRegistry,
         chain_id: u64,
         max_response_size: usize,
+        preconfirmations: Option<Preconfirmations>,
     ) -> eyre::Result<()> {
         let eth_handlers = handle.eth_handlers().clone();
         let l1_provider = alloy_provider::ProviderBuilder::new_with_network::<TempoNetwork>()
@@ -1596,12 +1619,16 @@ where
             max_response_size,
             zone_portal: portal_address,
         };
-        let api: Arc<dyn ZoneRpcApi> = Arc::new(ZoneRpc::new(
+        let mut rpc = ZoneRpc::new(
             eth_handlers,
             redacted_rpc_config.clone(),
             enabled_tokens,
             l1_provider,
-        ));
+        );
+        if let Some(preconfirmations) = preconfirmations {
+            rpc = rpc.with_preconfirmations(&preconfirmations);
+        }
+        let api: Arc<dyn ZoneRpcApi> = Arc::new(rpc);
         let local_addr = start_redacted_rpc(redacted_rpc_config, api).await?;
         info!(target: "reth::cli", %local_addr, "Redacted zone RPC server started");
 
@@ -1726,6 +1753,9 @@ where
         if let Some(encryptor) = self.withdrawal_reveal_encryptor.clone() {
             payload_factory = payload_factory.with_withdrawal_reveal_encryptor(encryptor);
         }
+        if let Some(preconfirmations) = self.preconfirmations.clone() {
+            payload_factory = payload_factory.with_preconfirmations(preconfirmations);
+        }
         ComponentsBuilder::default()
             .node_types::<N>()
             .pool(ZonePoolBuilder::new(
@@ -1751,6 +1781,7 @@ where
             self.prover_config.clone(),
             self.p2p_config.clone(),
             self.external_deposit_consumer,
+            self.preconfirmations.clone(),
         )
     }
 }

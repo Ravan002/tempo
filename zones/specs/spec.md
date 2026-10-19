@@ -488,6 +488,24 @@ The initial configuration uses nonce `0`.
 
 Leadership is transferred with `ZonePortal.setLeader(newLeader, expectedEpoch)`. The new leader must be an active sequencer. `expectedEpoch` provides compare-and-set fencing against stale handoff transactions, and only one distinct leader change is allowed per Tempo block. A real change increments `leaderEpoch`, records the current Tempo block in `leaderActivationTempoBlock`, and emits `LeaderUpdated`; setting the current leader is idempotent. Zone nodes consume this state only after Tempo finalization and authorize block production for the leader scheduled at each block's embedded Tempo anchor.
 
+### Preconfirmations
+
+A sequencer can promise to include a TIP-20 transfer before producing the block that contains it. `zone_preconfirmTransaction(rawTransaction)` accepts a signed transaction whose every call is a TIP-20 `transfer` or `transferWithMemo` that also satisfies the TIP-20 payment classification, and returns:
+
+```ts
+{
+  txHash: Hex,
+  includeBy: bigint, // highest zone block number that will contain the transaction
+  signature: Hex,    // sequencer signature over the EIP-712 message below
+}
+```
+
+The signature covers the EIP-712 struct `Preconfirmation(bytes32 txHash,uint64 includeBy)` with domain `{ name: "TempoZonePreconfirmation", version: "1", chainId }`, where `chainId` is the zone chain ID. Clients verify a preconfirmation by recovering the signer and comparing it with the zone's sequencer.
+
+The sequencer keeps preconfirmed transactions in an ordered queue together with the state they produce on top of the block its next build extends. A transfer is preconfirmed only if it executes successfully on that state, so later preconfirmations account for earlier ones: a reused nonce or a transfer exceeding the remaining balance is refused. The queue is bounded by the block gas limit and the block size budget. `includeBy` is the next block. The block builder executes the whole queue immediately after `advanceTempo`, in preconfirmation order, before any pool transaction. Issuing waits while a block is being built, so a promise is never checked against state that the in-flight block is about to change.
+
+Preconfirmations promise inclusion, not the transfer outcome. A Tempo policy change imported by the next `advanceTempo` can still make a preconfirmed transfer revert or fail fee collection. Preconfirmations are sequencer policy, not consensus rules: they are held in memory by the issuing node, are not carried across restarts or leadership handoffs, and a checkpoint-only block during catch-up delays inclusion past `includeBy`. Only a node that built the current head, or the block extending it, issues preconfirmations.
+
 ### Admin Transfer
 
 The admin can transfer the governance role to a new address via the same two-step process, allowing an operator to rotate to a new cold key or multisig after a planned governance change or a suspected key compromise:
@@ -1044,7 +1062,7 @@ Fee quotes are caller-independent: `eth_gasPrice` returns the fixed T1 gas price
 
 - `eth_getBalance`, `eth_getTransactionCount`: return `0x0` for non-self queries (no error, to avoid leaking account existence).
 - `eth_getTransactionByHash`, `eth_getTransactionReceipt`: return `null` if the caller is not the sender.
-- `eth_sendRawTransaction`, `eth_sendRawTransactionSync`: reject if the transaction sender does not match the authenticated account.
+- `eth_sendRawTransaction`, `eth_sendRawTransactionSync`, `zone_preconfirmTransaction`: reject if the transaction sender does not match the authenticated account.
 - `eth_fillTransaction`: fills but does not sign an unsigned transaction, with the same authenticated `from` enforcement as simulation methods.
 - `eth_call`, `eth_estimateGas`: `from` must equal the authenticated account. Account-indexed reads are then protected by the execution-level access controls described in [Privacy Modifications](#privacy-modifications), including for nested calls. State override sets and block override objects are rejected.
 - `eth_getLogs`, `eth_getFilterLogs`, `eth_getFilterChanges`: filtered to TIP-20 events where the caller is a relevant party (see [Event Filtering](#event-filtering)).
@@ -1112,6 +1130,7 @@ operator RPC transports and the authenticated redacted RPC.
 | `zone_getAuthorizationTokenInfo` | Authenticated redacted RPC only | Returns the authenticated account address and token expiry |
 | `zone_getZoneInfo` | Operator RPC and authenticated redacted RPC | Returns `zoneId`, `isAccessEnforced`, `isGatewayOpen`, `zoneTokens`, `sequencers`, `chainId`, and `tempoBlockNumber` |
 | `zone_getEncryptionKey` | Operator RPC and authenticated redacted RPC | Returns the active sequencer encryption key at the current Tempo L1 head |
+| `zone_preconfirmTransaction` | Authenticated redacted RPC only | Accepts a signed TIP-20 transfer and returns the sequencer's signed inclusion promise (see [Preconfirmations](#preconfirmations)) |
 
 `zone_getEncryptionKey` reads the active key directly from the portal at the current Tempo L1 head.
 Its response is:
@@ -1128,7 +1147,7 @@ This is the portal's `encryptionKeyAtBlock` return value without additional wrap
 uses JSON-RPC quantity encoding. Key rotation is visible immediately on L1 and does not wait for the
 Zone to process the corresponding Tempo block.
 
-There are no state-changing methods via authorization token. Withdrawals require a signed transaction submitted via `eth_sendRawTransaction`.
+There are no state-changing methods via authorization token. Withdrawals require a signed transaction submitted via `eth_sendRawTransaction`, and preconfirmed transfers a signed transaction submitted via `zone_preconfirmTransaction`.
 
 ### Error Codes
 
@@ -1138,7 +1157,7 @@ There are no state-changing methods via authorization token. Withdrawals require
 | `-32002` | Authorization token expired | Token has expired |
 | `-32003` | Transaction rejected | Sender mismatch on `eth_sendRawTransaction` |
 | `-32004` | Account mismatch | `from` mismatch on `eth_call` / `eth_estimateGas` |
-| `-32005` | Sequencer only | Full block transactions require the unrestricted operator RPC |
+| `-32005` | Sequencer only | Full block transactions require the unrestricted operator RPC, or the node is not producing the next block for `zone_preconfirmTransaction` |
 | `-32006` | Method disabled | WebSocket subscription kind is not available on zones |
 | `-32601` | Method not found | Method is not exposed by the redacted RPC allowlist |
 

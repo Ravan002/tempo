@@ -7,8 +7,8 @@ use crate::{
     WithdrawalRevealEncryptor,
     abi::{self, ZONE_INBOX_ADDRESS, ZONE_OUTBOX_ADDRESS},
 };
-use alloy_consensus::{Signed, TxLegacy};
-use alloy_eips::eip4895::Withdrawals;
+use alloy_consensus::{Signed, TxLegacy, transaction::TxHashRef as _};
+use alloy_eips::{eip2718::Encodable2718 as _, eip4895::Withdrawals};
 use alloy_evm::Evm;
 use alloy_primitives::{Bytes, U256};
 use alloy_sol_types::SolCall;
@@ -33,7 +33,7 @@ use reth_transaction_pool::{
     BestTransactions, BestTransactionsAttributes, PoolTransaction as _, TransactionPool,
     ValidPoolTransaction, error::InvalidPoolTransactionError,
 };
-use std::{error::Error, sync::Arc, time::Instant};
+use std::{collections::HashSet, error::Error, sync::Arc, time::Instant};
 use tempo_evm::TempoNextBlockEnvAttributes;
 use tempo_payload_types::{EncodedBlock, TempoBuiltPayload};
 use tempo_primitives::{
@@ -43,7 +43,7 @@ use tempo_primitives::{
 use tempo_transaction_pool::{
     StateAwareBestTransactions, TempoTransactionPool, transaction::TempoPooledTransaction,
 };
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use zone_chainspec::ZoneChainSpec;
 use zone_evm::ZoneEvmConfig;
 use zone_l1::{PreparedL1Block, TempoStateExt};
@@ -51,7 +51,8 @@ use zone_precompiles::L1StateError;
 use zone_primitives::constants::MAX_RLP_BLOCK_SIZE;
 
 use crate::{
-    TempoImport, ZonePayloadAttributes, ZonePayloadTypes, prewarming::PrewarmingExecutionContext,
+    Preconfirmations, TempoImport, ZonePayloadAttributes, ZonePayloadTypes,
+    prewarming::PrewarmingExecutionContext,
 };
 
 /// Default empty-batch cadence: every 120 zone blocks (~60 sec at Tempo's 500 ms block time).
@@ -68,6 +69,9 @@ pub const DEFAULT_WITHDRAWAL_BATCH_INTERVAL_BLOCKS: u64 = 120;
 /// [`MAX_RLP_BLOCK_SIZE`] so such blocks still replicate.
 const BLOCK_SIZE_SAFETY_MARGIN: usize = 1024 * 1024;
 
+/// Packed RLP bytes available to preconfirmed and pool transactions in one block.
+pub(crate) const POOL_TX_SIZE_BUDGET: usize = MAX_RLP_BLOCK_SIZE - BLOCK_SIZE_SAFETY_MARGIN;
+
 /// Diagnostic retained when upstream Tempo precompile storage stringifies an [`L1StateError`].
 const L1_STORAGE_UNAVAILABLE_ERROR_PREFIX: &str = "Tempo L1 storage unavailable";
 
@@ -77,6 +81,7 @@ const L1_STORAGE_UNAVAILABLE_ERROR_PREFIX: &str = "Tempo L1 storage unavailable"
 pub struct ZonePayloadFactory {
     withdrawal_batch_interval_blocks: u64,
     withdrawal_reveal_encryptor: Option<Arc<dyn WithdrawalRevealEncryptor>>,
+    preconfirmations: Option<Preconfirmations>,
 }
 
 impl ZonePayloadFactory {
@@ -85,6 +90,7 @@ impl ZonePayloadFactory {
         Self {
             withdrawal_batch_interval_blocks: withdrawal_batch_interval_blocks.max(1),
             withdrawal_reveal_encryptor: None,
+            preconfirmations: None,
         }
     }
 
@@ -93,6 +99,13 @@ impl ZonePayloadFactory {
         encryptor: Arc<dyn WithdrawalRevealEncryptor>,
     ) -> Self {
         self.withdrawal_reveal_encryptor = Some(encryptor);
+        self
+    }
+
+    /// Include the transactions preconfirmed through `preconfirmations` at the start of every
+    /// block, ahead of pool transactions.
+    pub fn with_preconfirmations(mut self, preconfirmations: Preconfirmations) -> Self {
+        self.preconfirmations = Some(preconfirmations);
         self
     }
 }
@@ -129,6 +142,7 @@ where
             task_executor: ctx.task_executor().clone(),
             withdrawal_batch_interval_blocks: self.withdrawal_batch_interval_blocks,
             withdrawal_reveal_encryptor: self.withdrawal_reveal_encryptor.clone(),
+            preconfirmations: self.preconfirmations.clone(),
         })
     }
 }
@@ -148,6 +162,8 @@ pub struct ZonePayloadBuilder<Provider> {
     withdrawal_batch_interval_blocks: u64,
     /// Encrypts authenticated-withdrawal sender reveal data for batch finalization.
     withdrawal_reveal_encryptor: Option<Arc<dyn WithdrawalRevealEncryptor>>,
+    /// Transactions this sequencer promised to include before any pool transaction.
+    preconfirmations: Option<Preconfirmations>,
 }
 
 impl<Provider> PayloadBuilder for ZonePayloadBuilder<Provider>
@@ -293,15 +309,46 @@ where
             })?;
         drop(prewarming);
 
+        // Held until the block is sealed so no preconfirmation is checked against state that this
+        // build's pool transactions are about to change.
+        let preconfirmations = self
+            .preconfirmations
+            .as_ref()
+            .map(|queue| queue.begin_block(&self.provider, &self.evm_config, &parent_header));
+        let mut included_preconfirmations = HashSet::new();
         if !checkpoint_only {
-            // Execute pool transactions until either all of them fit or their packed RLP bytes reach
-            // the size budget
-            // The block executor owns gas-capacity accounting.
-            let pool_tx_size_budget = MAX_RLP_BLOCK_SIZE - BLOCK_SIZE_SAFETY_MARGIN;
             let raw_best_txs = self
                 .pool
                 .best_transactions_with_attributes(BestTransactionsAttributes::new(base_fee, None));
             let mut best_txs = StateAwareBestTransactions::new(raw_best_txs);
+
+            // Preconfirmed transactions go first, in the order they were promised, so they execute
+            // on the state they were checked against.
+            let mut preconfirmed_tx_bytes = 0usize;
+            if let Some(build) = &preconfirmations {
+                for tx in build.transactions() {
+                    let tx_hash = *tx.tx_hash();
+                    let tx_bytes = tx.encode_2718_len();
+                    match builder.execute_transaction_with_result_closure(tx, |result| {
+                        best_txs.on_new_result(result);
+                    }) {
+                        Ok(_) => {
+                            preconfirmed_tx_bytes += tx_bytes;
+                            included_preconfirmations.insert(tx_hash);
+                        }
+                        // `finish` drops and reports every queued transaction that was not included.
+                        Err(reth_evm::block::BlockExecutionError::Validation(err)) => {
+                            debug!(target: "zone::payload", %tx_hash, %err, "preconfirmed transaction is invalid");
+                        }
+                        Err(err) => return Err(PayloadBuilderError::evm(err)),
+                    }
+                }
+            }
+
+            // Execute pool transactions until either all of them fit or their packed RLP bytes reach
+            // the size budget
+            // The block executor owns gas-capacity accounting.
+            let pool_tx_size_budget = POOL_TX_SIZE_BUDGET - preconfirmed_tx_bytes;
             if execute_pool_transactions(
                 |tx, best_txs| {
                     builder
@@ -375,6 +422,20 @@ where
             result: execution_result,
             state: db.take_bundle(),
         };
+        if let Some(preconfirmations) = preconfirmations {
+            let header = sealed_block.sealed_header().clone();
+            let state = core::mem::take(&mut db.cache);
+            if checkpoint_only {
+                preconfirmations.finish_without_transactions(
+                    &self.provider,
+                    &self.evm_config,
+                    header,
+                    state,
+                );
+            } else {
+                preconfirmations.finish(header, state, &included_preconfirmations);
+            }
+        }
 
         let executed_block = BuiltPayloadExecutedBlock {
             recovered_block,

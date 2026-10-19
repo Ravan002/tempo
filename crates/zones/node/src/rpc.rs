@@ -33,7 +33,7 @@ use reth_rpc::{EthFilter, eth::filter::EthFilterError};
 use reth_rpc_api::Web3ApiServer;
 use reth_rpc_builder::EthHandlers;
 use reth_rpc_eth_api::{
-    EthApiTypes, EthFilterApiServer, RpcConvert,
+    EthApiTypes, EthFilterApiServer, RpcConvert, RpcNodeCore,
     helpers::{EthApiSpec, EthBlocks, EthCall, EthFees, EthState, EthTransactions, FullEthApi},
 };
 use reth_rpc_eth_types::{EthApiError, logs_utils};
@@ -60,6 +60,7 @@ use alloy_rpc_client::{ConnectionConfig, WebSocketConfig};
 use tempo_contracts::zones::{IZoneInbox, ZONE_INBOX_ADDRESS, ZONE_TOKEN_ADDRESS, ZonePortal};
 use zone_evm::ZoneEvmConfig;
 use zone_p2p::{LeadershipSchedule, PeerTip, ZoneManifest};
+use zone_payload::{PreconfirmationError, PreconfirmationIssuer, Preconfirmations};
 use zone_primitives::constants::MAX_WS_FRAME_AND_MESSAGE_SIZE;
 use zone_rpc::{
     auth::AuthContext,
@@ -752,6 +753,9 @@ pub struct ZoneRpc<Api: EthApiTypes> {
     /// Maps filter IDs to the authenticated account that created them.
     /// The reth filter registry remains the source of truth for filter liveness.
     filter_owners: Arc<Mutex<HashMap<FilterId, Address>>>,
+    /// Appends to the sequencer's preconfirmation queue; `None` disables
+    /// `zone_preconfirmTransaction`.
+    preconfirmations: Option<PreconfirmationIssuer>,
 }
 
 impl<Api: EthApiTypes + 'static> ZoneRpc<Api> {
@@ -768,6 +772,7 @@ impl<Api: EthApiTypes + 'static> ZoneRpc<Api> {
             enabled_tokens,
             l1_provider,
             filter_owners: Arc::new(Mutex::new(HashMap::new())),
+            preconfirmations: None,
         };
         rpc.spawn_filter_owner_pruner();
         rpc
@@ -865,6 +870,20 @@ where
 
             to_raw(&block)
         })
+    }
+}
+
+impl<Api> ZoneRpc<Api>
+where
+    Api: EthApiTypes + RpcNodeCore<Evm = ZoneEvmConfig> + 'static,
+{
+    /// Serve `zone_preconfirmTransaction` from the sequencer's preconfirmation queue.
+    pub fn with_preconfirmations(mut self, preconfirmations: &Preconfirmations) -> Self {
+        self.preconfirmations = Some(preconfirmations.spawn_issuer(
+            self.eth.api.provider().clone(),
+            self.eth.api.evm_config().clone(),
+        ));
+        self
     }
 }
 
@@ -1117,6 +1136,27 @@ where
                 .await
                 .map_err(internal)?;
             to_raw(&hash)
+        })
+    }
+
+    fn preconfirm_transaction(&self, data: Bytes, auth: AuthContext) -> BoxFut<'_> {
+        Box::pin(async move {
+            let tx = zone_rpc::policy::verify_raw_tx_sender(&data, &auth)?;
+            let issuer = self
+                .preconfirmations
+                .as_ref()
+                .ok_or_else(JsonRpcError::method_disabled)?;
+            let preconfirmation = issuer.preconfirm(tx).await.map_err(|err| match err {
+                PreconfirmationError::NotSequencing => JsonRpcError::sequencer_only(),
+                PreconfirmationError::Provider(_)
+                | PreconfirmationError::Signing(_)
+                | PreconfirmationError::Stopped => internal(err),
+                PreconfirmationError::Unsupported
+                | PreconfirmationError::CapacityExhausted
+                | PreconfirmationError::Reverted
+                | PreconfirmationError::Invalid(_) => JsonRpcError::invalid_params(err.to_string()),
+            })?;
+            to_raw(&preconfirmation)
         })
     }
 

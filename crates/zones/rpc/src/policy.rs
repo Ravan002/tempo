@@ -2,7 +2,7 @@
 //!
 //! Shared by [`ZoneRpcApi`](crate::ZoneRpcApi) implementations.
 
-use alloy_consensus::transaction::SignerRecoverable;
+use alloy_consensus::transaction::{Recovered, SignerRecoverable};
 use alloy_eips::eip2718::Decodable2718;
 use alloy_network::TransactionBuilder;
 use alloy_primitives::Address;
@@ -73,7 +73,12 @@ fn enforce_contract_creation_with_allowlist(
 
 /// Decode a raw transaction and verify the recovered sender matches the
 /// authenticated caller. Returns `-32003 Transaction rejected` on mismatch.
-pub fn verify_raw_tx_sender(data: &[u8], auth: &AuthContext) -> Result<(), JsonRpcError> {
+///
+/// Returns the decoded transaction with its verified sender.
+pub fn verify_raw_tx_sender(
+    data: &[u8],
+    auth: &AuthContext,
+) -> Result<Recovered<TempoTxEnvelope>, JsonRpcError> {
     let tx = TempoTxEnvelope::decode_2718_exact(data)
         .map_err(|_| JsonRpcError::invalid_params("failed to decode transaction"))?;
 
@@ -85,7 +90,7 @@ pub fn verify_raw_tx_sender(data: &[u8], auth: &AuthContext) -> Result<(), JsonR
         return Err(JsonRpcError::transaction_rejected());
     }
 
-    Ok(())
+    Ok(Recovered::new_unchecked(tx, sender))
 }
 
 #[cfg(test)]

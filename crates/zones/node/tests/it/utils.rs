@@ -660,6 +660,8 @@ type RpcApiFactory = dyn Fn(zone_node::rpc::RedactedRpcConfig) -> RpcApiFuture +
 
 pub(crate) struct ZoneTestNode {
     http_url: url::Url,
+    /// Sequencer address that signs blocks and preconfirmations.
+    sequencer: Address,
     l1_provider: DynProvider<TempoNetwork>,
     portal_address: Address,
     deposit_queue: DepositQueue,
@@ -685,6 +687,11 @@ impl ZoneTestNode {
     /// Returns the HTTP RPC URL for connecting providers to this node.
     pub(crate) fn http_url(&self) -> &url::Url {
         &self.http_url
+    }
+
+    /// Returns the sequencer address that signs blocks and preconfirmations.
+    pub(crate) fn sequencer(&self) -> Address {
+        self.sequencer
     }
 
     /// Stop this node's task runtime while retaining its storage handles for the test lifetime.
@@ -1342,7 +1349,8 @@ impl ZoneTestNode {
         .with_deposit_decryption_keys(
             std::iter::once(SecretKey::from(sequencer_signer.credential()))
                 .chain(additional_decryption_keys),
-        );
+        )
+        .with_preconfirmations(sequencer_signer.clone());
         if portal_address.is_zero() {
             zone_node = zone_node
                 .with_deposit_decryption_keys(std::iter::once(L1Fixture::encryption_key()));
@@ -1421,6 +1429,9 @@ impl ZoneTestNode {
             });
 
         let deposit_queue = zone_node.deposit_queue();
+        let preconfirmations = zone_node
+            .preconfirmations()
+            .expect("test nodes issue preconfirmations");
         let enabled_tokens = zone_node.enabled_tokens();
         let l1_state_cache = zone_node.l1_state_cache();
         let l1_block_tracker = zone_node.l1_block_tracker();
@@ -1497,13 +1508,12 @@ impl ZoneTestNode {
             let eth_handlers = eth_handlers.clone();
             let enabled_tokens = rpc_enabled_tokens.clone();
             let l1_provider = rpc_l1_provider.clone();
+            let preconfirmations = preconfirmations.clone();
             Box::pin(async move {
-                Ok(Arc::new(zone_node::rpc::ZoneRpc::new(
-                    eth_handlers,
-                    config,
-                    enabled_tokens,
-                    l1_provider,
-                )) as Arc<dyn zone_node::rpc::ZoneRpcApi>)
+                Ok(Arc::new(
+                    zone_node::rpc::ZoneRpc::new(eth_handlers, config, enabled_tokens, l1_provider)
+                        .with_preconfirmations(&preconfirmations),
+                ) as Arc<dyn zone_node::rpc::ZoneRpcApi>)
             })
                 as Pin<Box<dyn Future<Output = eyre::Result<Arc<dyn zone_node::rpc::ZoneRpcApi>>>>>
         });
@@ -1512,6 +1522,7 @@ impl ZoneTestNode {
             deposit_queue,
             enabled_tokens,
             http_url,
+            sequencer: sequencer_signer.address(),
             l1_provider,
             portal_address,
             l1_state_cache,
@@ -4749,14 +4760,22 @@ fn build_redacted_rpc_ctx(
 /// - A running zone node with L1 state cache seeded
 /// - A redacted RPC server on a random port
 /// - Sequencer credentials for testing access control
-pub(crate) async fn start_zone_with_redacted_rpc() -> eyre::Result<RedactedRpcTestCtx> {
+///
+/// `custom_genesis` replaces the default Zone genesis template.
+pub(crate) async fn start_zone_with_redacted_rpc(
+    custom_genesis: Option<Genesis>,
+) -> eyre::Result<RedactedRpcTestCtx> {
     let sequencer_signer = alloy_signer_local::PrivateKeySigner::random();
     let sequencer_address = sequencer_signer.address();
 
-    let zone = ZoneTestNode::launch(
+    let block_signer =
+        alloy_signer_local::PrivateKeySigner::from(SecretKey::from_slice(&[0x01; 32])?);
+    let zone = ZoneTestNode::launch_with_genesis(
         DUMMY_L1_URL.to_string(),
         Address::ZERO,
         next_unique_chain_id(),
+        custom_genesis,
+        block_signer,
     )
     .await?;
     let fixture = L1Fixture::new();

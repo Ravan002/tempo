@@ -236,7 +236,7 @@ async fn ws_collect_messages_until_quiet(
 async fn test_auth_rejection() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
-    let ctx = start_zone_with_redacted_rpc().await?;
+    let ctx = start_zone_with_redacted_rpc(None).await?;
 
     // No auth header → 401
     let (status, _) = ctx
@@ -268,7 +268,7 @@ async fn test_auth_rejection() -> eyre::Result<()> {
 async fn test_send_raw_transaction_requires_enabled_token_balance() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
-    let mut ctx = start_zone_with_redacted_rpc().await?;
+    let mut ctx = start_zone_with_redacted_rpc(None).await?;
     let user_signer = PrivateKeySigner::random();
     let fee_payer = PrivateKeySigner::random();
     ctx.inject_deposit(
@@ -318,7 +318,7 @@ async fn test_send_raw_transaction_requires_enabled_token_balance() -> eyre::Res
 async fn test_non_secp_auth_tokens() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
-    let ctx = start_zone_with_redacted_rpc().await?;
+    let ctx = start_zone_with_redacted_rpc(None).await?;
     let p256_signer = P256SigningKey::random(&mut OsRng);
     let webauthn_signer = P256SigningKey::random(&mut OsRng);
 
@@ -347,7 +347,7 @@ async fn test_non_secp_auth_tokens() -> eyre::Result<()> {
 async fn test_invalid_non_secp_auth_tokens_are_rejected() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
-    let ctx = start_zone_with_redacted_rpc().await?;
+    let ctx = start_zone_with_redacted_rpc(None).await?;
     let p256_signer = P256SigningKey::random(&mut OsRng);
     let webauthn_signer = P256SigningKey::random(&mut OsRng);
 
@@ -375,7 +375,7 @@ async fn test_invalid_non_secp_auth_tokens_are_rejected() -> eyre::Result<()> {
 async fn test_keychain_auth_tokens_v1_and_v2() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
-    let mut ctx = start_zone_with_redacted_rpc().await?;
+    let mut ctx = start_zone_with_redacted_rpc(None).await?;
     let root_signer = PrivateKeySigner::random();
     let access_signer = P256SigningKey::random(&mut OsRng);
 
@@ -427,7 +427,7 @@ async fn test_keychain_auth_tokens_v1_and_v2() -> eyre::Result<()> {
 async fn test_keychain_auth_rejection_cases() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
-    let mut ctx = start_zone_with_redacted_rpc().await?;
+    let mut ctx = start_zone_with_redacted_rpc(None).await?;
 
     let missing_root = PrivateKeySigner::random();
     let missing_access = P256SigningKey::random(&mut OsRng);
@@ -501,7 +501,7 @@ async fn test_keychain_auth_rejection_cases() -> eyre::Result<()> {
 async fn test_public_methods() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
-    let ctx = start_zone_with_redacted_rpc().await?;
+    let ctx = start_zone_with_redacted_rpc(None).await?;
     let user_signer = PrivateKeySigner::random();
 
     for method in ["eth_blockNumber", "eth_chainId"] {
@@ -540,7 +540,7 @@ async fn test_public_methods() -> eyre::Result<()> {
 async fn test_filter_ownership_and_uninstall_cleanup() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
-    let mut ctx = start_zone_with_redacted_rpc().await?;
+    let mut ctx = start_zone_with_redacted_rpc(None).await?;
     let owner_signer = PrivateKeySigner::random();
     let other_signer = PrivateKeySigner::random();
 
@@ -612,7 +612,7 @@ async fn test_filter_ownership_and_uninstall_cleanup() -> eyre::Result<()> {
 async fn test_balance_privacy() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
-    let mut ctx = start_zone_with_redacted_rpc().await?;
+    let mut ctx = start_zone_with_redacted_rpc(None).await?;
 
     let depositor = address!("0x0000000000000000000000000000000000001111");
     let recipient = address!("0x0000000000000000000000000000000000005678");
@@ -662,7 +662,7 @@ async fn test_balance_privacy() -> eyre::Result<()> {
 async fn test_tip403_zero_caller_is_operator_only() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
-    let ctx = start_zone_with_redacted_rpc().await?;
+    let ctx = start_zone_with_redacted_rpc(None).await?;
     let user = PrivateKeySigner::random();
     let call = ITIP403Registry::isAuthorizedCall {
         policyId: ALLOW_ALL_POLICY_ID,
@@ -726,7 +726,7 @@ async fn test_tip403_zero_caller_is_operator_only() -> eyre::Result<()> {
 async fn test_tip20_eth_call_privacy() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
-    let mut ctx = start_zone_with_redacted_rpc().await?;
+    let mut ctx = start_zone_with_redacted_rpc(None).await?;
 
     let owner_signer = l1_dev_signer();
     let owner = owner_signer.address();
@@ -1107,7 +1107,7 @@ async fn test_native_account_getter_eth_call_privacy() -> eyre::Result<()> {
 async fn test_simulation_validation_rejects_create_and_overrides() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
-    let ctx = start_zone_with_redacted_rpc().await?;
+    let ctx = start_zone_with_redacted_rpc(None).await?;
     let user_signer = PrivateKeySigner::random();
     let simulation_target = format!("{:#x}", Address::repeat_byte(0x11));
 
@@ -1185,7 +1185,7 @@ async fn test_simulation_validation_rejects_create_and_overrides() -> eyre::Resu
 async fn test_block_access_control() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
-    let mut ctx = start_zone_with_redacted_rpc().await?;
+    let mut ctx = start_zone_with_redacted_rpc(None).await?;
     ctx.inject_empty_block().await?;
 
     let user_signer = PrivateKeySigner::random();
@@ -1234,7 +1234,7 @@ async fn test_block_access_control() -> eyre::Result<()> {
 async fn test_unexposed_methods_are_not_found() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
-    let ctx = start_zone_with_redacted_rpc().await?;
+    let ctx = start_zone_with_redacted_rpc(None).await?;
     let user_signer = PrivateKeySigner::random();
 
     for method in [
@@ -1271,7 +1271,7 @@ async fn test_unexposed_methods_are_not_found() -> eyre::Result<()> {
 async fn test_ws_logs_subscription_is_sender_scoped() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
-    let mut ctx = start_zone_with_redacted_rpc().await?;
+    let mut ctx = start_zone_with_redacted_rpc(None).await?;
     let owner_signer = l1_dev_signer();
     let outsider_signer = PrivateKeySigner::random();
     let spender = PrivateKeySigner::random().address();
@@ -1379,7 +1379,7 @@ async fn test_ws_logs_subscription_is_sender_scoped() -> eyre::Result<()> {
 async fn test_ws_pending_transaction_subscriptions_are_disabled() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
-    let ctx = start_zone_with_redacted_rpc().await?;
+    let ctx = start_zone_with_redacted_rpc(None).await?;
     let user_signer = PrivateKeySigner::random();
     let user_token = ctx.user_token(&user_signer);
     let mut user_ws = connect_redacted_rpc_ws(&ctx.redacted_rpc_url, &user_token).await?;

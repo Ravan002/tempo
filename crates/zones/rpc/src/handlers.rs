@@ -181,6 +181,15 @@ pub trait ZoneRpcApi: Send + Sync + 'static {
     /// `zone_getEncryptionKey()` — returns the active encryption key at the
     /// current Tempo L1 head.
     fn zone_get_encryption_key(&self, auth: AuthContext) -> BoxFut<'_>;
+
+    /// `zone_preconfirmTransaction(data)` — accepts a signed TIP-20 transfer and returns the
+    /// sequencer's signed promise to include it in a block numbered at most `includeBy`.
+    ///
+    /// Same sender verification as [`send_raw_transaction`](Self::send_raw_transaction).
+    /// Nodes that do not issue preconfirmations return `-32006 Method disabled`.
+    fn preconfirm_transaction(&self, _data: Bytes, _auth: AuthContext) -> BoxFut<'_> {
+        Box::pin(async { Err(JsonRpcError::method_disabled()) })
+    }
 }
 
 /// Deserialize JSON-RPC params, returning an error response on failure.
@@ -304,6 +313,9 @@ pub async fn dispatch(
         Method::EthSendRawTransaction => handle_send_raw_transaction(id, raw, auth, api).await,
         Method::EthSendRawTransactionSync => {
             handle_send_raw_transaction_sync(id, raw, auth, api).await
+        }
+        Method::ZonePreconfirmTransaction => {
+            handle_preconfirm_transaction(id, raw, auth, api).await
         }
 
         // Log & filter queries
@@ -543,6 +555,25 @@ async fn handle_send_raw_transaction_sync(
         id,
         Method::EthSendRawTransactionSync,
         api.send_raw_transaction_sync(data, auth.clone()).await,
+    )
+}
+
+/// Handle `zone_preconfirmTransaction`. Sender verification is delegated to the API impl.
+async fn handle_preconfirm_transaction(
+    id: Value,
+    raw: &str,
+    auth: &AuthContext,
+    api: &dyn ZoneRpcApi,
+) -> JsonRpcResponse {
+    let (data,) = match parse_params::<(Bytes,)>(raw, &id, "expected [data]") {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+
+    api_result(
+        id,
+        Method::ZonePreconfirmTransaction,
+        api.preconfirm_transaction(data, auth.clone()).await,
     )
 }
 

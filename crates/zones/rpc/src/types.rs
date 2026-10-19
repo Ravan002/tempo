@@ -470,6 +470,7 @@ define_methods! {
     EthFillTransaction => "eth_fillTransaction",
     EthSendRawTransaction => "eth_sendRawTransaction",
     EthSendRawTransactionSync => "eth_sendRawTransactionSync",
+    ZonePreconfirmTransaction => "zone_preconfirmTransaction",
 }
 
 /// Pre-serialized JSON `null`.
