@@ -250,6 +250,11 @@ tempo_hardfork!(
 );
 
 impl TempoHardfork {
+    /// Oldest hardfork this release executes; raise it when removing a hardfork's rules.
+    ///
+    /// Blocks activated under older forks are executed by their frozen era binary.
+    pub const MINIMUM_SUPPORTED: Self = Self::Genesis;
+
     /// Returns the ordered fallback fee tokens activated by this hardfork.
     pub const fn fallback_fee_tokens(&self) -> &'static [alloy_primitives::Address] {
         if self.is_t13() {
@@ -362,22 +367,30 @@ impl TempoHardfork {
     pub const fn from_chain_and_timestamp(chain_id: u64, timestamp: u64) -> Option<Self> {
         // Walk variants in reverse to find the latest active fork, mirroring
         // `TempoHardforks::tempo_hardfork_at` but without needing a chainspec instance.
+        // Genesis activates at 0 on every known chain, so only unknown chains fall through.
         let variants = Self::VARIANTS;
         let mut i = variants.len();
         while i > 0 {
             i -= 1;
-            let activation = match chain_id {
-                4217 => variants[i].mainnet_activation_timestamp(),
-                42431 => variants[i].moderato_activation_timestamp(),
-                _ => return None,
-            };
-            if let Some(ts) = activation
+            if let Some(ts) = variants[i].activation_timestamp(chain_id)
                 && timestamp >= ts
             {
                 return Some(variants[i]);
             }
         }
-        Some(Self::Genesis)
+        None
+    }
+
+    /// Returns this hardfork's activation timestamp on the given built-in chain.
+    ///
+    /// Returns `None` if the chain ID is not a known Tempo chain or the fork is not scheduled on
+    /// it.
+    pub const fn activation_timestamp(&self, chain_id: u64) -> Option<u64> {
+        match chain_id {
+            constants::mainnet::MAINNET_CHAIN_ID => self.mainnet_activation_timestamp(),
+            constants::moderato::MODERATO_CHAIN_ID => self.moderato_activation_timestamp(),
+            _ => None,
+        }
     }
 
     /// Retrieves the activation block for this hardfork on mainnet.
@@ -506,5 +519,45 @@ impl From<SpecId> for TempoHardfork {
         // Default to the default hardfork when converting from SpecId.
         // The actual hardfork should be passed explicitly where needed.
         Self::default()
+    }
+}
+
+#[cfg(test)]
+mod schedule_tests {
+    use super::*;
+    use crate::constants::{mainnet::*, moderato::*};
+
+    #[test]
+    fn activation_timestamp_dispatches_by_chain() {
+        assert_eq!(
+            TempoHardfork::T12.activation_timestamp(MAINNET_CHAIN_ID),
+            Some(MAINNET_T12_TIMESTAMP)
+        );
+        assert_eq!(
+            TempoHardfork::T11.activation_timestamp(MODERATO_CHAIN_ID),
+            Some(MODERATO_T11_TIMESTAMP)
+        );
+        assert_eq!(TempoHardfork::Genesis.activation_timestamp(1), None);
+        assert_eq!(
+            TempoHardfork::T14.activation_timestamp(MAINNET_CHAIN_ID),
+            None
+        );
+    }
+
+    #[test]
+    fn from_chain_and_timestamp_uses_activation_schedule() {
+        assert_eq!(TempoHardfork::from_chain_and_timestamp(1, 0), None);
+        assert_eq!(
+            TempoHardfork::from_chain_and_timestamp(MAINNET_CHAIN_ID, MAINNET_T12_TIMESTAMP - 1),
+            Some(TempoHardfork::T11)
+        );
+        assert_eq!(
+            TempoHardfork::from_chain_and_timestamp(MAINNET_CHAIN_ID, MAINNET_T12_TIMESTAMP),
+            Some(TempoHardfork::T12)
+        );
+        assert_eq!(
+            TempoHardfork::from_chain_and_timestamp(MODERATO_CHAIN_ID, 0),
+            Some(TempoHardfork::Genesis)
+        );
     }
 }

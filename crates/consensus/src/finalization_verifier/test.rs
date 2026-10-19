@@ -1,5 +1,5 @@
 use alloy_consensus::{BlockHeader as _, Header};
-use commonware_consensus::types::{Epoch, FixedEpocher};
+use commonware_consensus::types::{Epoch, FixedEpocher, Height};
 use commonware_macros::test_traced;
 use commonware_runtime::{Runner as _, deterministic};
 use reth_node_core::primitives::SealedBlock;
@@ -108,5 +108,32 @@ fn rejects_block_body_that_does_not_match_header() {
             verifier.decode_and_verify(&mut context, &certified),
             Err(Error::BlockBodyMismatch(_))
         ));
+    });
+}
+
+#[test]
+fn boundary_height_is_the_last_block_of_the_previous_epoch() {
+    deterministic::Runner::default().start(|mut context| async move {
+        let fixture = dkg_fixture(&mut context, Epoch::zero());
+        let verifier = FinalizationVerifier::new(
+            NetworkIdentity {
+                from_epoch: 0,
+                identity: *fixture.outcome.network_identity(),
+            },
+            FixedEpocher::new(EPOCH_LENGTH),
+        );
+        let length = EPOCH_LENGTH.get();
+        for (height, boundary) in [
+            (0, 0),
+            (length - 1, 0),
+            (length, length - 1),
+            (2 * length + 5, 2 * length - 1),
+        ] {
+            assert_eq!(
+                verifier.boundary_height(Height::new(height)).unwrap(),
+                Height::new(boundary),
+                "{height}"
+            );
+        }
     });
 }
