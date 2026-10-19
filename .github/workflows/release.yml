@@ -408,6 +408,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ needs.get-version.outputs.version }}
+          SOURCE_SHA: ${{ needs.get-version.outputs.sha }}
         run: |
           # Determine if this is a prerelease
           PRERELEASE=""
@@ -419,6 +420,7 @@ jobs:
           gh release create "$VERSION" \
             --repo ${{ github.repository }} \
             --title "Release $VERSION" \
+            --target "$SOURCE_SHA" \
             --draft \
             --notes "" \
             $PRERELEASE \
@@ -563,7 +565,7 @@ jobs:
         id: dest
         env:
           VERSION: ${{ needs.get-version.outputs.version }}
-          SHA: ${{ github.sha }}
+          SHA: ${{ needs.get-version.outputs.sha }}
         run: |
           if [[ "${{ github.repository }}" == "tempoxyz/tempo-private-fork" ]]; then
             echo "dir=${SHA}/${VERSION}" >> "$GITHUB_OUTPUT"

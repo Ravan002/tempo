@@ -25,6 +25,10 @@ the requested ref once and use its immutable commit for both builds. macOS
 binaries keep their existing native build path and are outside this reproducibility
 contract; the release as a whole still waits for the Linux verification gate.
 
+To exercise the Docker gate without publishing, dispatch `docker.yml` with
+`verify_only=true`. The release workflow's `dry_run=true` builds and checks its
+archives without creating a release or uploading to R2.
+
 These checks separate Depot builds/caches from verification, but both are
 orchestrated by GitHub Actions. They do not protect against a compromise of the
 GitHub workflow itself. The periodic Argo verifiers are no longer required for
