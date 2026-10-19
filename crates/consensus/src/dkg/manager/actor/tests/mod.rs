@@ -1889,3 +1889,50 @@ fn outcome_request_switches_notarized_ancestry_branches() {
         assert_eq!(harness.marshal.subscriptions(), subscriptions);
     });
 }
+
+#[test]
+fn dealer_does_not_offer_its_finalized_log_again_after_restart() {
+    Runner::default().start(|mut context| async move {
+        let (state, _keys, _) = dkg_state(&mut context, Epoch::new(1), 4, true);
+        let execution = StubExecutionProvider::default();
+        execution.add_header(outcome_header(Height::new(9), &state));
+        let mut h = Harness::builder(context.child("a"), "dealer_restart_after_finalized_log")
+            .epoch_length(10)
+            .initial_state(state.clone())
+            .execution(execution.clone())
+            .build()
+            .await;
+        h.start().await;
+        for height in 10..=15 {
+            h.report_finalized_header(header(Height::new(height))).await;
+        }
+        let log = h
+            .mailbox()
+            .get_dealer_log(state.epoch)
+            .await
+            .unwrap()
+            .expect("log at midpoint");
+        let mut with_log = header(Height::new(16));
+        with_log.inner.extra_data = log.encode().into();
+        h.report_finalized_header(with_log).await;
+        assert!(
+            !h.has_dealer_log(state.epoch).await,
+            "own log seen on chain"
+        );
+        h.stop().await;
+        drop(h);
+
+        let mut h = Harness::builder(context.child("b"), "dealer_restart_after_finalized_log")
+            .epoch_length(10)
+            .finalized_floor(Height::new(16))
+            .execution(execution.clone())
+            .build()
+            .await;
+        h.start().await;
+        h.report_finalized_header(header(Height::new(17))).await;
+        assert!(
+            !h.has_dealer_log(state.epoch).await,
+            "dealer offers its log again although it is already finalized on chain"
+        );
+    });
+}

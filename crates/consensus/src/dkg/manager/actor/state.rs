@@ -385,6 +385,15 @@ where
             return Ok(None);
         }
 
+        // Our log is already finalized for this epoch (replayed after a restart), so a fresh
+        // dealer would only offer it again.
+        if self
+            .logs_for_epoch(round.epoch)
+            .any(|(dealer, _)| *dealer == me.public_key())
+        {
+            return Ok(None);
+        }
+
         let share = if round.is_full_dkg() {
             info!("running full DKG ceremony as dealer (new polynomial)");
             None
