@@ -17076,6 +17076,7 @@ dependencies = [
  "eyre",
  "metrics",
  "reth-basic-payload-builder",
+ "futures",
  "reth-chainspec",
  "reth-errors",
  "reth-evm",

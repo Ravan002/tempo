@@ -55,6 +55,7 @@ alloy-sol-types.workspace = true
 
 # misc
 eyre.workspace = true
+futures.workspace = true
 metrics.workspace = true
 serde = { workspace = true, features = ["alloc", "derive"] }
 thiserror.workspace = true

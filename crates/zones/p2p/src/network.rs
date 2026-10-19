@@ -24,6 +24,9 @@ pub(crate) const TRANSACTION_CHANNEL: u64 = 3;
 pub(crate) const SETTLEMENT_PROPOSAL_CHANNEL: u64 = 4;
 /// Follower-to-leader settlement signature channel.
 pub(crate) const SETTLEMENT_SIGNATURE_CHANNEL: u64 = 5;
+/// Preconfirmation replication between quorum members: transaction batches and their
+/// acknowledgements.
+pub(crate) const PRECONFIRMATION_CHANNEL: u64 = 6;
 /// Commonware derives receive capacity from this burst size and the retained peer count.
 /// Forwarded transactions are retried from the sender's pool, so a small per-peer burst bounds
 /// memory before the transaction-specific wire limit can run without sacrificing eventual relay.
@@ -34,6 +37,10 @@ pub(crate) const TRANSACTION_BURST: u32 = 4;
 /// This is eight times Reth's default 128 KiB transaction input limit, leaving room for operators
 /// to raise the pool limit without allowing block-sized frames into transaction event queues.
 pub const MAX_TRANSACTION_MESSAGE_SIZE: usize = 1024 * 1024;
+
+/// Maximum preconfirmation frame accepted from another sequencer: one issuance batch of at most
+/// 256 transactions.
+pub const MAX_PRECONFIRMATION_MESSAGE_SIZE: usize = 8 * 1024 * 1024;
 
 // At 30M gas, calldata is bounded below 7.5 MiB; leave headroom for block overhead.
 pub(crate) const MAX_MESSAGE_SIZE: u32 = 20 * 1024 * 1024;
@@ -201,6 +208,11 @@ pub(crate) fn backfill_response_quota() -> Quota {
 
 pub(crate) fn transaction_quota() -> Quota {
     Quota::per_second(NZU32!(1024)).allow_burst(NZU32!(TRANSACTION_BURST))
+}
+
+/// Preconfirmation batches are issued back to back under load, each answered by one ACK.
+pub(crate) fn preconfirmation_quota() -> Quota {
+    Quota::per_second(NZU32!(16_384)).allow_burst(NZU32!(256))
 }
 
 /// ACKs are small fixed-shape EIP-712 statements plus one secp256k1 signature.

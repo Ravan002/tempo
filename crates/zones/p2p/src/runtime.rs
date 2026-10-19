@@ -25,8 +25,8 @@ use crate::{
     identity::{Ed25519Identity, Secp256k1Identity},
     network::{
         self, BACKFILL_REQUEST_CHANNEL, BACKFILL_RESPONSE_CHANNEL, BLOCK_CHANNEL, MAX_MESSAGE_SIZE,
-        MAX_TRANSACTION_MESSAGE_SIZE, SETTLEMENT_PROPOSAL_CHANNEL, SETTLEMENT_SIGNATURE_CHANNEL,
-        TRANSACTION_CHANNEL,
+        MAX_PRECONFIRMATION_MESSAGE_SIZE, MAX_TRANSACTION_MESSAGE_SIZE, PRECONFIRMATION_CHANNEL,
+        SETTLEMENT_PROPOSAL_CHANNEL, SETTLEMENT_SIGNATURE_CHANNEL, TRANSACTION_CHANNEL,
     },
     protocol::EncodedBlock,
     routing::{RoutingMembership, RoutingPolicy},
@@ -54,6 +54,7 @@ struct P2pSenders {
     settlement_proposals: CommonwareSender,
     settlement_signatures: CommonwareSender,
     transactions: CommonwareSender,
+    preconfirmations: CommonwareSender,
 }
 
 struct P2pReceivers<R = CommonwareReceiver> {
@@ -61,6 +62,7 @@ struct P2pReceivers<R = CommonwareReceiver> {
     settlement_proposals: R,
     settlement_signatures: R,
     transactions: R,
+    preconfirmations: R,
 }
 
 struct BackfillNodeChannels {
@@ -232,6 +234,15 @@ pub enum P2pCommand {
         transaction_hash: B256,
         transaction: Vec<u8>,
     },
+    /// Send one preconfirmation replication frame to `recipient`, or to every other quorum
+    /// member when `None`. The runtime reports the peers that admitted it with
+    /// [`P2pEvent::PreconfirmationFrameSent`].
+    SendPreconfirmationFrame {
+        /// Caller-chosen identifier echoed in the admission report.
+        id: u64,
+        recipient: Option<PublicKey>,
+        frame: Vec<u8>,
+    },
 }
 
 /// Observable lifecycle and block events emitted by the P2P runtime.
@@ -262,6 +273,10 @@ pub enum P2pEvent {
         follower_ed25519_public_key: PublicKey,
         transaction: Vec<u8>,
     },
+    /// The quorum peers that admitted a [`P2pCommand::SendPreconfirmationFrame`].
+    PreconfirmationFrameSent { id: u64, admitted: Vec<PublicKey> },
+    /// A quorum member received a preconfirmation replication frame from another quorum member.
+    PreconfirmationFrameReceived { peer: PublicKey, frame: Vec<u8> },
 }
 
 /// Handle used to communicate with, supervise, and stop the dedicated P2P runtime.
@@ -435,6 +450,10 @@ fn run(
             TRANSACTION_CHANNEL,
             network::transaction_quota(),
         );
+        let (preconfirmation_sender, preconfirmation_receiver) = commonware.register(
+            PRECONFIRMATION_CHANNEL,
+            network::preconfirmation_quota(),
+        );
         let mut network_task = commonware.start();
 
         if config.bypass_ip_check {
@@ -473,8 +492,10 @@ fn run(
                 settlement_proposals: settlement_proposal_sender,
                 settlement_signatures: settlement_signature_sender,
                 transactions: transaction_sender,
+                preconfirmations: preconfirmation_sender,
             },
             command_rx,
+            events.clone(),
         );
         tokio::pin!(command_loop);
 
@@ -488,6 +509,7 @@ fn run(
                 settlement_proposals: settlement_proposal_receiver,
                 settlement_signatures: settlement_signature_receiver,
                 transactions: transaction_receiver,
+                preconfirmations: preconfirmation_receiver,
             },
             events,
         );
@@ -538,6 +560,7 @@ async fn run_commands(
     capabilities: PeerCapabilities,
     mut senders: P2pSenders,
     mut commands: mpsc::Receiver<P2pCommand>,
+    events: mpsc::Sender<P2pEvent>,
 ) -> eyre::Result<()> {
     while let Some(command) = commands.recv().await {
         match command {
@@ -693,6 +716,35 @@ async fn run_commands(
                     debug!(target: "zone::p2p", ?transaction_hash, admitted = admitted.len(), configured, transaction_size_bytes = transaction_size, "Submitted transaction forwarding to quorum peers");
                 }
             }
+
+            P2pCommand::SendPreconfirmationFrame {
+                id,
+                recipient,
+                frame,
+            } => {
+                // Any quorum member may lead, so any quorum member issues and stores
+                // preconfirmations; RPC-only members never build blocks.
+                let policy =
+                    RoutingPolicy::new(&local_ed25519_public_key, &membership, &leadership);
+                let recipients = match recipient {
+                    Some(peer) if policy.is_remote_quorum_peer(&peer) => vec![peer],
+                    Some(_) => Vec::new(),
+                    None => policy.other_quorum_peers(),
+                };
+                let admitted = if policy.am_i_quorum_member()
+                    && !recipients.is_empty()
+                    && frame.len() <= MAX_PRECONFIRMATION_MESSAGE_SIZE
+                {
+                    senders
+                        .preconfirmations
+                        .send(Recipients::Some(recipients), frame, true)
+                } else {
+                    Vec::new()
+                };
+                let _ = events
+                    .send(P2pEvent::PreconfirmationFrameSent { id, admitted })
+                    .await;
+            }
         }
     }
 
@@ -716,6 +768,7 @@ where
         mut settlement_proposals,
         mut settlement_signatures,
         mut transactions,
+        mut preconfirmations,
     } = receivers;
 
     loop {
@@ -807,6 +860,30 @@ where
                     follower_ed25519_public_key: peer,
                     transaction,
                 }
+            }
+
+            result = preconfirmations.recv() => {
+                let (peer, bytes) = result.map_err(|err| eyre::eyre!("preconfirmation channel receive failed: {err}"))?;
+                let frame = match into_bounded_payload(bytes, MAX_PRECONFIRMATION_MESSAGE_SIZE) {
+                    Ok(frame) => frame,
+                    Err(size) => {
+                        commonware_p2p::block!(
+                            blocker,
+                            peer,
+                            frame_size_bytes = size,
+                            max_frame_size_bytes = MAX_PRECONFIRMATION_MESSAGE_SIZE,
+                            "Blocking peer for oversized preconfirmation frame"
+                        );
+                        continue;
+                    }
+                };
+                let policy = RoutingPolicy::new(&local_ed25519_public_key, &membership, &leadership);
+                if !(policy.am_i_quorum_member() && policy.is_remote_quorum_peer(&peer)) {
+                    metrics::counter!("zone_p2p_role_invalid_messages_dropped_total").increment(1);
+                    warn!(target: "zone::p2p", %peer, "Ignoring preconfirmation frame from role-invalid peer");
+                    continue;
+                }
+                P2pEvent::PreconfirmationFrameReceived { peer, frame }
             }
         };
         events
@@ -1063,6 +1140,7 @@ mod tests {
         let (_proposals_tx, settlement_proposals) = mock_receiver();
         let (_signatures_tx, settlement_signatures) = mock_receiver();
         let (transactions_tx, transactions) = mock_receiver();
+        let (_preconfirmations_tx, preconfirmations) = mock_receiver();
         let (events_tx, mut events) = tokio::sync::mpsc::channel(4);
         let blocker = RecordingBlocker::default();
         let observed_blocker = blocker.clone();
@@ -1076,6 +1154,7 @@ mod tests {
                 settlement_proposals,
                 settlement_signatures,
                 transactions,
+                preconfirmations,
             },
             events_tx,
         ));

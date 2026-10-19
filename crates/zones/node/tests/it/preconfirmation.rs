@@ -28,7 +28,9 @@ use zone_payload::SignedPreconfirmation;
 use zone_primitives::constants::MAX_UNPROCESSED_DEPOSITS;
 
 use crate::utils::{
-    DEFAULT_TIMEOUT, RedactedRpcTestCtx, TIP20_TX_GAS, start_zone_with_redacted_rpc,
+    DEFAULT_TIMEOUT, L1Fixture, RedactedRpcTestCtx, TIP20_TX_GAS, build_auth_token,
+    redacted_rpc_call, start_local_p2p_cluster, start_redacted_rpc_url,
+    start_zone_with_redacted_rpc,
 };
 
 /// Gas limit for a transfer from an account whose nonce is already in use.
@@ -209,6 +211,104 @@ async fn preconfirmations_stack_and_win_over_the_pool() -> eyre::Result<()> {
         );
     }
 
+    Ok(())
+}
+
+/// A promise is returned only after the other sequencers stored the transfer, so when the leader
+/// crashes before building the promised block, the sequencer that replaces it includes the
+/// transfer in that block.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn preconfirmations_are_kept_when_the_leader_crashes() -> eyre::Result<()> {
+    reth_tracing::init_test_tracing();
+
+    let mut cluster = start_local_p2p_cluster(24).await?;
+    // Commonware drops messages for offline peers; wait for the handshakes.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    let senders: Vec<_> = (0..4).map(|_| PrivateKeySigner::random()).collect();
+    let recipient = address!("0x00000000000000000000000000000000000c4a54");
+    cluster.inject_block(vec![])?;
+    cluster.wait_all_at(1, DEFAULT_TIMEOUT).await?;
+    cluster.inject_block(
+        senders
+            .iter()
+            .map(|sender| {
+                L1Fixture::make_deposit_for_block(
+                    PATH_USD_ADDRESS,
+                    sender.address(),
+                    sender.address(),
+                    SENDER_BALANCE,
+                )
+            })
+            .collect(),
+    )?;
+    cluster.wait_all_at(2, DEFAULT_TIMEOUT).await?;
+    cluster.fixture.seed_no_receive_policy(recipient)?;
+
+    // Leader A promises the transfers for block 3.
+    let leader = &cluster.nodes[0];
+    let chain_id = leader.provider().get_chain_id().await?;
+    let url = start_redacted_rpc_url(
+        leader,
+        zone_node::rpc::RedactedRpcConfig {
+            listen_addr: ([127, 0, 0, 1], 0).into(),
+            zone_id: 0,
+            chain_id,
+            max_auth_token_validity: zone_node::rpc::auth::DEFAULT_MAX_AUTH_TOKEN_VALIDITY,
+            max_response_size: 16 * 1024 * 1024,
+            zone_portal: Address::ZERO,
+        },
+    )
+    .await?;
+    let mut promised = Vec::new();
+    for (index, sender) in senders.iter().enumerate() {
+        let (_, raw) = signed_transfer(sender, chain_id, 0, recipient, index as u64 + 1)?;
+        let response = redacted_rpc_call(
+            &url,
+            "zone_preconfirmTransaction",
+            json!([raw]),
+            &build_auth_token(sender, 0, chain_id),
+        )
+        .await?;
+        let preconfirmation: SignedPreconfirmation =
+            serde_json::from_value(response["result"].clone())
+                .map_err(|err| eyre::eyre!("expected a preconfirmation ({err}): {response}"))?;
+        assert_eq!(preconfirmation.include_by, 3);
+        promised.push(preconfirmation);
+    }
+
+    // A crashes before building block 3, and an operator moves leadership to B from the next
+    // anchor on.
+    let tip_hash = cluster.assert_same_block(2).await?.hash;
+    let anchor = cluster.next_anchor_number();
+    let crashed_leader = cluster.nodes.remove(0);
+    crashed_leader.crash();
+    let replacement = cluster.p2p_public_keys[1].clone();
+    for node in &cluster.nodes {
+        assert!(node.leadership().install_forced_recovery(
+            1,
+            replacement.clone(),
+            tip_hash,
+            anchor
+        )?);
+    }
+    cluster.inject_block(vec![])?;
+    cluster.wait_all_at(3, Duration::from_secs(60)).await?;
+    assert_eq!(
+        cluster.assert_same_block(3).await?.beneficiary(),
+        cluster.sequencer_signers[1].address(),
+        "B must build block 3"
+    );
+
+    for preconfirmation in &promised {
+        let receipt = cluster.nodes[0]
+            .provider()
+            .get_transaction_receipt(preconfirmation.tx_hash)
+            .await?
+            .ok_or_else(|| eyre::eyre!("promised transfer {} was lost", preconfirmation.tx_hash))?;
+        assert!(receipt.status());
+        assert_eq!(receipt.block_number(), Some(preconfirmation.include_by));
+    }
     Ok(())
 }
 

@@ -144,6 +144,11 @@ impl EventSinks {
         sinks.backfill_responses = backfill_responses;
     }
 
+    /// Routes preconfirmation events to `sink` for the process lifetime, across generations.
+    pub(crate) fn install_preconfirmations(&self, sink: mpsc::Sender<P2pEvent>) {
+        self.inner.lock().expect("poisoned").preconfirmations = Some(sink);
+    }
+
     fn clear(&self) {
         let mut sinks = self.inner.lock().expect("poisoned");
         sinks.sync = None;
@@ -155,6 +160,12 @@ impl EventSinks {
         let sinks = self.inner.lock().expect("poisoned");
         if matches!(event, P2pEvent::TransactionReceived { .. }) {
             sinks.transactions.clone()
+        } else if matches!(
+            event,
+            P2pEvent::PreconfirmationFrameSent { .. }
+                | P2pEvent::PreconfirmationFrameReceived { .. }
+        ) {
+            sinks.preconfirmations.clone()
         } else {
             sinks.sync.clone()
         }
@@ -174,6 +185,8 @@ struct GenerationSinks {
     sync: Option<mpsc::Sender<P2pEvent>>,
     transactions: Option<mpsc::Sender<P2pEvent>>,
     backfill_responses: Option<mpsc::Sender<BackfillResponse>>,
+    /// Process-lifetime preconfirmation replication sink; generations do not replace it.
+    preconfirmations: Option<mpsc::Sender<P2pEvent>>,
 }
 
 /// Long-lived P2P event demultiplexer for non-backfill protocols.

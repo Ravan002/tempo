@@ -6,6 +6,9 @@
 use crate::{
     ZoneEngine,
     follower::PeerTipRegistry,
+    preconfirmation_replication::{
+        PRECONFIRMATION_EVENT_BACKLOG, spawn_preconfirmation_replication,
+    },
     replication::{BACKFILL_SERVE_QUEUE_CAPACITY, serve_backfill_requests},
     role::{
         EventSinks, LeaderSequencerDeps, RoleControllerContext, SharedRoleStatus,
@@ -613,6 +616,12 @@ where
             "no Zone chain advancement mechanism configured: enable a sequencer, configure P2P, or register an external deposit consumer"
         );
 
+        // Load promises left by a previous run before this node can build a block.
+        if let Some(preconfirmations) = &self.preconfirmations {
+            preconfirmations
+                .open_journal(&ctx.config.datadir().data_dir().join("preconfirmations"))?;
+        }
+
         let tempo_block_number = ctx.node.provider().latest()?.tempo_block_number()?;
         let last_operational_tempo_block = latest_operational_tempo_block(ctx.node.provider())?;
         if last_operational_tempo_block < tempo_block_number {
@@ -805,6 +814,17 @@ where
             .get()
             .saturating_mul(1024 * 1024) as usize;
         let provider = ctx.node.provider().clone();
+        if let (Some(preconfirmations), Some(runtime)) = (&self.preconfirmations, &p2p_runtime) {
+            let (events, event_rx) = tokio::sync::mpsc::channel(PRECONFIRMATION_EVENT_BACKLOG);
+            runtime.sinks.install_preconfirmations(events);
+            spawn_preconfirmation_replication(
+                preconfirmations.clone(),
+                provider.clone(),
+                runtime.commands.clone(),
+                event_rx,
+                &task_executor,
+            );
+        }
         let zone_provider = provider.clone();
         let pool = ctx.node.pool().clone();
         let engine_handle = ctx.beacon_engine_handle.clone();

@@ -19,7 +19,7 @@ pub use builder::{
     build_advance_tempo_headers_tx, build_advance_tempo_tx,
 };
 pub use preconfirmation::{
-    Preconfirmation, PreconfirmationError, PreconfirmationIssuer, Preconfirmations,
-    SignedPreconfirmation,
+    Preconfirmation, PreconfirmationError, PreconfirmationIssuer, PreconfirmationReplicator,
+    Preconfirmations, SignedPreconfirmation,
 };
 pub use withdrawal_reveal::WithdrawalRevealEncryptor;

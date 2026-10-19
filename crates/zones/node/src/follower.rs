@@ -337,6 +337,9 @@ where
                         P2pEvent::SettlementSignatureReceived { .. } => {
                             debug!(target: "zone::p2p", "Ignoring leader-only attestation event on follower");
                         }
+                        // Routed to the process-lifetime preconfirmation replication task.
+                        P2pEvent::PreconfirmationFrameSent { .. }
+                        | P2pEvent::PreconfirmationFrameReceived { .. } => {}
                     }
                 }
                 Ok(()) = schedule_changes.changed() => {

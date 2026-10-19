@@ -13,26 +13,34 @@
 //! build finishes, the built block becomes the new tip and its state becomes the base for the next
 //! preconfirmations, before the block is even canonical.
 //!
+//! In a multi-sequencer Zone a promise is returned only after every connected sequencer stored the
+//! transaction through a [`PreconfirmationReplicator`]. Whichever sequencer builds the next block
+//! includes the stored transactions first, so a leadership handoff or a failed leader does not
+//! break a promise. Each node also journals its outstanding transactions in its data directory so
+//! a restart does not lose them.
+//!
 //! The promise covers inclusion, not the transfer outcome. Inclusion can still fail if Tempo policy
 //! imported by the next block's `advanceTempo` forbids the fee payment, and a checkpoint-only block
-//! during catch-up carries no transactions, which delays inclusion past `includeBy`. The queue lives
-//! in memory, so it does not survive a restart or a leadership handoff.
+//! during catch-up carries no transactions, which delays inclusion past `includeBy`.
+
+mod journal;
 
 use crate::builder::POOL_TX_SIZE_BUDGET;
 use alloy_consensus::{BlockHeader as _, Transaction as _, transaction::TxHashRef as _};
-use alloy_eips::eip2718::Encodable2718 as _;
+use alloy_eips::eip2718::{Decodable2718 as _, Encodable2718 as _};
 use alloy_evm::Evm as _;
-use alloy_primitives::{Address, B256, Signature, SignatureError};
+use alloy_primitives::{Address, B256, Bytes, Signature, SignatureError};
 use alloy_signer::SignerSync as _;
 use alloy_signer_local::PrivateKeySigner;
 use alloy_sol_types::{SolCall as _, SolStruct as _, eip712_domain, sol};
+use futures::{FutureExt as _, future::BoxFuture};
 use reth_chainspec::EthChainSpec as _;
 use reth_errors::ProviderError;
 use reth_evm::{ConfigureEvm as _, NextBlockEnvAttributes};
-use reth_primitives_traits::{Recovered, SealedHeader};
+use reth_primitives_traits::{Recovered, SealedHeader, SignerRecoverable as _};
 use reth_revm::{
     State,
-    context::result::EVMError,
+    context::result::{EVMError, InvalidTransaction},
     database::StateProviderDatabase,
     database_interface::bal::EvmDatabaseError,
     db::{CacheState, DatabaseCommit as _},
@@ -41,14 +49,15 @@ use reth_storage_api::{BlockHashReader, BlockNumReader, StateProvider as _, Stat
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
-    sync::{Arc, Mutex, MutexGuard},
+    path::Path,
+    sync::{Arc, Mutex, MutexGuard, OnceLock},
     time::{SystemTime, UNIX_EPOCH},
 };
 use tempo_contracts::precompiles::ITIP20;
 use tempo_evm::TempoNextBlockEnvAttributes;
 use tempo_primitives::{TempoAddressExt as _, TempoHeader, TempoTxEnvelope};
 use tempo_revm::TempoInvalidTransaction;
-use tracing::warn;
+use tracing::{debug, warn};
 use zone_evm::ZoneEvmConfig;
 use zone_precompiles::L1StorageReader;
 
@@ -116,7 +125,26 @@ pub enum PreconfirmationError {
     /// The issuer thread is gone because the node is shutting down.
     #[error("preconfirmation issuer stopped")]
     Stopped,
+    /// The transaction could not be journaled; it stays queued but is not promised.
+    #[error("preconfirmation could not be journaled: {0}")]
+    Journal(Arc<std::io::Error>),
+    /// Not every connected sequencer stored the transaction; it stays queued but is not promised.
+    #[error("preconfirmation could not be replicated: {0}")]
+    NotReplicated(String),
 }
+
+/// Shares preconfirmed transactions with the other sequencers of a Zone.
+pub trait PreconfirmationReplicator: Send + Sync + 'static {
+    /// Sends `transactions`, promised for block `include_by`, to every other sequencer and
+    /// resolves once each connected sequencer stored them.
+    fn replicate(
+        &self,
+        include_by: u64,
+        transactions: Vec<Bytes>,
+    ) -> BoxFuture<'static, Result<(), String>>;
+}
+
+type Replication = futures::future::Shared<BoxFuture<'static, Result<(), String>>>;
 
 /// Shared queue of preconfirmed transactions, filled by a [`PreconfirmationIssuer`] and drained
 /// by the payload builder.
@@ -124,6 +152,7 @@ pub enum PreconfirmationError {
 pub struct Preconfirmations {
     signer: PrivateKeySigner,
     queue: Arc<Mutex<Queue>>,
+    replicator: Arc<OnceLock<Arc<dyn PreconfirmationReplicator>>>,
 }
 
 impl std::fmt::Debug for Preconfirmations {
@@ -142,7 +171,90 @@ impl Preconfirmations {
         Self {
             signer,
             queue: Arc::default(),
+            replicator: Arc::default(),
         }
+    }
+
+    /// Replicates every batch issued from now on through `replicator` before promising it.
+    pub fn set_replicator(&self, replicator: Arc<dyn PreconfirmationReplicator>) {
+        if self.replicator.set(replicator).is_err() {
+            warn!(target: "zone::preconfirmation", "preconfirmation replicator is already set");
+        }
+    }
+
+    /// Journals outstanding transactions in `directory` and loads those left by a previous run,
+    /// which the next block this node builds includes first.
+    pub fn open_journal(&self, directory: &Path) -> eyre::Result<()> {
+        let (journal, entries) = journal::Journal::open(directory)?;
+        let mut seen = HashSet::new();
+        let mut loaded = Vec::new();
+        for entry in entries {
+            let tx = TempoTxEnvelope::decode_2718_exact(&entry.transaction)
+                .map_err(|err| eyre::eyre!("corrupt preconfirmation journal entry: {err}"))?
+                .try_into_recovered()
+                .map_err(|err| eyre::eyre!("unrecoverable journaled transaction: {err}"))?;
+            if seen.insert(*tx.tx_hash()) {
+                loaded.push(Queued {
+                    tx,
+                    include_by: entry.include_by,
+                });
+            }
+        }
+        if !loaded.is_empty() {
+            tracing::info!(target: "zone::preconfirmation", count = loaded.len(), "loaded journaled preconfirmations");
+        }
+        let mut queue = self.lock();
+        queue.replicas.extend(loaded);
+        queue.journal = Some(journal);
+        Ok(())
+    }
+
+    /// Stores transactions another sequencer promised for block `include_by`, so this node
+    /// includes them if it builds the next block. Returns `false` if this node already built
+    /// block `include_by` and therefore cannot keep the promise.
+    ///
+    /// Stored transactions are dropped once the canonical head reaches their block, which then
+    /// includes them.
+    pub fn store_replicas(
+        &self,
+        canonical_head: u64,
+        include_by: u64,
+        transactions: Vec<Recovered<TempoTxEnvelope>>,
+    ) -> bool {
+        let mut queue = self.lock();
+        if queue
+            .tip
+            .as_ref()
+            .is_some_and(|tip| tip.header.number() >= include_by)
+        {
+            return false;
+        }
+        queue
+            .replicas
+            .retain(|queued| queued.include_by > canonical_head);
+        let known: HashSet<_> = queue
+            .replicas
+            .iter()
+            .map(|queued| *queued.tx.tx_hash())
+            .collect();
+        let stored: Vec<_> = transactions
+            .into_iter()
+            .filter(|tx| !known.contains(tx.tx_hash()))
+            .map(|tx| Queued { tx, include_by })
+            .collect();
+        if let Some(Err(err)) = queue
+            .journal
+            .as_mut()
+            .map(|journal| journal.retire_built(include_by, canonical_head))
+        {
+            warn!(target: "zone::preconfirmation", %err, "failed to retire a preconfirmation journal file");
+        }
+        if let Err(err) = queue.journal_append(include_by, &stored) {
+            warn!(target: "zone::preconfirmation", %err, "failed to journal replicated preconfirmations");
+            return false;
+        }
+        queue.replicas.extend(stored);
+        true
     }
 
     /// Starts the thread that appends transactions to the queue and returns a handle to submit
@@ -163,6 +275,7 @@ impl Preconfirmations {
         let (submissions, received) = std::sync::mpsc::channel::<Submission>();
         let chain_id = evm_config.chain_spec().chain_id();
         let queue = self.queue.clone();
+        let replicator = self.replicator.clone();
         std::thread::Builder::new()
             .name("zone-preconfirmations".into())
             .spawn(move || {
@@ -174,12 +287,25 @@ impl Preconfirmations {
                         .into_iter()
                         .map(|submission| (submission.tx, submission.respond))
                         .unzip();
+                    let encoded: Vec<Bytes> =
+                        txs.iter().map(|tx| tx.encoded_2718().into()).collect();
                     let outcomes = queue
                         .lock()
                         .expect("preconfirmation queue poisoned")
                         .enqueue(&provider, &evm_config, txs);
+                    let replication = replicator.get().and_then(|replicator| {
+                        let include_by =
+                            outcomes.iter().find_map(|outcome| outcome.clone().ok())?;
+                        let promised = encoded
+                            .into_iter()
+                            .zip(&outcomes)
+                            .filter_map(|(tx, outcome)| outcome.is_ok().then_some(tx))
+                            .collect();
+                        Some(replicator.replicate(include_by, promised).shared())
+                    });
                     for (respond, outcome) in responders.into_iter().zip(outcomes) {
-                        let _ = respond.send(outcome);
+                        let _ = respond
+                            .send(outcome.map(|include_by| (include_by, replication.clone())));
                     }
                 }
             })
@@ -207,6 +333,11 @@ impl Preconfirmations {
         L1: L1StorageReader + Unpin,
     {
         let mut queue = self.lock();
+        // Transactions other sequencers promised, or this node promised before a restart.
+        let inherited: Vec<_> = core::mem::take(&mut queue.replicas)
+            .into_iter()
+            .filter(|queued| !queue.promised.contains_key(queued.tx.tx_hash()))
+            .collect();
         if queue.tip.as_ref().map(|tip| tip.header.hash()) != Some(parent.hash()) {
             let mut requeued = queue
                 .tip
@@ -214,12 +345,15 @@ impl Preconfirmations {
                 .map(|tip| tip.preconfirmed)
                 .unwrap_or_default();
             requeued.append(&mut queue.pending);
+            requeued.extend(inherited);
             let tip = Tip {
                 header: parent.clone(),
                 state_base: parent.hash(),
                 preconfirmed: Vec::new(),
             };
             queue.rebase(provider, evm_config, tip, CacheState::default(), requeued);
+        } else if !inherited.is_empty() {
+            queue.requeue(provider, evm_config, inherited);
         }
 
         PreconfirmationBuild { queue }
@@ -259,7 +393,13 @@ impl PreconfirmationIssuer {
         self.submissions
             .send(Submission { tx, respond })
             .map_err(|_| PreconfirmationError::Stopped)?;
-        let include_by = outcome.await.map_err(|_| PreconfirmationError::Stopped)??;
+        let (include_by, replication) =
+            outcome.await.map_err(|_| PreconfirmationError::Stopped)??;
+        if let Some(replication) = replication {
+            replication
+                .await
+                .map_err(PreconfirmationError::NotReplicated)?;
+        }
 
         // Signing is deterministic, so a resubmission gets the same signature, and it happens
         // off the issuer thread because it does not depend on the queue.
@@ -278,7 +418,7 @@ impl PreconfirmationIssuer {
 
 struct Submission {
     tx: Recovered<TempoTxEnvelope>,
-    respond: tokio::sync::oneshot::Sender<Result<u64, PreconfirmationError>>,
+    respond: tokio::sync::oneshot::Sender<Result<(u64, Option<Replication>), PreconfirmationError>>,
 }
 
 /// Exclusive access to the queue for the duration of one block build.
@@ -310,6 +450,7 @@ impl PreconfirmationBuild<'_> {
         L1: L1StorageReader + Unpin,
     {
         let pending = core::mem::take(&mut self.queue.pending);
+        self.queue.journal_truncate(header.number() + 1);
         let tip = Tip {
             state_base: header.parent_hash(),
             header,
@@ -336,6 +477,7 @@ impl PreconfirmationBuild<'_> {
         }
         metrics::counter!("zone_preconfirmations_included_total")
             .increment(preconfirmed.len() as u64);
+        self.queue.journal_truncate(header.number() + 1);
 
         self.queue.reset(
             Tip {
@@ -363,6 +505,11 @@ struct Queue {
     gas: u64,
     /// Sum of `pending` encoded lengths.
     bytes: usize,
+    /// Transactions promised by other sequencers or loaded from the journal, which the next
+    /// block this node builds includes after `pending`.
+    replicas: Vec<Queued>,
+    /// Record of outstanding transactions; `None` until the node opens it.
+    journal: Option<journal::Journal>,
 }
 
 impl Queue {
@@ -422,15 +569,24 @@ impl Queue {
             executed.iter().map(|&index| &txs[index]),
         );
         let mut txs: Vec<_> = txs.into_iter().map(Some).collect();
-        let mut issued = 0;
+        let first_issued = self.pending.len();
         for (index, result) in executed.into_iter().zip(results) {
             if result.is_ok() {
                 let tx = txs[index].take().expect("each transaction executes once");
                 self.push(Queued { tx, include_by });
-                issued += 1;
             }
             outcomes[index] = Some(result.map(|()| include_by));
         }
+        let issued = &self.pending[first_issued..];
+        if let Err(err) = journal_append(&mut self.journal, include_by, issued) {
+            let err = Arc::new(err);
+            for outcome in outcomes.iter_mut().flatten() {
+                if outcome.is_ok() {
+                    *outcome = Err(PreconfirmationError::Journal(err.clone()));
+                }
+            }
+        }
+        let issued = issued.len() as u64;
         for (index, first) in duplicates {
             outcomes[index] = outcomes[first].clone();
         }
@@ -491,16 +647,63 @@ impl Queue {
         L1: L1StorageReader + Unpin,
     {
         self.reset(tip, state);
+        self.requeue(provider, evm_config, requeued);
+    }
+
+    /// Re-executes `requeued` in order on top of the queue and appends those that still succeed.
+    /// A transaction whose nonce is already used was included by an earlier block, so it is
+    /// dropped without reporting a broken promise.
+    fn requeue<P, L1>(
+        &mut self,
+        provider: &P,
+        evm_config: &ZoneEvmConfig<L1>,
+        requeued: Vec<Queued>,
+    ) where
+        P: StateProviderFactory,
+        L1: L1StorageReader + Unpin,
+    {
         let outcomes = self.execute(
             provider,
             evm_config,
             requeued.iter().map(|queued| &queued.tx),
         );
+        let mut kept = Vec::new();
         for (queued, outcome) in requeued.into_iter().zip(outcomes) {
             match outcome {
-                Ok(()) => self.push(queued),
+                Ok(()) => kept.push(queued),
+                Err(PreconfirmationError::Invalid(EVMError::Transaction(
+                    TempoInvalidTransaction::EthInvalidTransaction(
+                        InvalidTransaction::NonceTooLow { .. },
+                    ),
+                ))) => {
+                    debug!(target: "zone::preconfirmation", tx_hash = %queued.tx.tx_hash(), "preconfirmed transaction is already included");
+                }
                 Err(err) => drop_preconfirmation(&queued, &err),
             }
+        }
+        let next_block = self
+            .tip
+            .as_ref()
+            .expect("requeue requires a tip")
+            .header
+            .number()
+            + 1;
+        if let Err(err) = self.journal_append(next_block, &kept) {
+            warn!(target: "zone::preconfirmation", %err, "failed to journal requeued preconfirmations");
+        }
+        for queued in kept {
+            self.push(queued);
+        }
+    }
+
+    fn journal_append(&mut self, slot: u64, entries: &[Queued]) -> std::io::Result<()> {
+        journal_append(&mut self.journal, slot, entries)
+    }
+
+    /// Retires the journal file for block `slot`, whose previous entries are all built.
+    fn journal_truncate(&mut self, slot: u64) {
+        if let Some(Err(err)) = self.journal.as_mut().map(|journal| journal.truncate(slot)) {
+            warn!(target: "zone::preconfirmation", %err, "failed to truncate the preconfirmation journal");
         }
     }
 
@@ -593,6 +796,26 @@ struct Queued {
     tx: Recovered<TempoTxEnvelope>,
     /// Block number promised when the transaction was first preconfirmed.
     include_by: u64,
+}
+
+fn journal_append(
+    journal: &mut Option<journal::Journal>,
+    slot: u64,
+    entries: &[Queued],
+) -> std::io::Result<()> {
+    let Some(journal) = journal else {
+        return Ok(());
+    };
+    let encoded: Vec<_> = entries
+        .iter()
+        .map(|queued| (queued.include_by, queued.tx.encoded_2718()))
+        .collect();
+    journal.append(
+        slot,
+        encoded
+            .iter()
+            .map(|(include_by, tx)| (*include_by, tx.as_slice())),
+    )
 }
 
 fn signing_hash(tx_hash: B256, include_by: u64, chain_id: u64) -> B256 {

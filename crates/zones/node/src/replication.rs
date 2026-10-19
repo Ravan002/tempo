@@ -501,6 +501,9 @@ pub(crate) async fn collect_follower_settlement_signatures(
                             tracing::warn!(target: "zone::p2p", %follower, %err, "Rejected follower settlement signature");
                         }
                     }
+                    // Routed to the process-lifetime preconfirmation replication task.
+                    P2pEvent::PreconfirmationFrameSent { .. }
+                    | P2pEvent::PreconfirmationFrameReceived { .. } => {}
                     P2pEvent::BlockReceived { .. }
                     | P2pEvent::TransactionReceived { .. }
                     | P2pEvent::SettlementProposalReceived { .. } => {

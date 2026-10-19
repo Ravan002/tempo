@@ -1150,7 +1150,9 @@ where
                 PreconfirmationError::NotSequencing => JsonRpcError::sequencer_only(),
                 PreconfirmationError::Provider(_)
                 | PreconfirmationError::Signing(_)
-                | PreconfirmationError::Stopped => internal(err),
+                | PreconfirmationError::Stopped
+                | PreconfirmationError::Journal(_)
+                | PreconfirmationError::NotReplicated(_) => internal(err),
                 PreconfirmationError::Unsupported
                 | PreconfirmationError::CapacityExhausted
                 | PreconfirmationError::Reverted

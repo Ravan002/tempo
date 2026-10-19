@@ -4301,7 +4301,7 @@ pub(crate) fn seed_fixture_for_zone(fixture: &L1Fixture, zone: &ZoneTestNode, se
 ///
 /// Signs the token with the given signer and returns the hex string (no `0x` prefix)
 /// suitable for the `X-Authorization-Token` header.
-fn build_auth_token(
+pub(crate) fn build_auth_token(
     signer: &alloy_signer_local::PrivateKeySigner,
     zone_id: u32,
     chain_id: u64,
@@ -4369,7 +4369,7 @@ fn build_keychain_auth_token(
 /// Send a JSON-RPC request to the redacted zone RPC and return the parsed response.
 ///
 /// Returns the full JSON response body (including `jsonrpc`, `id`, `result`/`error`).
-async fn redacted_rpc_call(
+pub(crate) async fn redacted_rpc_call(
     url: &url::Url,
     method: &str,
     params: serde_json::Value,
@@ -4729,7 +4729,7 @@ impl RedactedRpcTestCtx {
     }
 }
 
-async fn start_redacted_rpc_url(
+pub(crate) async fn start_redacted_rpc_url(
     zone: &ZoneTestNode,
     config: zone_node::rpc::RedactedRpcConfig,
 ) -> eyre::Result<url::Url> {

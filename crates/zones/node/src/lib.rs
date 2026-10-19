@@ -13,6 +13,7 @@ pub mod engine;
 mod follower;
 pub mod genesis;
 pub mod node;
+mod preconfirmation_replication;
 mod replication;
 pub mod role;
 pub mod rpc;
