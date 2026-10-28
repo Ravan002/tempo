@@ -848,6 +848,10 @@ impl TIP20ChannelReserve {
         if signer != self.expected_signer(descriptor) {
             return Err(TIP20ChannelReserveError::invalid_signature().into());
         }
+        // The signature proves the signer's root key.
+        if self.storage.is_retired_root(signer)? {
+            return Err(TIP20ChannelReserveError::root_key_retired(signer).into());
+        }
         Ok(())
     }
 
@@ -2672,7 +2676,7 @@ mod tests {
                 .abi_encode(),
                 Address::ZERO,
             );
-            assert!(result.is_ok());
+            assert!(matches!(result, Err(evm2::PrecompileError::Revert(_))));
             Ok(())
         })
     }
